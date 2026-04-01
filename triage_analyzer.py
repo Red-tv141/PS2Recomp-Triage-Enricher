@@ -177,14 +177,15 @@ def generate_phase1(funcs, data, output_dir):
 
 ### What to do
 These functions are pre-approved for straightforward translation. For each function:
-1. CHECK CURRENT STATE FIRST: If the user prompt indicates that Phase 1 is complete, skip steps 2-5 entirely and jump directly to the "Phase Transition" section at the bottom.
+1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+   Functions that compile clean → mark done, skip.
+   Only fix functions with actual errors.
 2. Open the corresponding `.cpp` file in `/auto_Recomp/`.
 3. Fix any compilation errors (syntax, type mismatches, pointer casts).
 4. Ensure all `goto` labels remain intact and unchanged.
 5. Add brief comments where the logic is non-obvious.
 
 ### What NOT to do
-- Do NOT translate, compile, or modify any code if the phase is already complete.
 - Do NOT run a massive `diff` across all files to extract lessons during phase transition.** Sample a maximum of 3-5 random `.cpp` files instead.
 - Do NOT extract helpers or create new functions.
 - Do NOT restructure the control flow or rename labels.
@@ -208,8 +209,10 @@ A function is **done** when it compiles with zero errors/warnings, all `goto` la
 ---
 
 ## Phase Transition
-When ALL functions in this list compile successfully:
-1. Write `phase1_lessons.md` with any patterns, common fixes, or discoveries.
+When ALL functions compile:
+1. Write `phase1_lessons.md` — its sole purpose is to prepare Claude for the next phase.
+   Include only what was surprising or non-obvious that a future Claude wouldn't know from 
+   reading phase2_wrappers.md alone. Skip anything already documented there.
 2. Open `phase2_wrappers.md` and add relevant notes to its "Lessons from Previous Phase" section.
 3. Report completion to the user.
 """
@@ -241,11 +244,14 @@ def generate_phase2(funcs, data, output_dir):
 ## Instructions for Claude
 
 ### What to do
-1. Open the `.cpp` file in `/auto_Recomp/`.
-2. Fix compilation errors — most will be type mismatches or missing casts.
-3. For wrappers: ensure the delegated call signature matches exactly (argument count, types, return type).
-4. For getters: ensure the return value and global access patterns are correct.
-5. Preserve all `goto` labels.
+1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+   Functions that compile clean → mark done, skip.
+   Only fix functions with actual errors.
+2. Open the `.cpp` file in `/auto_Recomp/`.
+3. Fix compilation errors — most will be type mismatches or missing casts.
+4. For wrappers: ensure the delegated call signature matches exactly (argument count, types, return type).
+5. For getters: ensure the return value and global access patterns are correct.
+6. Preserve all `goto` labels.
 
 ### What NOT to do
 - Do NOT inline the wrapped function's body into the wrapper.
@@ -278,7 +284,9 @@ Same as Phase 1: zero errors/warnings, labels intact, no new dependencies.
 
 ## Phase Transition
 When ALL functions compile:
-1. Write `phase2_lessons.md` summarizing patterns and common fixes.
+1. Write `phase2_lessons.md` — its sole purpose is to prepare Claude for the next phase.
+   Include only what was surprising or non-obvious that a future Claude wouldn't know from
+   reading phase3_math.md alone. Skip anything already documented there.
 2. Open `phase3_math.md` and add notes to its "Lessons from Previous Phase" section.
 3. Report completion to the user.
 """
@@ -314,14 +322,17 @@ def generate_phase3(funcs, data, output_dir):
 ## Instructions for Claude
 
 ### What to do
-1. Open the `.cpp` file in `/auto_Recomp/`.
-2. Fix compilation errors.
-3. **COP2/VU0 translation:** Replace inline assembly with C++ math using the project's standard types (`Vector4`, GLM, or whatever the headers define). **Do NOT invent custom math structs.**
-4. Search `assembly.txt` for the function's MIPS code to verify your translation:
+1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+   Functions that compile clean → mark done, skip.
+   Only fix functions with actual errors.
+2. Open the `.cpp` file in `/auto_Recomp/`.
+3. Fix compilation errors.
+4. **COP2/VU0 translation:** Replace inline assembly with C++ math using the project's standard types (`Vector4`, GLM, or whatever the headers define). **Do NOT invent custom math structs.**
+5. Search `assembly.txt` for the function's MIPS code to verify your translation:
    ```bash
    grep -A 80 "FUNCTION_ADDRESS" assembly.txt
    ```
-5. Check `triage_map.json` for hardware flags:
+6. Check `triage_map.json` for hardware flags:
    ```bash
    grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
    ```
@@ -366,7 +377,9 @@ Zero errors/warnings, all labels intact, no new dependencies. COP2 translations 
 
 ## Phase Transition
 When ALL functions compile:
-1. Write `phase3_lessons.md` with FPU/COP2 patterns and fixes discovered.
+1. Write `phase3_lessons.md` — its sole purpose is to prepare Claude for the next phase.
+   Include only what was surprising or non-obvious that a future Claude wouldn't know from
+   reading phase4_state_machines.md alone. Skip anything already documented there.
 2. Open `phase4_state_machines.md` and add notes to "Lessons from Previous Phase".
 3. Report completion to the user.
 """
@@ -404,10 +417,13 @@ def generate_phase4(funcs, data, output_dir):
 ## Instructions for Claude
 
 ### What to do
-1. Open the `.cpp` file in `/auto_Recomp/`.
-2. Fix compilation errors.
-3. **Control flow is sacred:** These functions have dense `goto` networks that mirror the original assembly. Every label, every branch target matters.
-4. Search for context when needed:
+1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+   Functions that compile clean → mark done, skip.
+   Only fix functions with actual errors.
+2. Open the `.cpp` file in `/auto_Recomp/`.
+3. Fix compilation errors.
+4. **Control flow is sacred:** These functions have dense `goto` networks that mirror the original assembly. Every label, every branch target matters.
+5. Search for context when needed:
    ```bash
    grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
    grep -A 10 "FUNCTION_NAME" flowchart.txt
@@ -450,7 +466,9 @@ Zero errors/warnings, ALL labels intact (this is critical for state machines), n
 
 ## Phase Transition
 When ALL functions compile:
-1. Write `phase4_lessons.md` with patterns for control flow, jump tables, global writes.
+1. Write `phase4_lessons.md` — its sole purpose is to prepare Claude for the next phase.
+   Include only what was surprising or non-obvious that a future Claude wouldn't know from
+   reading phase4_state_machines.md alone. Skip anything already documented there.
 2. Open `phase5_acc_hazard.md` and add notes to "Lessons from Previous Phase".
 3. Report completion to the user.
 """
@@ -485,14 +503,17 @@ def generate_phase5(funcs, data, output_dir):
 Before touching ANY function in this phase, you MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` for the recommended ACC emulation pattern. This is not optional.
 
 ### What to do
-1. Add `// HAZARD: ACC precision` as the FIRST comment in each function.
-2. Open the `.cpp` file and fix compilation errors.
-3. Translate ACC operations using the pattern from the Skill file.
-4. **Always** cross-reference with assembly:
+1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+   Functions that compile clean → mark done, skip.
+   Only fix functions with actual errors.
+2. Add `// HAZARD: ACC precision` as the FIRST comment in each function.
+3. Open the `.cpp` file and fix compilation errors.
+4. Translate ACC operations using the pattern from the Skill file.
+5. **Always** cross-reference with assembly:
    ```bash
    grep -A 100 "FUNCTION_ADDRESS" assembly.txt
    ```
-5. Mark every ACC translation with a comment showing the original instruction:
+6. Mark every ACC translation with a comment showing the original instruction:
    ```cpp
    // ACC = vf01 * vf02 (vmulа.xyzw ACC, vf01, vf02)
    acc.x = vf01.x * vf02.x;
@@ -543,7 +564,9 @@ Zero errors/warnings, all labels intact, every ACC operation commented with orig
 
 ## Phase Transition
 When ALL functions compile:
-1. Write `phase5_lessons.md` with ACC emulation patterns and edge cases.
+1. Write `phase5_lessons.md` — its sole purpose is to prepare Claude for the next phase.
+   Include only what was surprising or non-obvious that a future Claude wouldn't know from
+   reading reading phase6_mmio.md alone. Skip anything already documented there.
 2. Open `phase6_mmio.md` and add notes to "Lessons from Previous Phase".
 3. Report completion to the user.
 """
@@ -578,16 +601,19 @@ def generate_phase6(funcs, data, output_dir):
 These functions touch PS2 hardware. You MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` before proceeding.
 
 ### What to do
-1. Open the `.cpp` file in `/auto_Recomp/`.
-2. Identify which MMIO registers are accessed by searching assembly:
+1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+   Functions that compile clean → mark done, skip.
+   Only fix functions with actual errors.
+2. Open the `.cpp` file in `/auto_Recomp/`.
+3. Identify which MMIO registers are accessed by searching assembly:
    ```bash
    grep -A 100 "FUNCTION_ADDRESS" assembly.txt
    ```
-3. Check `triage_map.json` for hardware flags:
+4. Check `triage_map.json` for hardware flags:
    ```bash
    grep -B 2 -A 30 "FUNCTION_NAME" triage_map.json
    ```
-4. For each MMIO access, determine the correct strategy:
+5. For each MMIO access, determine the correct strategy:
    - **Stub it:** If the hardware interaction is not needed on PC (e.g., DMA sync wait), replace with a no-op and comment.
    - **HLE it:** If the function does something observable (e.g., uploads a texture), translate to PC API calls.
    - **Flag it:** If uncertain, add `// TODO: MMIO — [register address] — needs HLE implementation`.
@@ -626,8 +652,10 @@ Zero errors/warnings, all labels intact, every MMIO access either stubbed/HLE'd/
 
 ## Project Completion
 When all Phase 6 functions compile:
-1. Write `phase6_lessons.md` with MMIO patterns discovered.
-2. Write `project_summary.md` summarizing all phases, total functions completed, and remaining TODO items.
+1. Write `phase6_lessons.md` — its sole purpose is to document MMIO patterns
+   that were surprising or non-obvious. Skip anything already in the Skill file.
+2. Write `project_summary.md` summarizing all phases, total functions completed,
+   and remaining TODO items.
 3. Report completion to the user.
 """
     path = output_dir / "phase6_mmio.md"
