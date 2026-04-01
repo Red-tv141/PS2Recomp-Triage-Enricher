@@ -5,7 +5,10 @@
 // OUTPUTS:
 //   1. config_auto_recomp.toml — UNIFIED config ready for ps2recomp.exe
 //      (merges Step 1 config.toml + our triage additions)
-//   2. triage_map.json — full DNA map with tags for the report tool
+//   2. triage_map.json         — full DNA map with tags for the report tool
+//   3. assembly.txt            — Raw MIPS assembly dump for all analyzed functions
+//   4. decompiled.txt          — Decompiled C/C++ pseudo-code (via Ghidra Decompiler)
+//   5. flowchart.txt           — Control flow block mappings and edge destinations
 //
 // RULES IMPLEMENTED (17 + tags):
 //   1.  No DANGEROUS_KEYWORDS (removed - was killing game logic)
@@ -31,6 +34,9 @@
 // @author Puggsy + Claude
 // @category PS2Recomp
 
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
+import ghidra.program.model.block.*;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.address.*;
@@ -200,6 +206,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
 
         // --- Main scan ---
         println("[SCAN] Analyzing...");
+        // --- Setup Exporter ---
+        DecompInterface decomp = new DecompInterface();
+        decomp.openProgram(currentProgram);
+        BasicBlockModel blockModel = new BasicBlockModel(currentProgram);
+
+        PrintWriter asmWriter    = new PrintWriter(new FileWriter(new File(outputDir, "assembly.txt")));
+        PrintWriter decompWriter = new PrintWriter(new FileWriter(new File(outputDir, "decompiled.txt")));
+        PrintWriter flowWriter   = new PrintWriter(new FileWriter(new File(outputDir, "flowchart.txt")));
         long scanStart = System.currentTimeMillis();
 
         FunctionIterator allFuncs = funcManager.getFunctions(true);
@@ -214,6 +228,46 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             Address addr = func.getEntryPoint();
             long offset = addr.getOffset();
             String funcName = func.getName();
+            // --- Export Text Files ---
+            String header = "\n\n========================================\n" +
+                                        "FUNCTION: " + funcName + "\n" +
+                                        "ADDRESS:  " + addr + "\n" +
+                                        "========================================\n";
+
+            // 1. Assembly
+            asmWriter.println(header);
+            InstructionIterator instructions = currentProgram.getListing().getInstructions(func.getBody(), true);
+            while (instructions.hasNext()) {
+                Instruction instr = instructions.next();
+                asmWriter.println(instr.getAddress() + "  " + instr);
+            }
+
+            // 2. Decompiled
+            decompWriter.println(header);
+            DecompileResults decompResult = decomp.decompileFunction(func, 30, monitor);
+            if (decompResult != null && decompResult.decompileCompleted()) {
+                decompWriter.println(decompResult.getDecompiledFunction().getC());
+            } else {
+                decompWriter.println("[decompile failed]");
+            }
+
+            // 3. Flowchart
+            flowWriter.println(header);
+            try {
+                CodeBlockIterator blocks = blockModel.getCodeBlocksContaining(func.getBody(), monitor);
+                while (blocks.hasNext()) {
+                    CodeBlock block = blocks.next();
+                    flowWriter.println("  BLOCK: " + block.getFirstStartAddress());
+                    CodeBlockReferenceIterator dests = block.getDestinations(monitor);
+                    while (dests.hasNext()) {
+                        CodeBlockReference ref = dests.next();
+                        flowWriter.println("    --> " + ref.getDestinationAddress() +
+                                           " [" + ref.getFlowType().getName() + "]");
+                    }
+                }
+            } catch (Exception e) {
+                flowWriter.println("  [flowchart failed: " + e.getMessage() + "]");
+            }
 
             // RULE 9: Skip already classified
             if (step1StubAddresses.contains(offset) || step1SkipAddresses.contains(offset)
@@ -321,6 +375,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         println("\n[SUCCESS] Unified TOML : " + unifiedToml.getAbsolutePath());
         println("[SUCCESS] Triage JSON  : " + triageJson.getAbsolutePath());
         println("\nRun:  ps2recomp.exe " + unifiedToml.getName());
+        // --- Cleanup Exporter ---
+        asmWriter.close();
+        decompWriter.close();
+        flowWriter.close();
+        decomp.dispose();
+        
+        println("[SUCCESS] Exported text logs : assembly.txt, decompiled.txt, flowchart.txt");
+        println("All 5 files saved to directory: " + outputDir.getAbsolutePath());
     }
 
     // =========================================================
