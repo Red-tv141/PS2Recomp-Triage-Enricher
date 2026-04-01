@@ -177,12 +177,15 @@ def generate_phase1(funcs, data, output_dir):
 
 ### What to do
 These functions are pre-approved for straightforward translation. For each function:
-1. Open the corresponding `.cpp` file in `/auto_Recomp/`.
-2. Fix any compilation errors (syntax, type mismatches, pointer casts).
-3. Ensure all `goto` labels remain intact and unchanged.
-4. Add brief comments where the logic is non-obvious.
+1. CHECK CURRENT STATE FIRST: If the user prompt indicates that Phase 1 is complete, skip steps 2-5 entirely and jump directly to the "Phase Transition" section at the bottom.
+2. Open the corresponding `.cpp` file in `/auto_Recomp/`.
+3. Fix any compilation errors (syntax, type mismatches, pointer casts).
+4. Ensure all `goto` labels remain intact and unchanged.
+5. Add brief comments where the logic is non-obvious.
 
 ### What NOT to do
+- Do NOT translate, compile, or modify any code if the phase is already complete.
+- Do NOT run a massive `diff` across all files to extract lessons during phase transition.** Sample a maximum of 3-5 random `.cpp` files instead.
 - Do NOT extract helpers or create new functions.
 - Do NOT restructure the control flow or rename labels.
 - Do NOT read `assembly.txt` or `triage_map.json` in full — use `grep` if you need context:
@@ -195,11 +198,6 @@ These are small, independent functions. Process them in batches of 10-20. After 
 
 ### Completion criteria
 A function is **done** when it compiles with zero errors/warnings, all `goto` labels are preserved, and no new dependencies were introduced.
-
----
-
-## Lessons from Previous Phase
-<!-- Claude: When starting this phase, note any relevant findings here. -->
 
 ---
 
