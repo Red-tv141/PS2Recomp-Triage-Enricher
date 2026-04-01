@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-PS2Recomp Triage Analyzer — CLI Query Tool + Full Report Generator
-===================================================================
-Reads triage_map.json and produces interactive queries OR a full text report.
+PS2Recomp Triage Analyzer — Phase-Based MD Generator + CLI Query Tool
+======================================================================
+Double-click (no arguments) → scans triage_map.json in same folder,
+generates 6 phase MD files with embedded Claude instructions.
 
-Usage:
-  python triage_analyzer.py triage_map.json report
-  python triage_analyzer.py triage_map.json report --output my_report.txt
+CLI usage (unchanged):
   python triage_analyzer.py triage_map.json stats
-  python triage_analyzer.py triage_map.json coverage
   python triage_analyzer.py triage_map.json top fpu_ops 20
-  python triage_analyzer.py triage_map.json tag SAFE_LEAF
-  python triage_analyzer.py triage_map.json category VECTORS
-  python triage_analyzer.py triage_map.json filter --category STATE_MACHINES --tag MULTI_RETURN
-  python triage_analyzer.py triage_map.json filter --min-fpu 10 --min-size 200
-  python triage_analyzer.py triage_map.json disposition STUB
-  python triage_analyzer.py triage_map.json export SAFE_LEAF safe_leaf_funcs.csv
+  python triage_analyzer.py triage_map.json report --output my_report.txt
+  ... etc.
 """
 
-import json, sys, argparse
+import json, sys, argparse, os
 from pathlib import Path
 from datetime import datetime
 
@@ -27,6 +21,10 @@ try:
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
+
+# =========================================================
+# DATA LOADING
+# =========================================================
 
 def load_triage(path):
     with open(path) as f:
@@ -51,8 +49,656 @@ def flatten_functions(data):
         rows.append(row)
     return rows
 
+def compute_priority_score(r):
+    """Weighted score: higher = more complex / higher priority."""
+    return (r["size"]
+            + r.get("fpu_ops", 0) * 10
+            + r.get("acc_ops", 0) * 50
+            + (500 if "ACC_PRECISION_HAZARD" in r["tag_list"] else 0)
+            + (300 if "VU0_VECTORS" in r["tag_list"] else 0)
+            + (200 if "USES_SPR" in r["tag_list"] else 0))
+
 # =========================================================
-# FULL REPORT GENERATOR
+# PHASE CLASSIFICATION
+# =========================================================
+
+def classify_phases(rows):
+    """Assign each RECOMPILE function to exactly one phase. Returns dict of phase→list."""
+    phases = {
+        "phase1_safe_leaf": [],
+        "phase2_wrappers": [],
+        "phase3_math": [],
+        "phase4_state_machines": [],
+        "phase5_acc_hazard": [],
+        "phase6_mmio": [],
+    }
+
+    for r in rows:
+        if r["disposition"] != "RECOMPILE":
+            continue
+
+        tags = r["tag_list"]
+        cat = r["category"]
+
+        # Phase 5 — ACC hazard takes highest priority (special handling)
+        if "ACC_PRECISION_HAZARD" in tags:
+            phases["phase5_acc_hazard"].append(r)
+        # Phase 6 — MMIO access (hardware registers)
+        elif "ACCESSES_MMIO" in tags:
+            phases["phase6_mmio"].append(r)
+        # Phase 1 — Safe leaf functions (auto-translate candidates)
+        elif "SAFE_LEAF" in tags:
+            phases["phase1_safe_leaf"].append(r)
+        # Phase 2 — Wrappers and getters/stubs
+        elif cat in ("WRAPPER", "GETTER_OR_STUB"):
+            phases["phase2_wrappers"].append(r)
+        # Phase 3 — Math/vector functions
+        elif cat == "MATH_VECTORS":
+            phases["phase3_math"].append(r)
+        # Phase 4 — State machines + everything else
+        else:
+            phases["phase4_state_machines"].append(r)
+
+    # Sort each phase by priority score descending
+    for key in phases:
+        for r in phases[key]:
+            r["_score"] = compute_priority_score(r)
+        phases[key].sort(key=lambda x: -x["_score"])
+
+    return phases
+
+
+# =========================================================
+# FUNCTION TABLE FORMATTER
+# =========================================================
+
+def format_function_table(funcs, include_fpu=True):
+    """Returns a markdown table string for a list of functions."""
+    lines = []
+
+    if include_fpu:
+        header = f"| {'#':>4s} | {'Address':>12s} | {'Score':>6s} | {'Size':>6s} | {'FPU':>4s} | {'ACC':>4s} | {'Br':>4s} | {'Category':>16s} | Name | Tags |"
+        sep    = f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*7}:|{'-'*5}:|{'-'*5}:|{'-'*5}:|{'-'*17}:|{'-'*40}|{'-'*20}|"
+        lines.append(header)
+        lines.append(sep)
+        for i, r in enumerate(funcs, 1):
+            flags = []
+            if "ACC_PRECISION_HAZARD" in r["tag_list"]: flags.append("ACC!")
+            if "VU0_VECTORS" in r["tag_list"]: flags.append("VU0")
+            if "USES_SPR" in r["tag_list"]: flags.append("SPR")
+            if "MULTI_RETURN" in r["tag_list"]: flags.append("MR")
+            if "WRITES_GLOBAL" in r["tag_list"]: flags.append("WG")
+            tag_str = ", ".join(flags) if flags else "-"
+            lines.append(
+                f"| {i:>4d} | {r['address']:>12s} | {r['_score']:>6d} | {r['size']:>6d} | "
+                f"{r.get('fpu_ops',0):>4d} | {r.get('acc_ops',0):>4d} | "
+                f"{r.get('branch_ops',0):>4d} | {r['category']:>16s} | "
+                f"{r['name'][:38]} | {tag_str} |"
+            )
+    else:
+        header = f"| {'#':>4s} | {'Address':>12s} | {'Size':>6s} | {'Category':>16s} | Name |"
+        sep    = f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*17}:|{'-'*45}|"
+        lines.append(header)
+        lines.append(sep)
+        for i, r in enumerate(funcs, 1):
+            lines.append(
+                f"| {i:>4d} | {r['address']:>12s} | {r['size']:>6d} | "
+                f"{r['category']:>16s} | {r['name'][:43]} |"
+            )
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# PHASE MD GENERATORS
+# =========================================================
+
+def generate_phase1(funcs, data, output_dir):
+    """Phase 1: SAFE_LEAF — auto-translate candidates."""
+    total_size = sum(r["size"] for r in funcs)
+    gp = data.get("global_pointer", "0x0037E4F0")
+
+    md = f"""# Phase 1: SAFE_LEAF — Auto-Translate
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+**Global Pointer ($gp):** {gp}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **What these are:** Leaf functions — they call nothing and have no complex side effects.
+- **Expected difficulty:** LOW. These are the simplest functions in the binary.
+
+---
+
+## Instructions for Claude
+
+### What to do
+These functions are pre-approved for straightforward translation. For each function:
+1. Open the corresponding `.cpp` file in `/auto_Recomp/`.
+2. Fix any compilation errors (syntax, type mismatches, pointer casts).
+3. Ensure all `goto` labels remain intact and unchanged.
+4. Add brief comments where the logic is non-obvious.
+
+### What NOT to do
+- Do NOT extract helpers or create new functions.
+- Do NOT restructure the control flow or rename labels.
+- Do NOT read `assembly.txt` or `triage_map.json` in full — use `grep` if you need context:
+  ```bash
+  grep -A 50 "FUNCTION_ADDRESS" assembly.txt
+  ```
+
+### Batch strategy
+These are small, independent functions. Process them in batches of 10-20. After each batch, verify compilation before moving on.
+
+### Completion criteria
+A function is **done** when it compiles with zero errors/warnings, all `goto` labels are preserved, and no new dependencies were introduced.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: When starting this phase, note any relevant findings here. -->
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=False)}
+
+---
+
+## Phase Transition
+When ALL functions in this list compile successfully:
+1. Write `phase1_lessons.md` with any patterns, common fixes, or discoveries.
+2. Open `phase2_wrappers.md` and add relevant notes to its "Lessons from Previous Phase" section.
+3. Report completion to the user.
+"""
+    path = output_dir / "phase1_safe_leaf.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+def generate_phase2(funcs, data, output_dir):
+    """Phase 2: WRAPPER + GETTER_OR_STUB."""
+    total_size = sum(r["size"] for r in funcs)
+    gp = data.get("global_pointer", "0x0037E4F0")
+
+    md = f"""# Phase 2: Wrappers & Getters — Thin Delegation Functions
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+**Global Pointer ($gp):** {gp}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **What these are:** Wrappers (delegate to one or two other functions) and getters/stubs (return a value or do minimal work).
+- **Expected difficulty:** LOW-MEDIUM. Most are trivial, but some wrappers may need correct calling conventions.
+
+---
+
+## Instructions for Claude
+
+### What to do
+1. Open the `.cpp` file in `/auto_Recomp/`.
+2. Fix compilation errors — most will be type mismatches or missing casts.
+3. For wrappers: ensure the delegated call signature matches exactly (argument count, types, return type).
+4. For getters: ensure the return value and global access patterns are correct.
+5. Preserve all `goto` labels.
+
+### What NOT to do
+- Do NOT inline the wrapped function's body into the wrapper.
+- Do NOT extract helpers or change structure.
+- Do NOT read large reference files in full — use `grep`:
+  ```bash
+  grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
+  ```
+
+### Key patterns to watch for
+- **$gp-relative loads:** These access `.sdata/.sbss` globals via `ctx->gp`. Ensure `ctx->gp = {gp}` is set.
+- **Calling convention:** PS2 uses MIPS o32/n32 ABI. Arguments in `$a0-$a3`, return in `$v0/$v1`.
+- **Void wrappers:** Some wrappers return void but the callee returns a value — don't add a return where there isn't one.
+
+### Completion criteria
+Same as Phase 1: zero errors/warnings, labels intact, no new dependencies.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: Add relevant findings from Phase 1 here before starting. -->
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=False)}
+
+---
+
+## Phase Transition
+When ALL functions compile:
+1. Write `phase2_lessons.md` summarizing patterns and common fixes.
+2. Open `phase3_math.md` and add notes to its "Lessons from Previous Phase" section.
+3. Report completion to the user.
+"""
+    path = output_dir / "phase2_wrappers.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+def generate_phase3(funcs, data, output_dir):
+    """Phase 3: MATH_VECTORS — FPU-heavy vector math."""
+    total_size = sum(r["size"] for r in funcs)
+    gp = data.get("global_pointer", "0x0037E4F0")
+    vu0_count = sum(1 for r in funcs if "VU0_VECTORS" in r["tag_list"])
+    high_fpu = sum(1 for r in funcs if r.get("fpu_ops", 0) > 30)
+
+    md = f"""# Phase 3: MATH_VECTORS — FPU & Vector Operations
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+**Global Pointer ($gp):** {gp}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **VU0/COP2 functions:** {vu0_count}
+- **High FPU density (>30 ops):** {high_fpu}
+- **What these are:** The computational core — physics, animation, collision, camera, effects.
+- **Expected difficulty:** MEDIUM-HIGH. FPU precision and COP2 translation are the main challenges.
+
+---
+
+## Instructions for Claude
+
+### What to do
+1. Open the `.cpp` file in `/auto_Recomp/`.
+2. Fix compilation errors.
+3. **COP2/VU0 translation:** Replace inline assembly with C++ math using the project's standard types (`Vector4`, GLM, or whatever the headers define). **Do NOT invent custom math structs.**
+4. Search `assembly.txt` for the function's MIPS code to verify your translation:
+   ```bash
+   grep -A 80 "FUNCTION_ADDRESS" assembly.txt
+   ```
+5. Check `triage_map.json` for hardware flags:
+   ```bash
+   grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
+   ```
+
+### COP2 Translation Reference
+| PS2 Instruction | C++ Equivalent |
+|-----------------|---------------|
+| `vmul.xyzw vfD, vfA, vfB` | `vfD.x = vfA.x * vfB.x; ...` (per component) |
+| `vadd.xyzw vfD, vfA, vfB` | `vfD.x = vfA.x + vfB.x; ...` |
+| `vsub.xyzw vfD, vfA, vfB` | `vfD.x = vfA.x - vfB.x; ...` |
+| `vmulq vfD, vfA, Q` | `vfD = vfA * Q_register;` |
+| `vdiv Q, vfA.x, vfB.y` | `Q_register = vfA.x / vfB.y;` |
+| `vsqrt Q, vfA.x` | `Q_register = sqrtf(vfA.x);` |
+| `vftoi0 vfD, vfA` | `vfD = (int)vfA;` (truncate, per component) |
+| `vitof0 vfD, vfA` | `vfD = (float)vfA;` (per component) |
+
+### PS2 FPU Quirks
+- **No NaN/Inf:** PS2 EE FPU clamps to ±MAX_FLOAT instead. Standard C++ `float` produces NaN/Inf which breaks PS2 logic.
+- **Non-IEEE rounding:** PS2 truncates toward zero; x86 defaults to round-to-nearest. This can cause drift in physics over many frames.
+- **If precision matters:** Add `// TODO: VERIFY — PS2 precision` comment. Do not try to emulate PS2 rounding unless the Skill file provides a pattern.
+
+### What NOT to do
+- Do NOT extract helpers, change structure, rename labels.
+- Do NOT invent `struct Vec4 {{ float x,y,z,w; }}` — use what already exists in the headers.
+- Do NOT "optimize" the math — keep it 1:1 with the assembly.
+
+### Completion criteria
+Zero errors/warnings, all labels intact, no new dependencies. COP2 translations marked with comment showing original instruction.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: Add relevant findings from Phase 2 here before starting. -->
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=True)}
+
+---
+
+## Phase Transition
+When ALL functions compile:
+1. Write `phase3_lessons.md` with FPU/COP2 patterns and fixes discovered.
+2. Open `phase4_state_machines.md` and add notes to "Lessons from Previous Phase".
+3. Report completion to the user.
+"""
+    path = output_dir / "phase3_math.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+def generate_phase4(funcs, data, output_dir):
+    """Phase 4: STATE_MACHINES + GAME_LOGIC + UNCATEGORIZED."""
+    total_size = sum(r["size"] for r in funcs)
+    gp = data.get("global_pointer", "0x0037E4F0")
+    high_branch = sum(1 for r in funcs if r.get("branch_ops", 0) > 50)
+    multi_ret = sum(1 for r in funcs if "MULTI_RETURN" in r["tag_list"])
+    writes_global = sum(1 for r in funcs if "WRITES_GLOBAL" in r["tag_list"])
+
+    md = f"""# Phase 4: State Machines & Game Logic — Complex Control Flow
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+**Global Pointer ($gp):** {gp}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **High branch count (>50):** {high_branch}
+- **Multi-return functions:** {multi_ret}
+- **Global writers:** {writes_global}
+- **What these are:** Game state machines, menu logic, event handlers, AI, and misc game logic.
+- **Expected difficulty:** HIGH. Complex control flow with many branches, switch/case patterns, and global state mutations.
+
+---
+
+## Instructions for Claude
+
+### What to do
+1. Open the `.cpp` file in `/auto_Recomp/`.
+2. Fix compilation errors.
+3. **Control flow is sacred:** These functions have dense `goto` networks that mirror the original assembly. Every label, every branch target matters.
+4. Search for context when needed:
+   ```bash
+   grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
+   grep -A 10 "FUNCTION_NAME" flowchart.txt
+   grep -A 100 "FUNCTION_ADDRESS" assembly.txt
+   ```
+
+### Key patterns
+- **Switch/case via jump tables:** The decompiler may produce `goto *` or computed jumps. Check `triage_map.json` for `jump_tables` field — it tells you the table address and entry count.
+- **Global state writes:** Functions tagged `WRITES_GLOBAL` modify game state through `$gp`-relative stores. Ensure the global pointer is correct (`ctx->gp = {gp}`).
+- **Tight loops:** Some state machines contain polling loops that may be `BUSY_WAIT_HAZARD` on PS2 — these will be flagged in the Tags column.
+
+### What NOT to do
+- Do NOT restructure switch/case logic — even if it looks ugly with `goto`, keep it.
+- Do NOT extract state handler functions.
+- Do NOT change label order or branch targets.
+- Do NOT "simplify" the control flow.
+
+### Handling uncertainty
+If you're not sure about a branch target or a global write, add:
+```cpp
+// TODO: VERIFY — [describe what's uncertain]
+```
+Do not guess.
+
+### Completion criteria
+Zero errors/warnings, ALL labels intact (this is critical for state machines), no new dependencies.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: Add relevant findings from Phase 3 here before starting. -->
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=True)}
+
+---
+
+## Phase Transition
+When ALL functions compile:
+1. Write `phase4_lessons.md` with patterns for control flow, jump tables, global writes.
+2. Open `phase5_acc_hazard.md` and add notes to "Lessons from Previous Phase".
+3. Report completion to the user.
+"""
+    path = output_dir / "phase4_state_machines.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+def generate_phase5(funcs, data, output_dir):
+    """Phase 5: ACC_PRECISION_HAZARD — accumulator precision issues."""
+    total_size = sum(r["size"] for r in funcs)
+    gp = data.get("global_pointer", "0x0037E4F0")
+
+    md = f"""# Phase 5: ACC_PRECISION_HAZARD — VU0 Accumulator Functions
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+**Global Pointer ($gp):** {gp}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **What these are:** Functions that use the PS2 VU0 accumulator register (ACC) via instructions like `vmadda`, `vmsuba`, `vopmsub`, etc.
+- **Expected difficulty:** VERY HIGH. The ACC register has no direct C++ equivalent, and precision behavior differs from IEEE-754.
+
+---
+
+## Instructions for Claude
+
+### ⚠️ CRITICAL: Read the Skill file FIRST
+Before touching ANY function in this phase, you MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` for the recommended ACC emulation pattern. This is not optional.
+
+### What to do
+1. Add `// HAZARD: ACC precision` as the FIRST comment in each function.
+2. Open the `.cpp` file and fix compilation errors.
+3. Translate ACC operations using the pattern from the Skill file.
+4. **Always** cross-reference with assembly:
+   ```bash
+   grep -A 100 "FUNCTION_ADDRESS" assembly.txt
+   ```
+5. Mark every ACC translation with a comment showing the original instruction:
+   ```cpp
+   // ACC = vf01 * vf02 (vmulа.xyzw ACC, vf01, vf02)
+   acc.x = vf01.x * vf02.x;
+   acc.y = vf01.y * vf02.y;
+   // vf03 = ACC + vf04 * vf05 (vmadda.xyzw vf03, vf04, vf05)
+   vf03.x = acc.x + vf04.x * vf05.x;
+   vf03.y = acc.y + vf04.y * vf05.y;
+   ```
+
+### ACC Instruction Quick Reference
+| PS2 Instruction | Meaning |
+|-----------------|---------|
+| `vmadda.xyzw ACC, vfA, vfB` | `ACC += vfA * vfB` |
+| `vmsuba.xyzw ACC, vfA, vfB` | `ACC -= vfA * vfB` |
+| `vmula.xyzw ACC, vfA, vfB` | `ACC = vfA * vfB` |
+| `vadda.xyzw ACC, vfA, vfB` | `ACC = vfA + vfB` |
+| `vopmsub vfD, vfA, vfB` | Cross product: `vfD = ACC - vfA ×_outer vfB` |
+| `vmadd vfD, vfA, vfB` | `vfD = ACC + vfA * vfB` |
+| `vmsub vfD, vfA, vfB` | `vfD = ACC - vfA * vfB` |
+
+### PS2 ACC Precision Rules
+- ACC is a 32-bit float register per component (x, y, z, w).
+- PS2 truncates toward zero (not IEEE round-to-nearest).
+- Accumulated multiply-add chains drift differently than C++ `float` chains.
+- **Do NOT use `double` to "improve" precision** — the goal is PS2-accurate behavior, not IEEE-accurate.
+
+### What NOT to do
+- Do NOT skip the Skill file read.
+- Do NOT invent your own ACC emulation pattern.
+- Do NOT use `double` or extended precision.
+- Do NOT extract helpers or change structure.
+
+### Completion criteria
+Zero errors/warnings, all labels intact, every ACC operation commented with original instruction, `// HAZARD: ACC precision` at function top.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: Add relevant findings from Phase 4 here before starting. -->
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=True)}
+
+---
+
+## Phase Transition
+When ALL functions compile:
+1. Write `phase5_lessons.md` with ACC emulation patterns and edge cases.
+2. Open `phase6_mmio.md` and add notes to "Lessons from Previous Phase".
+3. Report completion to the user.
+"""
+    path = output_dir / "phase5_acc_hazard.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+def generate_phase6(funcs, data, output_dir):
+    """Phase 6: ACCESSES_MMIO — hardware register access."""
+    total_size = sum(r["size"] for r in funcs)
+    gp = data.get("global_pointer", "0x0037E4F0")
+
+    md = f"""# Phase 6: MMIO — Hardware Register Access Functions
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+**Global Pointer ($gp):** {gp}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **What these are:** Functions that directly read/write PS2 hardware registers (GS, VIF, DMA, timers, etc.)
+- **Expected difficulty:** VERY HIGH. These interact with hardware that doesn't exist on PC. Most will need HLE (High-Level Emulation) stubs or runtime hooks.
+
+---
+
+## Instructions for Claude
+
+### ⚠️ CRITICAL: Read the Skill file FIRST
+These functions touch PS2 hardware. You MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` before proceeding.
+
+### What to do
+1. Open the `.cpp` file in `/auto_Recomp/`.
+2. Identify which MMIO registers are accessed by searching assembly:
+   ```bash
+   grep -A 100 "FUNCTION_ADDRESS" assembly.txt
+   ```
+3. Check `triage_map.json` for hardware flags:
+   ```bash
+   grep -B 2 -A 30 "FUNCTION_NAME" triage_map.json
+   ```
+4. For each MMIO access, determine the correct strategy:
+   - **Stub it:** If the hardware interaction is not needed on PC (e.g., DMA sync wait), replace with a no-op and comment.
+   - **HLE it:** If the function does something observable (e.g., uploads a texture), translate to PC API calls.
+   - **Flag it:** If uncertain, add `// TODO: MMIO — [register address] — needs HLE implementation`.
+
+### PS2 MMIO Address Ranges
+| Range | Hardware |
+|-------|----------|
+| `0x10000000-0x10001FFF` | EE Timers, INTC, SIF |
+| `0x10002000-0x10002FFF` | IPU (Image Processing Unit) |
+| `0x10003000-0x10003FFF` | GIF (Graphics Interface) |
+| `0x10003800-0x10003C30` | VIF0/VIF1 |
+| `0x10008000-0x1000EFFF` | DMA channels |
+| `0x12000000-0x12001FFF` | GS (Graphics Synthesizer) privileged |
+| `0x70000000-0x70003FFF` | Scratchpad RAM (16KB, must be mapped) |
+
+### What NOT to do
+- Do NOT try to emulate full hardware behavior — that's what PCSX2 does. We want HLE.
+- Do NOT remove MMIO code entirely — stub it with a comment so it can be revisited.
+- Do NOT change function structure or labels.
+
+### Completion criteria
+Zero errors/warnings, all labels intact, every MMIO access either stubbed/HLE'd/flagged with `// TODO: MMIO`.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: Add relevant findings from Phase 5 here before starting. -->
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=True)}
+
+---
+
+## Project Completion
+When all Phase 6 functions compile:
+1. Write `phase6_lessons.md` with MMIO patterns discovered.
+2. Write `project_summary.md` summarizing all phases, total functions completed, and remaining TODO items.
+3. Report completion to the user.
+"""
+    path = output_dir / "phase6_mmio.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+# =========================================================
+# MAIN PHASE GENERATION ENTRY POINT
+# =========================================================
+
+def generate_phases(data, rows, output_dir):
+    """Generate all 6 phase MD files."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    phases = classify_phases(rows)
+
+    generators = {
+        "phase1_safe_leaf": generate_phase1,
+        "phase2_wrappers": generate_phase2,
+        "phase3_math": generate_phase3,
+        "phase4_state_machines": generate_phase4,
+        "phase5_acc_hazard": generate_phase5,
+        "phase6_mmio": generate_phase6,
+    }
+
+    print("=" * 70)
+    print("PS2Recomp Phase Generator")
+    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"ELF Hash: {data.get('elf_hash', 'N/A')}")
+    print("=" * 70)
+    print()
+
+    total_funcs = 0
+    for phase_key in ["phase1_safe_leaf", "phase2_wrappers", "phase3_math",
+                       "phase4_state_machines", "phase5_acc_hazard", "phase6_mmio"]:
+        funcs = phases[phase_key]
+        gen_func = generators[phase_key]
+        path, count = gen_func(funcs, data, output_dir)
+        total_funcs += count
+        size = sum(r["size"] for r in funcs)
+        print(f"  {path.name:30s}  {count:>5,} functions  {size/1024:>8.1f} KB")
+
+    # Count functions not assigned to any phase (SKIP, STUB)
+    recompile_count = sum(1 for r in rows if r["disposition"] == "RECOMPILE")
+    skip_count = sum(1 for r in rows if r["disposition"] == "SKIP")
+    stub_count = sum(1 for r in rows if r["disposition"] == "STUB")
+
+    print()
+    print(f"  Total in phases:  {total_funcs:>5,} / {recompile_count:,} RECOMPILE functions")
+    print(f"  Skipped (SKIP):   {skip_count:>5,}")
+    print(f"  Stubbed (STUB):   {stub_count:>5,}")
+    print()
+
+    if total_funcs != recompile_count:
+        diff = recompile_count - total_funcs
+        print(f"  ⚠ {diff} RECOMPILE functions were not assigned to any phase.")
+        print(f"    Check classification logic if this is unexpected.")
+    else:
+        print(f"  ✓ All RECOMPILE functions assigned. No gaps.")
+
+    print()
+    print(f"Output directory: {output_dir.resolve()}")
+    print("=" * 70)
+
+
+# =========================================================
+# FULL REPORT GENERATOR (original, preserved)
 # =========================================================
 
 def generate_report(data, rows, output_path):
@@ -327,12 +973,7 @@ def generate_report(data, rows, output_path):
                       and r["disposition"] == "RECOMPILE"]
 
     for r in hle_candidates:
-        r["_priority"] = (r["size"]
-                          + r.get("fpu_ops", 0) * 10
-                          + r.get("acc_ops", 0) * 50
-                          + (500 if "ACC_PRECISION_HAZARD" in r["tag_list"] else 0)
-                          + (300 if "VU0_VECTORS" in r["tag_list"] else 0)
-                          + (200 if "USES_SPR" in r["tag_list"] else 0))
+        r["_priority"] = compute_priority_score(r)
 
     hle_candidates.sort(key=lambda x: -x["_priority"])
 
@@ -443,18 +1084,50 @@ def cmd_export(data, rows, tag, path):
         for r in matched: f.write(",".join(str(r.get(k, "")) for k in keys) + "\n")
     print(f"Exported {len(matched)} to {path}")
 
+
 # =========================================================
 # MAIN
 # =========================================================
 
 def main():
+    # Double-click mode: no arguments → auto-find triage_map.json and generate phases
+    if len(sys.argv) == 1:
+        script_dir = Path(__file__).parent
+        json_path = script_dir / "triage_map.json"
+        if not json_path.exists():
+            # Try common variations
+            for name in ["triage_map.json", "triage.json"]:
+                candidate = script_dir / name
+                if candidate.exists():
+                    json_path = candidate
+                    break
+            else:
+                print("ERROR: triage_map.json not found in script directory.")
+                print(f"  Looked in: {script_dir}")
+                print(f"  Place triage_map.json next to this script, or use CLI mode:")
+                print(f"  python {Path(__file__).name} <triage_map.json> <command>")
+                input("\nPress Enter to exit...")
+                sys.exit(1)
+
+        print(f"Found: {json_path}")
+        data = load_triage(str(json_path))
+        rows = flatten_functions(data)
+
+        output_dir = script_dir / "phases"
+        generate_phases(data, rows, output_dir)
+
+        input("\nDone! Press Enter to exit...")
+        return
+
+    # CLI mode: original argument parsing
     p = argparse.ArgumentParser(description="PS2Recomp Triage Analyzer",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("json_file")
     p.add_argument("command", choices=["stats","coverage","top","tag","category",
-                                        "disposition","filter","export","report"])
+                                        "disposition","filter","export","report","phases"])
     p.add_argument("args", nargs="*")
     p.add_argument("--output", "-o", default=None)
+    p.add_argument("--output-dir", default=None)
     p.add_argument("--category", dest="filter_category", default=None)
     p.add_argument("--tag", dest="filter_tag", default=None)
     p.add_argument("--min-fpu", type=int, default=None)
@@ -465,7 +1138,10 @@ def main():
     data = load_triage(args.json_file)
     rows = flatten_functions(data)
 
-    if args.command == "report":
+    if args.command == "phases":
+        out_dir = args.output_dir or str(Path(args.json_file).parent / "phases")
+        generate_phases(data, rows, out_dir)
+    elif args.command == "report":
         out = args.output or f"{Path(args.json_file).stem}_report.txt"
         generate_report(data, rows, out)
     elif args.command == "stats": cmd_stats(data, rows)
@@ -479,10 +1155,10 @@ def main():
         if not args.args: print("Usage: top <metric> [n]"); return
         cmd_top(data, rows, args.args[0], int(args.args[1]) if len(args.args)>1 else 20)
     elif args.command == "tag":
-        if not args.args: print("Usage: tag <NAME>"); return
+        if not args.args: print("Usage: tag <n>"); return
         cmd_tag(data, rows, args.args[0])
     elif args.command == "category":
-        if not args.args: print("Usage: category <NAME>"); return
+        if not args.args: print("Usage: category <n>"); return
         cmd_category(data, rows, args.args[0])
     elif args.command == "disposition":
         if not args.args: print("Usage: disposition <STUB|SKIP|RECOMPILE>"); return
