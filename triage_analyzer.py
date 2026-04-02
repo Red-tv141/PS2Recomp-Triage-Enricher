@@ -84,23 +84,13 @@ def dependency_sort(funcs):
                 deps[r["name"]].add(callee)
 
     # Topological sort (Kahn's algorithm) with score-based tiebreaking
-    in_degree = {name: 0 for name in phase_names}
+    # in_degree[X] = how many of X's in-phase callees remain (X is "blocked" until all resolved)
+    # reverse[Y] = list of callers that depend on Y
     reverse = {name: [] for name in phase_names}
     for caller, callees in deps.items():
         for callee in callees:
-            in_degree[callee] = in_degree.get(callee, 0)  # ensure key exists
             reverse[callee].append(caller)
-            in_degree[caller] = in_degree.get(caller, 0)
-
-    # Count incoming edges within the phase
-    for caller, callees in deps.items():
-        for callee in callees:
-            in_degree[caller] += 1  # caller depends on callee
-
-    # Reset and recount properly: in_degree[X] = how many of X's callees are in this phase
-    in_degree = {name: 0 for name in phase_names}
-    for caller, callees in deps.items():
-        in_degree[caller] = len(callees)
+    in_degree = {name: len(callees) for name, callees in deps.items()}
 
     # Start with functions that have no in-phase dependencies
     queue = sorted([n for n in phase_names if in_degree[n] == 0],
@@ -197,8 +187,8 @@ def format_function_table(funcs, include_fpu=True):
     lines = []
 
     if include_fpu:
-        header = f"| {'#':>4s} | {'Address':>12s} | {'Score':>6s} | {'Size':>6s} | {'FPU':>4s} | {'ACC':>4s} | {'Br':>4s} | {'Xref':>4s} | {'Category':>16s} | Name | Tags |"
-        sep    = f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*7}:|{'-'*5}:|{'-'*5}:|{'-'*5}:|{'-'*5}:|{'-'*17}:|{'-'*38}|{'-'*20}|"
+        header = f"| {'#':>4s} | {'Address':>12s} | {'Score':>6s} | {'Size':>6s} | {'FPU':>4s} | {'ACC':>4s} | {'Br':>4s} | {'Calls':>5s} | {'Xref':>4s} | {'Category':>16s} | Name | Tags |"
+        sep    = f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*7}:|{'-'*5}:|{'-'*5}:|{'-'*5}:|{'-'*6}:|{'-'*5}:|{'-'*17}:|{'-'*42}|{'-'*20}|"
         lines.append(header)
         lines.append(sep)
         for i, r in enumerate(funcs, 1):
@@ -211,11 +201,15 @@ def format_function_table(funcs, include_fpu=True):
             if "WRITES_GLOBAL" in r["tag_list"]: flags.append("WG")
             if "COMPLEX_CONTROL_FLOW" in r["tag_list"]: flags.append("JT")
             tag_str = ", ".join(flags) if flags else "-"
+            name = r['name']
+            if len(name) > 40:
+                name = name[:22] + ".." + name[-16:]
             lines.append(
                 f"| {i:>4d} | {r['address']:>12s} | {r['_score']:>6d} | {r['size']:>6d} | "
                 f"{r.get('fpu_ops',0):>4d} | {r.get('acc_ops',0):>4d} | "
-                f"{r.get('branch_ops',0):>4d} | {r.get('xref_to_count',0):>4d} | {r['category']:>16s} | "
-                f"{r['name'][:36]} | {tag_str} |"
+                f"{r.get('branch_ops',0):>4d} | {r.get('callee_count',0):>5d} | "
+                f"{r.get('xref_to_count',0):>4d} | {r['category']:>16s} | "
+                f"{name:<40s} | {tag_str} |"
             )
     else:
         header = f"| {'#':>4s} | {'Address':>12s} | {'Size':>6s} | {'Category':>16s} | Name |"
@@ -223,9 +217,12 @@ def format_function_table(funcs, include_fpu=True):
         lines.append(header)
         lines.append(sep)
         for i, r in enumerate(funcs, 1):
+            name = r['name']
+            if len(name) > 43:
+                name = name[:25] + ".." + name[-16:]
             lines.append(
                 f"| {i:>4d} | {r['address']:>12s} | {r['size']:>6d} | "
-                f"{r['category']:>16s} | {r['name'][:43]} |"
+                f"{r['category']:>16s} | {name:<43s} |"
             )
 
     return "\n".join(lines)
