@@ -41,6 +41,7 @@ def flatten_functions(data):
             "size": func["size"],
             "tags": ", ".join(func.get("tags", [])),
             "tag_list": func.get("tags", []),
+            "callee_list": func.get("callees", []),
         }
         for k, v in func.get("metrics", {}).items():
             row[k] = v
@@ -62,15 +63,82 @@ def compute_priority_score(r):
 # PHASE CLASSIFICATION
 # =========================================================
 
+def dependency_sort(funcs):
+    """Sort functions so callees appear before callers (bottom-up dependency order).
+    Falls back to priority score for functions without dependency relationships."""
+    if not funcs:
+        return funcs
+
+    # Build name→function lookup and compute scores
+    by_name = {}
+    for r in funcs:
+        r["_score"] = compute_priority_score(r)
+        by_name[r["name"]] = r
+
+    # Build adjacency: caller → set of callee names (only within this phase)
+    phase_names = set(by_name.keys())
+    deps = {r["name"]: set() for r in funcs}
+    for r in funcs:
+        for callee in r.get("callee_list", []):
+            if callee in phase_names:
+                deps[r["name"]].add(callee)
+
+    # Topological sort (Kahn's algorithm) with score-based tiebreaking
+    in_degree = {name: 0 for name in phase_names}
+    reverse = {name: [] for name in phase_names}
+    for caller, callees in deps.items():
+        for callee in callees:
+            in_degree[callee] = in_degree.get(callee, 0)  # ensure key exists
+            reverse[callee].append(caller)
+            in_degree[caller] = in_degree.get(caller, 0)
+
+    # Count incoming edges within the phase
+    for caller, callees in deps.items():
+        for callee in callees:
+            in_degree[caller] += 1  # caller depends on callee
+
+    # Reset and recount properly: in_degree[X] = how many of X's callees are in this phase
+    in_degree = {name: 0 for name in phase_names}
+    for caller, callees in deps.items():
+        in_degree[caller] = len(callees)
+
+    # Start with functions that have no in-phase dependencies
+    queue = sorted([n for n in phase_names if in_degree[n] == 0],
+                   key=lambda n: -by_name[n]["_score"])
+    result = []
+    while queue:
+        name = queue.pop(0)
+        result.append(by_name[name])
+        # Functions that depend on 'name' lose one dependency
+        for caller in reverse.get(name, []):
+            if caller in in_degree:
+                in_degree[caller] -= 1
+                if in_degree[caller] == 0:
+                    # Insert sorted by score
+                    queue.append(caller)
+                    queue.sort(key=lambda n: -by_name[n]["_score"])
+
+    # Add any remaining (cycles) sorted by score
+    seen = {r["name"] for r in result}
+    for r in sorted(funcs, key=lambda x: -x["_score"]):
+        if r["name"] not in seen:
+            result.append(r)
+
+    return result
+
+
 def classify_phases(rows):
     """Assign each RECOMPILE function to exactly one phase. Returns dict of phase→list."""
     phases = {
         "phase1_safe_leaf": [],
         "phase2_wrappers": [],
         "phase3_math": [],
-        "phase4_state_machines": [],
+        "phase4a_game_logic": [],
+        "phase4b_state_machines": [],
         "phase5_acc_hazard": [],
         "phase6_mmio": [],
+        "phase7_vu0_microcode": [],
+        "orphan_code": [],
     }
 
     for r in rows:
@@ -80,8 +148,19 @@ def classify_phases(rows):
         tags = r["tag_list"]
         cat = r["category"]
 
+        # Extract callee list from JSON (new field from enriched Java output)
+        r["callee_list"] = r.get("callee_list", [])
+
+        # Orphan functions — zero incoming references, likely dead code
+        if "ORPHAN_CODE" in tags:
+            phases["orphan_code"].append(r)
+            continue
+
+        # Phase 7 — VU0 microcode (vcallms) — needs special HLE, cannot auto-translate
+        if "VU0_MICROCODE" in tags:
+            phases["phase7_vu0_microcode"].append(r)
         # Phase 5 — ACC hazard takes highest priority (special handling)
-        if "ACC_PRECISION_HAZARD" in tags:
+        elif "ACC_PRECISION_HAZARD" in tags:
             phases["phase5_acc_hazard"].append(r)
         # Phase 6 — MMIO access (hardware registers)
         elif "ACCESSES_MMIO" in tags:
@@ -95,15 +174,16 @@ def classify_phases(rows):
         # Phase 3 — Math/vector functions
         elif cat == "MATH_VECTORS":
             phases["phase3_math"].append(r)
-        # Phase 4 — State machines + everything else
+        # Phase 4a — Game logic (global state mutations + calls)
+        elif cat == "GAME_LOGIC":
+            phases["phase4a_game_logic"].append(r)
+        # Phase 4b — State machines + everything else
         else:
-            phases["phase4_state_machines"].append(r)
+            phases["phase4b_state_machines"].append(r)
 
-    # Sort each phase by priority score descending
+    # Apply dependency-aware sorting to each phase
     for key in phases:
-        for r in phases[key]:
-            r["_score"] = compute_priority_score(r)
-        phases[key].sort(key=lambda x: -x["_score"])
+        phases[key] = dependency_sort(phases[key])
 
     return phases
 
@@ -117,23 +197,25 @@ def format_function_table(funcs, include_fpu=True):
     lines = []
 
     if include_fpu:
-        header = f"| {'#':>4s} | {'Address':>12s} | {'Score':>6s} | {'Size':>6s} | {'FPU':>4s} | {'ACC':>4s} | {'Br':>4s} | {'Category':>16s} | Name | Tags |"
-        sep    = f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*7}:|{'-'*5}:|{'-'*5}:|{'-'*5}:|{'-'*17}:|{'-'*40}|{'-'*20}|"
+        header = f"| {'#':>4s} | {'Address':>12s} | {'Score':>6s} | {'Size':>6s} | {'FPU':>4s} | {'ACC':>4s} | {'Br':>4s} | {'Xref':>4s} | {'Category':>16s} | Name | Tags |"
+        sep    = f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*7}:|{'-'*5}:|{'-'*5}:|{'-'*5}:|{'-'*5}:|{'-'*17}:|{'-'*38}|{'-'*20}|"
         lines.append(header)
         lines.append(sep)
         for i, r in enumerate(funcs, 1):
             flags = []
             if "ACC_PRECISION_HAZARD" in r["tag_list"]: flags.append("ACC!")
             if "VU0_VECTORS" in r["tag_list"]: flags.append("VU0")
+            if "VU0_MICROCODE" in r["tag_list"]: flags.append("uVU0")
             if "USES_SPR" in r["tag_list"]: flags.append("SPR")
             if "MULTI_RETURN" in r["tag_list"]: flags.append("MR")
             if "WRITES_GLOBAL" in r["tag_list"]: flags.append("WG")
+            if "COMPLEX_CONTROL_FLOW" in r["tag_list"]: flags.append("JT")
             tag_str = ", ".join(flags) if flags else "-"
             lines.append(
                 f"| {i:>4d} | {r['address']:>12s} | {r['_score']:>6d} | {r['size']:>6d} | "
                 f"{r.get('fpu_ops',0):>4d} | {r.get('acc_ops',0):>4d} | "
-                f"{r.get('branch_ops',0):>4d} | {r['category']:>16s} | "
-                f"{r['name'][:38]} | {tag_str} |"
+                f"{r.get('branch_ops',0):>4d} | {r.get('xref_to_count',0):>4d} | {r['category']:>16s} | "
+                f"{r['name'][:36]} | {tag_str} |"
             )
     else:
         header = f"| {'#':>4s} | {'Address':>12s} | {'Size':>6s} | {'Category':>16s} | Name |"
@@ -156,7 +238,7 @@ def format_function_table(funcs, include_fpu=True):
 def generate_phase1(funcs, data, output_dir):
     """Phase 1: SAFE_LEAF — auto-translate candidates."""
     total_size = sum(r["size"] for r in funcs)
-    gp = data.get("global_pointer", "0x0037E4F0")
+    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
 
     md = f"""# Phase 1: SAFE_LEAF — Auto-Translate
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -177,7 +259,7 @@ def generate_phase1(funcs, data, output_dir):
 
 ### What to do
 These functions are pre-approved for straightforward translation. For each function:
-1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
    Functions that compile clean → mark done, skip.
    Only fix functions with actual errors.
 2. Open the corresponding `.cpp` file in `/auto_Recomp/`.
@@ -224,7 +306,7 @@ When ALL functions compile:
 def generate_phase2(funcs, data, output_dir):
     """Phase 2: WRAPPER + GETTER_OR_STUB."""
     total_size = sum(r["size"] for r in funcs)
-    gp = data.get("global_pointer", "0x0037E4F0")
+    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
 
     md = f"""# Phase 2: Wrappers & Getters — Thin Delegation Functions
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -244,7 +326,7 @@ def generate_phase2(funcs, data, output_dir):
 ## Instructions for Claude
 
 ### What to do
-1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
    Functions that compile clean → mark done, skip.
    Only fix functions with actual errors.
 2. Open the `.cpp` file in `/auto_Recomp/`.
@@ -298,7 +380,7 @@ When ALL functions compile:
 def generate_phase3(funcs, data, output_dir):
     """Phase 3: MATH_VECTORS — FPU-heavy vector math."""
     total_size = sum(r["size"] for r in funcs)
-    gp = data.get("global_pointer", "0x0037E4F0")
+    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
     vu0_count = sum(1 for r in funcs if "VU0_VECTORS" in r["tag_list"])
     high_fpu = sum(1 for r in funcs if r.get("fpu_ops", 0) > 30)
 
@@ -322,7 +404,7 @@ def generate_phase3(funcs, data, output_dir):
 ## Instructions for Claude
 
 ### What to do
-1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
    Functions that compile clean → mark done, skip.
    Only fix functions with actual errors.
 2. Open the `.cpp` file in `/auto_Recomp/`.
@@ -379,8 +461,8 @@ Zero errors/warnings, all labels intact, no new dependencies. COP2 translations 
 When ALL functions compile:
 1. Write `phase3_lessons.md` — its sole purpose is to prepare Claude for the next phase.
    Include only what was surprising or non-obvious that a future Claude wouldn't know from
-   reading phase4_state_machines.md alone. Skip anything already documented there.
-2. Open `phase4_state_machines.md` and add notes to "Lessons from Previous Phase".
+   reading phase4a_game_logic.md alone. Skip anything already documented there.
+2. Open `phase4a_game_logic.md` and add notes to "Lessons from Previous Phase".
 3. Report completion to the user.
 """
     path = output_dir / "phase3_math.md"
@@ -388,15 +470,94 @@ When ALL functions compile:
     return path, len(funcs)
 
 
-def generate_phase4(funcs, data, output_dir):
-    """Phase 4: STATE_MACHINES + GAME_LOGIC + UNCATEGORIZED."""
+def generate_phase4a(funcs, data, output_dir):
+    """Phase 4a: GAME_LOGIC — functions that modify global state with calls."""
     total_size = sum(r["size"] for r in funcs)
-    gp = data.get("global_pointer", "0x0037E4F0")
+    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
+    writes_global = sum(1 for r in funcs if "WRITES_GLOBAL" in r["tag_list"])
+    high_xref = sum(1 for r in funcs if r.get("xref_to_count", 0) > 10)
+
+    md = f"""# Phase 4a: Game Logic — Global State & Function Calls
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+**Global Pointer ($gp):** {gp}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **Global writers:** {writes_global}
+- **High fan-in (>10 callers):** {high_xref}
+- **What these are:** Game logic functions — they read/write global state and call other functions. Includes initialization, update loops, resource management, and game subsystem code.
+- **Expected difficulty:** MEDIUM-HIGH. The challenge is ensuring correct global access patterns and calling conventions.
+
+---
+
+## Dependency Order
+Functions in this list are sorted **callees-first**: if function A calls function B and both are in this phase, B appears before A. Fix B first so A's call is correct.
+
+---
+
+## Instructions for Claude
+
+### What to do
+1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
+   Functions that compile clean → mark done, skip.
+   Only fix functions with actual errors.
+2. Open the `.cpp` file in `/auto_Recomp/`.
+3. Fix compilation errors.
+4. **Global state writes:** These functions modify game state through `$gp`-relative stores. Ensure the global pointer is correct (`ctx->gp = {gp}`).
+5. **High fan-in functions** (many callers) are marked in the Tags column. A bug here propagates widely — test thoroughly.
+6. Search for context when needed:
+   ```bash
+   grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
+   grep -A 100 "FUNCTION_ADDRESS" assembly.txt
+   ```
+
+### What NOT to do
+- Do NOT restructure control flow or rename labels.
+- Do NOT extract helpers or change function boundaries.
+- Do NOT "simplify" global access patterns.
+
+### Completion criteria
+Zero errors/warnings, all labels intact, no new dependencies.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: Add relevant findings from Phase 3 here before starting. -->
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=True)}
+
+---
+
+## Phase Transition
+When ALL functions compile:
+1. Write `phase4a_lessons.md` — its sole purpose is to prepare Claude for the next phase.
+   Include only what was surprising or non-obvious that a future Claude wouldn't know from
+   reading phase4b_state_machines.md alone.
+2. Open `phase4b_state_machines.md` and add notes to "Lessons from Previous Phase".
+3. Report completion to the user.
+"""
+    path = output_dir / "phase4a_game_logic.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+def generate_phase4b(funcs, data, output_dir):
+    """Phase 4b: STATE_MACHINES + UNCATEGORIZED — complex control flow."""
+    total_size = sum(r["size"] for r in funcs)
+    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
     high_branch = sum(1 for r in funcs if r.get("branch_ops", 0) > 50)
     multi_ret = sum(1 for r in funcs if "MULTI_RETURN" in r["tag_list"])
-    writes_global = sum(1 for r in funcs if "WRITES_GLOBAL" in r["tag_list"])
+    jump_tables = sum(1 for r in funcs if "COMPLEX_CONTROL_FLOW" in r["tag_list"])
 
-    md = f"""# Phase 4: State Machines & Game Logic — Complex Control Flow
+    md = f"""# Phase 4b: State Machines — Complex Control Flow
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
@@ -408,21 +569,26 @@ def generate_phase4(funcs, data, output_dir):
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **High branch count (>50):** {high_branch}
 - **Multi-return functions:** {multi_ret}
-- **Global writers:** {writes_global}
-- **What these are:** Game state machines, menu logic, event handlers, AI, and misc game logic.
-- **Expected difficulty:** HIGH. Complex control flow with many branches, switch/case patterns, and global state mutations.
+- **Jump table functions:** {jump_tables}
+- **What these are:** State machines, menu logic, event handlers, AI, and uncategorized functions with complex branching.
+- **Expected difficulty:** HIGH. Dense `goto` networks mirror the original assembly. Every label, every branch target matters.
+
+---
+
+## Dependency Order
+Functions in this list are sorted **callees-first**: if function A calls function B and both are in this phase, B appears before A. Fix B first.
 
 ---
 
 ## Instructions for Claude
 
 ### What to do
-1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
    Functions that compile clean → mark done, skip.
    Only fix functions with actual errors.
 2. Open the `.cpp` file in `/auto_Recomp/`.
 3. Fix compilation errors.
-4. **Control flow is sacred:** These functions have dense `goto` networks that mirror the original assembly. Every label, every branch target matters.
+4. **Control flow is sacred:** These functions have dense `goto` networks. Every label, every branch target matters.
 5. Search for context when needed:
    ```bash
    grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
@@ -431,9 +597,9 @@ def generate_phase4(funcs, data, output_dir):
    ```
 
 ### Key patterns
-- **Switch/case via jump tables:** The decompiler may produce `goto *` or computed jumps. Check `triage_map.json` for `jump_tables` field — it tells you the table address and entry count.
+- **Switch/case via jump tables:** The decompiler may produce `goto *` or computed jumps. Functions tagged `COMPLEX_CONTROL_FLOW` use `jr $reg` (indirect jumps). Check `flowchart.txt` for block layout.
 - **Global state writes:** Functions tagged `WRITES_GLOBAL` modify game state through `$gp`-relative stores. Ensure the global pointer is correct (`ctx->gp = {gp}`).
-- **Tight loops:** Some state machines contain polling loops that may be `BUSY_WAIT_HAZARD` on PS2 — these will be flagged in the Tags column.
+- **Tight loops:** Some state machines contain polling loops flagged as `BUSY_WAIT_HAZARD`.
 
 ### What NOT to do
 - Do NOT restructure switch/case logic — even if it looks ugly with `goto`, keep it.
@@ -454,7 +620,7 @@ Zero errors/warnings, ALL labels intact (this is critical for state machines), n
 ---
 
 ## Lessons from Previous Phase
-<!-- Claude: Add relevant findings from Phase 3 here before starting. -->
+<!-- Claude: Add relevant findings from Phase 4a here before starting. -->
 
 ---
 
@@ -466,13 +632,13 @@ Zero errors/warnings, ALL labels intact (this is critical for state machines), n
 
 ## Phase Transition
 When ALL functions compile:
-1. Write `phase4_lessons.md` — its sole purpose is to prepare Claude for the next phase.
+1. Write `phase4b_lessons.md` — its sole purpose is to prepare Claude for the next phase.
    Include only what was surprising or non-obvious that a future Claude wouldn't know from
-   reading phase4_state_machines.md alone. Skip anything already documented there.
+   reading phase5_acc_hazard.md alone.
 2. Open `phase5_acc_hazard.md` and add notes to "Lessons from Previous Phase".
 3. Report completion to the user.
 """
-    path = output_dir / "phase4_state_machines.md"
+    path = output_dir / "phase4b_state_machines.md"
     path.write_text(md, encoding="utf-8")
     return path, len(funcs)
 
@@ -480,7 +646,7 @@ When ALL functions compile:
 def generate_phase5(funcs, data, output_dir):
     """Phase 5: ACC_PRECISION_HAZARD — accumulator precision issues."""
     total_size = sum(r["size"] for r in funcs)
-    gp = data.get("global_pointer", "0x0037E4F0")
+    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
 
     md = f"""# Phase 5: ACC_PRECISION_HAZARD — VU0 Accumulator Functions
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -503,7 +669,7 @@ def generate_phase5(funcs, data, output_dir):
 Before touching ANY function in this phase, you MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` for the recommended ACC emulation pattern. This is not optional.
 
 ### What to do
-1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
    Functions that compile clean → mark done, skip.
    Only fix functions with actual errors.
 2. Add `// HAZARD: ACC precision` as the FIRST comment in each function.
@@ -578,7 +744,7 @@ When ALL functions compile:
 def generate_phase6(funcs, data, output_dir):
     """Phase 6: ACCESSES_MMIO — hardware register access."""
     total_size = sum(r["size"] for r in funcs)
-    gp = data.get("global_pointer", "0x0037E4F0")
+    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
 
     md = f"""# Phase 6: MMIO — Hardware Register Access Functions
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -601,7 +767,7 @@ def generate_phase6(funcs, data, output_dir):
 These functions touch PS2 hardware. You MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` before proceeding.
 
 ### What to do
-1. CHECK FIRST: Run `cl.exe /c *.cpp` on the batch.
+1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
    Functions that compile clean → mark done, skip.
    Only fix functions with actual errors.
 2. Open the `.cpp` file in `/auto_Recomp/`.
@@ -650,15 +816,148 @@ Zero errors/warnings, all labels intact, every MMIO access either stubbed/HLE'd/
 
 ---
 
-## Project Completion
-When all Phase 6 functions compile:
+## Phase Transition
+When ALL functions compile:
 1. Write `phase6_lessons.md` — its sole purpose is to document MMIO patterns
    that were surprising or non-obvious. Skip anything already in the Skill file.
-2. Write `project_summary.md` summarizing all phases, total functions completed,
-   and remaining TODO items.
+2. Open `phase7_vu0_microcode.md` and add notes to "Lessons from Previous Phase".
 3. Report completion to the user.
 """
     path = output_dir / "phase6_mmio.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+def generate_phase7(funcs, data, output_dir):
+    """Phase 7: VU0_MICROCODE — functions using vcallms/vcallmsr (VU0 micro mode)."""
+    total_size = sum(r["size"] for r in funcs)
+    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
+
+    md = f"""# Phase 7: VU0 Microcode — vcallms/vcallmsr Functions
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+**Global Pointer ($gp):** {gp}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **What these are:** Functions that call VU0 microprograms via `vcallms` or `vcallmsr` instructions. These execute code on the Vector Unit 0 coprocessor.
+- **Expected difficulty:** EXTREME. VU0 micro mode runs a separate instruction stream on dedicated hardware. Static recompilation cannot auto-translate these — they need hand-written HLE or complete VU0 microprogram reimplementation.
+
+---
+
+## Instructions for Claude
+
+### CRITICAL: Read the Skill file FIRST
+You MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` resources on VU0 architecture before proceeding.
+Also load `db-vu-instructions.md` for the VU instruction reference.
+
+### What to do
+1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
+   Functions that compile clean → mark done, skip.
+   Only fix functions with actual errors.
+2. For each function:
+   a. Search the assembly for the `vcallms` instruction and its target address:
+      ```bash
+      grep -A 100 "FUNCTION_ADDRESS" assembly.txt | grep -i vcallms
+      ```
+   b. The `vcallms` operand is the VU0 microprogram entry address (in VU0 micro memory).
+   c. Determine what the microprogram does (typically: matrix multiply, transform, lighting).
+   d. Replace the `vcallms` call with equivalent C++ math operations.
+3. Mark every translation with a comment showing the original VU0 call:
+   ```cpp
+   // vcallms 0x0000 — VU0 microprogram: matrix multiply
+   // Replaces VU0 micro mode execution with C++ equivalent
+   result = matrix * vector;
+   ```
+
+### VU0 Micro Mode Reference
+- `vcallms imm`: Call VU0 microprogram at address `imm` (in VU micro memory, not EE memory).
+- `vcallmsr`: Call VU0 microprogram at address stored in CMSAR0 register.
+- The VU0 microprogram reads/writes VU0 registers (vf00-vf31, vi00-vi15).
+- Data is passed via VU0 data memory and COP2 register transfers (`ctc2`/`cfc2`/`qmtc2`/`qmfc2`).
+
+### Strategy per function
+1. **If the microprogram is a known pattern** (matrix multiply, vector normalize, dot product): replace with C++ math.
+2. **If the microprogram is unknown**: stub the function with `// TODO: VU0_MICROCODE — needs microprogram analysis` and move on.
+3. **Do NOT try to emulate VU0 execution** — that's what PCSX2 does. We want HLE.
+
+### What NOT to do
+- Do NOT skip the Skill file read.
+- Do NOT try to interpret VU0 microcode from the EE assembly alone — the microprogram lives in VU memory.
+- Do NOT change function structure or labels.
+
+### Completion criteria
+Zero errors/warnings, all labels intact, every `vcallms` either HLE'd or stubbed with TODO comment.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: Add relevant findings from Phase 6 here before starting. -->
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=True)}
+
+---
+
+## Project Completion
+When all Phase 7 functions compile:
+1. Write `phase7_lessons.md` — document VU0 microcode patterns found.
+2. Write `project_summary.md` summarizing all phases, total functions completed,
+   and remaining TODO items (especially unresolved VU0 microprograms).
+3. Report completion to the user.
+"""
+    path = output_dir / "phase7_vu0_microcode.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(funcs)
+
+
+def generate_orphan(funcs, data, output_dir):
+    """Orphan Code — zero-reference functions, likely dead code."""
+    total_size = sum(r["size"] for r in funcs)
+
+    md = f"""# Orphan Code — Zero-Reference Functions
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**ELF Hash:** {data.get('elf_hash', 'N/A')}
+
+---
+
+## Overview
+- **Total functions:** {len(funcs):,}
+- **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
+- **What these are:** Functions with ZERO incoming references — nothing in the binary calls them.
+- **Likely explanation:** Dead code, debug functions, or functions called only via jump tables not resolved by Ghidra.
+
+---
+
+## Instructions for Claude
+
+### What to do
+1. **Do NOT fix these proactively.** These functions are likely dead code.
+2. If a compilation error in another phase mentions an orphan function, come here to fix it.
+3. If after all other phases are done, the game still doesn't work correctly, check if any orphan functions are actually needed (called via indirect jumps or function pointers).
+
+### When to investigate
+- A function here has a name that suggests it's important (e.g., contains "init", "main", "update").
+- The game crashes and the call stack points to an orphan function address.
+- A jump table in another function targets an orphan function's address.
+
+### What NOT to do
+- Do NOT spend time fixing these unless there's evidence they're needed.
+- Do NOT delete them from the build — they may be reached via indirect calls.
+
+---
+
+## Function List ({len(funcs):,} functions)
+
+{format_function_table(funcs, include_fpu=False)}
+"""
+    path = output_dir / "orphan_code.md"
     path.write_text(md, encoding="utf-8")
     return path, len(funcs)
 
@@ -668,7 +967,7 @@ When all Phase 6 functions compile:
 # =========================================================
 
 def generate_phases(data, rows, output_dir):
-    """Generate all 6 phase MD files."""
+    """Generate all phase MD files (7 phases + orphan report)."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -678,10 +977,20 @@ def generate_phases(data, rows, output_dir):
         "phase1_safe_leaf": generate_phase1,
         "phase2_wrappers": generate_phase2,
         "phase3_math": generate_phase3,
-        "phase4_state_machines": generate_phase4,
+        "phase4a_game_logic": generate_phase4a,
+        "phase4b_state_machines": generate_phase4b,
         "phase5_acc_hazard": generate_phase5,
         "phase6_mmio": generate_phase6,
+        "phase7_vu0_microcode": generate_phase7,
+        "orphan_code": generate_orphan,
     }
+
+    phase_order = [
+        "phase1_safe_leaf", "phase2_wrappers", "phase3_math",
+        "phase4a_game_logic", "phase4b_state_machines",
+        "phase5_acc_hazard", "phase6_mmio", "phase7_vu0_microcode",
+        "orphan_code",
+    ]
 
     print("=" * 70)
     print("PS2Recomp Phase Generator")
@@ -691,14 +1000,17 @@ def generate_phases(data, rows, output_dir):
     print()
 
     total_funcs = 0
-    for phase_key in ["phase1_safe_leaf", "phase2_wrappers", "phase3_math",
-                       "phase4_state_machines", "phase5_acc_hazard", "phase6_mmio"]:
+    orphan_count = 0
+    for phase_key in phase_order:
         funcs = phases[phase_key]
         gen_func = generators[phase_key]
         path, count = gen_func(funcs, data, output_dir)
-        total_funcs += count
+        if phase_key == "orphan_code":
+            orphan_count = count
+        else:
+            total_funcs += count
         size = sum(r["size"] for r in funcs)
-        print(f"  {path.name:30s}  {count:>5,} functions  {size/1024:>8.1f} KB")
+        print(f"  {path.name:35s}  {count:>5,} functions  {size/1024:>8.1f} KB")
 
     # Count functions not assigned to any phase (SKIP, STUB)
     recompile_count = sum(1 for r in rows if r["disposition"] == "RECOMPILE")
@@ -706,17 +1018,19 @@ def generate_phases(data, rows, output_dir):
     stub_count = sum(1 for r in rows if r["disposition"] == "STUB")
 
     print()
-    print(f"  Total in phases:  {total_funcs:>5,} / {recompile_count:,} RECOMPILE functions")
+    print(f"  Active phases:    {total_funcs:>5,} / {recompile_count:,} RECOMPILE functions")
+    print(f"  Orphan (deferred):{orphan_count:>5,}")
     print(f"  Skipped (SKIP):   {skip_count:>5,}")
     print(f"  Stubbed (STUB):   {stub_count:>5,}")
     print()
 
-    if total_funcs != recompile_count:
-        diff = recompile_count - total_funcs
-        print(f"  ⚠ {diff} RECOMPILE functions were not assigned to any phase.")
+    expected = total_funcs + orphan_count
+    if expected != recompile_count:
+        diff = recompile_count - expected
+        print(f"  WARNING: {diff} RECOMPILE functions were not assigned to any phase.")
         print(f"    Check classification logic if this is unexpected.")
     else:
-        print(f"  ✓ All RECOMPILE functions assigned. No gaps.")
+        print(f"  All RECOMPILE functions assigned. No gaps.")
 
     print()
     print(f"Output directory: {output_dir.resolve()}")
