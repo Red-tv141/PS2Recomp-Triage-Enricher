@@ -5,10 +5,7 @@
 // OUTPUTS:
 //   1. config_auto_recomp.toml — UNIFIED config ready for ps2recomp.exe
 //      (merges Step 1 config.toml + our triage additions)
-//   2. triage_map.json         — full DNA map with tags for the report tool
-//   3. assembly.txt            — Raw MIPS assembly dump for all analyzed functions
-//   4. decompiled.txt          — Decompiled C/C++ pseudo-code (via Ghidra Decompiler)
-//   5. flowchart.txt           — Control flow block mappings and edge destinations
+//   2. triage_map.json — full DNA map with tags for the report tool
 //
 // RULES IMPLEMENTED (17 + tags):
 //   1.  No DANGEROUS_KEYWORDS (removed - was killing game logic)
@@ -107,7 +104,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     class FuncTraits {
         int  floatOps=0, branchOps=0, mathOps=0, loadOps=0, returnPaths=0;
         long byteSize=0;
-        int  calledCount=0;
+        int  calleeCount=0;
+        int  xrefToCount=0;            // incoming references (how many functions call this one)
+        List<String> calleeNames=new ArrayList<>(); // names of called functions (for dependency ordering)
         boolean isThunk=false;
         boolean writesToGlobal=false, usesCop1=false, usesCop2=false;
         boolean usesSPR=false, hasStackFrame=false, hasMutatingInstructions=false;
@@ -117,6 +116,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         boolean hasBusyWait=false;
         boolean hasVcallms=false;       // RULE 16
         boolean hasJumpTable=false;     // RULE 17
+        boolean accessesMMIO=false;     // RULE 4+5: merged from accessesHardware()
     }
 
     // =========================================================
@@ -215,6 +215,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         PrintWriter decompWriter = new PrintWriter(new FileWriter(new File(outputDir, "decompiled.txt")));
         PrintWriter flowWriter   = new PrintWriter(new FileWriter(new File(outputDir, "flowchart.txt")));
         long scanStart = System.currentTimeMillis();
+        try {
 
         FunctionIterator allFuncs = funcManager.getFunctions(true);
         int totalFuncs = 0, uncategorized = 0;
@@ -225,6 +226,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         while (allFuncs.hasNext() && !monitor.isCancelled()) {
             Function func = allFuncs.next();
             totalFuncs++;
+            if (totalFuncs % 500 == 0)
+                monitor.setMessage("Scanning function " + totalFuncs + "...");
             Address addr = func.getEntryPoint();
             long offset = addr.getOffset();
             String funcName = func.getName();
@@ -327,7 +330,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             List<String> tags = new ArrayList<>();
             String category = assignCategory(traits);
 
-            if (traits.calledCount==0 && traits.callOps==0 && !traits.isThunk && traits.byteSize>0)
+            if (traits.calleeCount==0 && traits.callOps==0 && !traits.isThunk && traits.byteSize>0)
                 { tags.add("SAFE_LEAF"); safeLeafCount++; }
             if (traits.accOps >= 3)
                 { tags.add("ACC_PRECISION_HAZARD"); accHazardCount++; }
@@ -342,8 +345,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if (traits.hasJumpTable)
                 { tags.add("COMPLEX_CONTROL_FLOW"); jumpTableCount++; }
 
-            // RULE 5: MMIO as tag only
-            if (accessesHardware(func))
+            // RULE 5: MMIO as tag only (now computed inside getTraits)
+            if (traits.accessesMMIO)
                 { tags.add("ACCESSES_MMIO"); mmioCount++; }
 
             if (traits.usesCop2) tags.add("VU0_VECTORS");
@@ -375,18 +378,24 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         println("\n[SUCCESS] Unified TOML : " + unifiedToml.getAbsolutePath());
         println("[SUCCESS] Triage JSON  : " + triageJson.getAbsolutePath());
         println("\nRun:  ps2recomp.exe " + unifiedToml.getName());
-        // --- Cleanup Exporter ---
-        asmWriter.close();
-        decompWriter.close();
-        flowWriter.close();
-        decomp.dispose();
-        
         println("[SUCCESS] Exported text logs : assembly.txt, decompiled.txt, flowchart.txt");
         println("All 5 files saved to directory: " + outputDir.getAbsolutePath());
+        } finally {
+            // --- Cleanup Exporter (guaranteed even on exception) ---
+            asmWriter.close();
+            decompWriter.close();
+            flowWriter.close();
+            decomp.dispose();
+        }
     }
 
     // =========================================================
     // RULE 9: PARSE STEP 1 CONFIG
+    // NOTE: This parser assumes Step 1's config.toml uses a simple format:
+    //   stubs = [ "name@0xADDR", ... ] and skip = [ ... ] with "]" alone on its
+    //   own line to close each array. Inline arrays, nested tables, or comments
+    //   containing "]" will break parsing. This is safe as long as Step 1 output
+    //   format is controlled by ExportPS2Functions.java.
     // =========================================================
     private void parseStep1Config(File configFile) throws IOException {
         BufferedReader reader = new BufferedReader(new FileReader(configFile));
@@ -525,8 +534,16 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if(cache.containsKey(key)) return cache.get(key);
         FuncTraits traits=new FuncTraits();
         traits.byteSize=func.getBody().getNumAddresses();
-        traits.calledCount=func.getCalledFunctions(monitor).size();
-        traits.isThunk=func.isThunk()||(traits.byteSize<=8&&traits.calledCount>0);
+        Set<Function> callees=func.getCalledFunctions(monitor);
+        traits.calleeCount=callees.size();
+        for(Function callee:callees) traits.calleeNames.add(callee.getName());
+        // Count incoming references (how many call sites reference this function)
+        int xrefCount=0;
+        for(Reference ref:refManager.getReferencesTo(func.getEntryPoint())){
+            if(ref.getReferenceType().isCall()||ref.getReferenceType().isFlow()) xrefCount++;
+        }
+        traits.xrefToCount=xrefCount;
+        traits.isThunk=func.isThunk()||(traits.byteSize<=8&&traits.calleeCount>0);
         if(traits.isThunk){cache.put(key,traits);return traits;}
 
         InstructionIterator asmIter=currentProgram.getListing().getInstructions(func.getBody(),true);
@@ -591,10 +608,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             // JAL/JALR
             if(ml.equals("jal")||ml.equals("jalr")){traits.hasMutatingInstructions=true;traits.callOps++;}
 
-            // SPR (RULE 6: normalize)
+            // SPR (RULE 6: normalize) + MMIO hardware access (RULE 4+5: DATA refs only)
             for(Reference ref:inst.getReferencesFrom()){
                 long norm=normalizeAddress(ref.getToAddress().getOffset());
                 if(norm>=SPR_START&&norm<=SPR_END) traits.usesSPR=true;
+                if(!ref.getReferenceType().isCall()&&!ref.getReferenceType().isFlow()){
+                    if((norm>=MMIO_START&&norm<=MMIO_END)||(norm>=MMIO_GS_START&&norm<=MMIO_GS_END))
+                        traits.accessesMMIO=true;
+                }
             }
 
             // Counters
@@ -624,7 +645,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // UPDATED CATEGORY HEURISTICS (Copy-Paste Ready)
     // =========================================================
     private String assignCategory(FuncTraits t) {
-        boolean calls = (t.calledCount > 0 || t.callOps > 0);
+        boolean calls = (t.calleeCount > 0 || t.callOps > 0);
         
         // Leaf functions that do nothing but return or simple math
         if (!calls && t.byteSize < 100 && !t.writesToGlobal) return "GETTER_OR_STUB";
@@ -817,7 +838,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"load_ops\": "+t.loadOps+", ");
             w.print("\"acc_ops\": "+t.accOps+", ");
             w.print("\"call_ops\": "+t.callOps+", ");
-            w.print("\"callee_count\": "+t.calledCount+", ");
+            w.print("\"callee_count\": "+t.calleeCount+", ");
+            w.print("\"xref_to_count\": "+t.xrefToCount+", ");
             w.print("\"return_paths\": "+t.returnPaths);
             w.print("}, ");
             w.print("\"hardware\": {");
@@ -832,6 +854,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("}, ");
             w.print("\"tags\": [");
             for(int j=0;j<r.tags.size();j++){if(j>0) w.print(", "); w.print("\""+r.tags.get(j)+"\"");}
+            w.print("], ");
+            w.print("\"callees\": [");
+            for(int j=0;j<t.calleeNames.size();j++){if(j>0) w.print(", "); w.print(jsonString(t.calleeNames.get(j)));}
             w.print("]}");
             if(i<results.size()-1) w.println(","); else w.println();
         }
