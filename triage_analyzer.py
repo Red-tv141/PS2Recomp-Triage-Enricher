@@ -254,6 +254,7 @@ def generate_phase1(funcs, data, output_dir):
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **What these are:** Leaf functions — they call nothing and have no complex side effects.
 - **Expected difficulty:** LOW. These are the simplest functions in the binary.
+- **Skill file required:** NO
 
 ---
 
@@ -279,7 +280,9 @@ These functions are pre-approved for straightforward translation. For each funct
   ```
 
 ### Batch strategy
-These are small, independent functions. Process them in batches of 10-20. After each batch, verify compilation before moving on.
+These are small, independent functions. Process them in batches of 10-20 using this strict order:
+`open batch → fix all errors in batch → build → verify zero errors → next batch`.
+Do NOT open the next batch before the current one compiles clean.
 
 ### Completion criteria
 A function is **done** when it compiles with zero errors/warnings, all `goto` labels are preserved, and no new dependencies were introduced.
@@ -322,6 +325,7 @@ def generate_phase2(funcs, data, output_dir):
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **What these are:** Wrappers (delegate to one or two other functions) and getters/stubs (return a value or do minimal work).
 - **Expected difficulty:** LOW-MEDIUM. Most are trivial, but some wrappers may need correct calling conventions.
+- **Skill file required:** NO
 
 ---
 
@@ -400,6 +404,7 @@ def generate_phase3(funcs, data, output_dir):
 - **High FPU density (>30 ops):** {high_fpu}
 - **What these are:** The computational core — physics, animation, collision, camera, effects.
 - **Expected difficulty:** MEDIUM-HIGH. FPU precision and COP2 translation are the main challenges.
+- **Skill file required:** NO
 
 ---
 
@@ -493,6 +498,7 @@ def generate_phase4a(funcs, data, output_dir):
 - **High fan-in (>10 callers):** {high_xref}
 - **What these are:** Game logic functions — they read/write global state and call other functions. Includes initialization, update loops, resource management, and game subsystem code.
 - **Expected difficulty:** MEDIUM-HIGH. The challenge is ensuring correct global access patterns and calling conventions.
+- **Skill file required:** NO
 
 ---
 
@@ -574,6 +580,7 @@ def generate_phase4b(funcs, data, output_dir):
 - **Jump table functions:** {jump_tables}
 - **What these are:** State machines, menu logic, event handlers, AI, and uncategorized functions with complex branching.
 - **Expected difficulty:** HIGH. Dense `goto` networks mirror the original assembly. Every label, every branch target matters.
+- **Skill file required:** NO
 
 ---
 
@@ -662,6 +669,7 @@ def generate_phase5(funcs, data, output_dir):
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **What these are:** Functions that use the PS2 VU0 accumulator register (ACC) via instructions like `vmadda`, `vmsuba`, `vopmsub`, etc.
 - **Expected difficulty:** VERY HIGH. The ACC register has no direct C++ equivalent, and precision behavior differs from IEEE-754.
+- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` before touching any function.
 
 ---
 
@@ -760,6 +768,7 @@ def generate_phase6(funcs, data, output_dir):
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **What these are:** Functions that directly read/write PS2 hardware registers (GS, VIF, DMA, timers, etc.)
 - **Expected difficulty:** VERY HIGH. These interact with hardware that doesn't exist on PC. Most will need HLE (High-Level Emulation) stubs or runtime hooks.
+- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` before touching any function.
 
 ---
 
@@ -847,6 +856,7 @@ def generate_phase7(funcs, data, output_dir):
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **What these are:** Functions that call VU0 microprograms via `vcallms` or `vcallmsr` instructions. These execute code on the Vector Unit 0 coprocessor.
 - **Expected difficulty:** EXTREME. VU0 micro mode runs a separate instruction stream on dedicated hardware. Static recompilation cannot auto-translate these — they need hand-written HLE or complete VU0 microprogram reimplementation.
+- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` AND `db-vu-instructions.md` before touching any function.
 
 ---
 
@@ -893,6 +903,7 @@ Also load `db-vu-instructions.md` for the VU instruction reference.
 
 ### Completion criteria
 Zero errors/warnings, all labels intact, every `vcallms` either HLE'd or stubbed with TODO comment.
+**A stubbed function counts as done** — do not block phase completion waiting for microprogram analysis.
 
 ---
 
@@ -957,7 +968,8 @@ def generate_orphan(funcs, data, output_dir):
 
 ## Function List ({len(funcs):,} functions)
 
-{format_function_table(funcs, include_fpu=False)}
+<!-- populated by triage_analyzer.py from triage_map.json -->
+{format_function_table(funcs, include_fpu=False) if funcs else "*(No orphan functions in this build.)*"}
 """
     path = output_dir / "orphan_code.md"
     path.write_text(md, encoding="utf-8")
