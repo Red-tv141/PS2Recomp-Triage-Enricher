@@ -3,7 +3,7 @@
 PS2Recomp Triage Analyzer — Phase-Based MD Generator + CLI Query Tool
 ======================================================================
 Double-click (no arguments) → scans triage_map.json in same folder,
-generates 6 phase MD files with embedded Claude instructions.
+generates 7 phase + 2 Additionals MD files with embedded Claude instructions.
 
 CLI usage (unchanged):
   python triage_analyzer.py triage_map.json stats
@@ -65,53 +65,58 @@ def compute_priority_score(r):
 
 def dependency_sort(funcs):
     """Sort functions so callees appear before callers (bottom-up dependency order).
-    Falls back to priority score for functions without dependency relationships."""
+    Falls back to priority score for functions without dependency relationships.
+    Uses address as the unique key to handle overloaded/static function names."""
     if not funcs:
         return funcs
 
-    # Build name→function lookup and compute scores
-    by_name = {}
+    # Build address→function lookup and compute scores
+    by_addr = {}
     for r in funcs:
         r["_score"] = compute_priority_score(r)
-        by_name[r["name"]] = r
+        by_addr[r["address"]] = r
 
-    # Build adjacency: caller → set of callee names (only within this phase)
-    phase_names = set(by_name.keys())
-    deps = {r["name"]: set() for r in funcs}
+    # Build name→set-of-addresses index (one name may map to many addresses)
+    from collections import defaultdict
+    name_to_addrs = defaultdict(set)
     for r in funcs:
-        for callee in r.get("callee_list", []):
-            if callee in phase_names:
-                deps[r["name"]].add(callee)
+        name_to_addrs[r["name"]].add(r["address"])
+
+    phase_addrs = set(by_addr.keys())
+
+    # Build adjacency: caller address → set of callee addresses (only within this phase)
+    deps = {addr: set() for addr in phase_addrs}
+    for r in funcs:
+        for callee_name in r.get("callee_list", []):
+            for callee_addr in name_to_addrs.get(callee_name, ()):
+                if callee_addr != r["address"]:
+                    deps[r["address"]].add(callee_addr)
 
     # Topological sort (Kahn's algorithm) with score-based tiebreaking
-    # in_degree[X] = how many of X's in-phase callees remain (X is "blocked" until all resolved)
-    # reverse[Y] = list of callers that depend on Y
-    reverse = {name: [] for name in phase_names}
-    for caller, callees in deps.items():
-        for callee in callees:
-            reverse[callee].append(caller)
-    in_degree = {name: len(callees) for name, callees in deps.items()}
+    reverse = {addr: [] for addr in phase_addrs}
+    for caller_addr, callee_addrs in deps.items():
+        for callee_addr in callee_addrs:
+            reverse[callee_addr].append(caller_addr)
+    in_degree = {addr: len(callees) for addr, callees in deps.items()}
 
     # Start with functions that have no in-phase dependencies
-    queue = sorted([n for n in phase_names if in_degree[n] == 0],
-                   key=lambda n: -by_name[n]["_score"])
+    queue = sorted([a for a in phase_addrs if in_degree[a] == 0],
+                   key=lambda a: -by_addr[a]["_score"])
     result = []
     while queue:
-        name = queue.pop(0)
-        result.append(by_name[name])
-        # Functions that depend on 'name' lose one dependency
-        for caller in reverse.get(name, []):
-            if caller in in_degree:
-                in_degree[caller] -= 1
-                if in_degree[caller] == 0:
-                    # Insert sorted by score
-                    queue.append(caller)
-                    queue.sort(key=lambda n: -by_name[n]["_score"])
+        addr = queue.pop(0)
+        result.append(by_addr[addr])
+        for caller_addr in reverse.get(addr, []):
+            if caller_addr in in_degree:
+                in_degree[caller_addr] -= 1
+                if in_degree[caller_addr] == 0:
+                    queue.append(caller_addr)
+                    queue.sort(key=lambda a: -by_addr[a]["_score"])
 
     # Add any remaining (cycles) sorted by score
-    seen = {r["name"] for r in result}
+    seen = {r["address"] for r in result}
     for r in sorted(funcs, key=lambda x: -x["_score"]):
-        if r["name"] not in seen:
+        if r["address"] not in seen:
             result.append(r)
 
     return result
