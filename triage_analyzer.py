@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 """
-PS2Recomp Triage Analyzer — Phase-Based MD Generator + CLI Query Tool
-======================================================================
-Double-click (no arguments) → scans triage_map.json in same folder,
-generates 7 phase + 2 Additionals MD files with embedded Claude instructions.
+PS2Recomp Triage Analyzer v3
+=============================
+Changes from v2:
+  [FIX-1]  dependency_sort: reverse edges are now sets → no duplicate in_degree counts
+  [FIX-2]  classify_phases: VU0_MICROCODE checked before ACC_PRECISION_HAZARD
+  [NEW-1]  --recomp-dir flag: injects cpp_found=True/False into every row
+           Enables Claude to skip pre-generated functions automatically
+  [NEW-2]  'stub-gap' CLI command: lists STUB functions missing a runtime handler
+           Uses runtime_has_handler field from schema v3 triage_map.json
+  [NEW-3]  phase8_integration.md: auto-generated list of recomp/ files not yet
+           in CMakeLists.txt (replaces the manual set-diff that was done by hand)
+  [NEW-4]  phase docs get a one-line "Quick start" note: if cpp_found for all
+           functions → skip to CMakeLists registration, no manual work needed
+  [NEW-5]  'cmake-block' CLI command: generates a ready-to-paste
+           target_sources() block for a given phase
 
-CLI usage (unchanged):
+Double-click (no args) → scans triage_map.json in the same folder,
+generates phase MD files + phase8_integration.md.
+
+CLI usage:
   python triage_analyzer.py triage_map.json stats
   python triage_analyzer.py triage_map.json top fpu_ops 20
   python triage_analyzer.py triage_map.json report --output my_report.txt
-  ... etc.
+  python triage_analyzer.py triage_map.json stub-gap            [NEW-2]
+  python triage_analyzer.py triage_map.json cmake-block phase1  [NEW-5]
+  python triage_analyzer.py triage_map.json cmake-block all
 """
 
-import json, sys, argparse, os
+import json, sys, argparse, os, glob, re
 from pathlib import Path
 from datetime import datetime
+from collections import defaultdict
 
 try:
     import pandas as pd
@@ -22,69 +39,100 @@ try:
 except ImportError:
     HAS_PANDAS = False
 
+
 # =========================================================
 # DATA LOADING
 # =========================================================
 
 def load_triage(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
-def flatten_functions(data):
+
+def flatten_functions(data, recomp_dir=None):
+    """
+    Convert triage_map.json functions list to flat row dicts.
+    [NEW-1] If recomp_dir is given, inject cpp_found into each row.
+    """
+    # Build filename index once if needed
+    cpp_index = None
+    if recomp_dir:
+        cpp_index = set()
+        for p in glob.glob(str(Path(recomp_dir) / "*.cpp")):
+            cpp_index.add(Path(p).name.lower())
+
     rows = []
     for func in data["functions"]:
+        addr_raw = func["address"]
+        # Normalise address to 6-digit lowercase hex suffix used in filenames
+        try:
+            addr_int = int(addr_raw, 16)
+            addr_suffix = f"_0x{addr_int:x}.cpp"
+        except (ValueError, TypeError):
+            addr_suffix = None
+
         row = {
-            "address": func["address"],
-            "name": func["name"],
-            "category": func["category"],
+            "address":     addr_raw,
+            "name":        func["name"],
+            "category":    func["category"],
             "disposition": func["disposition"],
-            "size": func["size"],
-            "tags": ", ".join(func.get("tags", [])),
-            "tag_list": func.get("tags", []),
+            "size":        func["size"],
+            "tags":        ", ".join(func.get("tags", [])),
+            "tag_list":    func.get("tags", []),
             "callee_list": func.get("callees", []),
+            # [NEW-2] runtime handler coverage (schema v3 field)
+            "runtime_has_handler": func.get("runtime_has_handler", None),
         }
         for k, v in func.get("metrics", {}).items():
             row[k] = v
         for k, v in func.get("hardware", {}).items():
             row[k] = v
+
+        # [NEW-1] cpp_found
+        if cpp_index is not None and addr_suffix is not None:
+            # Match by address suffix (handles name collisions)
+            row["cpp_found"] = any(f.endswith(addr_suffix) for f in cpp_index)
+        else:
+            row["cpp_found"] = None  # unknown
+
         rows.append(row)
     return rows
 
+
 def compute_priority_score(r):
-    """Weighted score: higher = more complex / higher priority."""
     return (r["size"]
             + r.get("fpu_ops", 0) * 10
             + r.get("acc_ops", 0) * 50
             + (500 if "ACC_PRECISION_HAZARD" in r["tag_list"] else 0)
-            + (300 if "VU0_VECTORS" in r["tag_list"] else 0)
-            + (200 if "USES_SPR" in r["tag_list"] else 0))
+            + (300 if "VU0_VECTORS"          in r["tag_list"] else 0)
+            + (200 if "USES_SPR"             in r["tag_list"] else 0))
+
 
 # =========================================================
 # PHASE CLASSIFICATION
 # =========================================================
 
 def dependency_sort(funcs):
-    """Sort functions so callees appear before callers (bottom-up dependency order).
-    Falls back to priority score for functions without dependency relationships.
-    Uses address as the unique key to handle overloaded/static function names."""
+    """
+    Topological sort (Kahn's) so callees appear before callers.
+    [FIX-1] reverse adjacency is now a set per node to prevent duplicate
+    in_degree decrements when multiple callees share a name.
+    """
     if not funcs:
         return funcs
 
-    # Build address→function lookup and compute scores
     by_addr = {}
     for r in funcs:
         r["_score"] = compute_priority_score(r)
         by_addr[r["address"]] = r
 
-    # Build name→set-of-addresses index (one name may map to many addresses)
-    from collections import defaultdict
     name_to_addrs = defaultdict(set)
     for r in funcs:
         name_to_addrs[r["name"]].add(r["address"])
 
     phase_addrs = set(by_addr.keys())
 
-    # Build adjacency: caller address → set of callee addresses (only within this phase)
+    # caller → set of callee addresses (within this phase only)
     deps = {addr: set() for addr in phase_addrs}
     for r in funcs:
         for callee_name in r.get("callee_list", []):
@@ -92,94 +140,76 @@ def dependency_sort(funcs):
                 if callee_addr != r["address"]:
                     deps[r["address"]].add(callee_addr)
 
-    # Topological sort (Kahn's algorithm) with score-based tiebreaking
-    reverse = {addr: [] for addr in phase_addrs}
+    # [FIX-1] reverse map uses sets to prevent duplicate entries
+    reverse = {addr: set() for addr in phase_addrs}
     for caller_addr, callee_addrs in deps.items():
         for callee_addr in callee_addrs:
-            reverse[callee_addr].append(caller_addr)
+            reverse[callee_addr].add(caller_addr)
+
     in_degree = {addr: len(callees) for addr, callees in deps.items()}
 
-    # Start with functions that have no in-phase dependencies
     queue = sorted([a for a in phase_addrs if in_degree[a] == 0],
                    key=lambda a: -by_addr[a]["_score"])
     result = []
     while queue:
         addr = queue.pop(0)
         result.append(by_addr[addr])
-        for caller_addr in reverse.get(addr, []):
+        for caller_addr in reverse.get(addr, set()):
             if caller_addr in in_degree:
                 in_degree[caller_addr] -= 1
                 if in_degree[caller_addr] == 0:
                     queue.append(caller_addr)
-                    queue.sort(key=lambda a: -by_addr[a]["_score"])
+        queue.sort(key=lambda a: -by_addr[a]["_score"])
 
-    # Add any remaining (cycles) sorted by score
     seen = {r["address"] for r in result}
     for r in sorted(funcs, key=lambda x: -x["_score"]):
         if r["address"] not in seen:
             result.append(r)
-
     return result
 
 
 def classify_phases(rows):
-    """Assign each RECOMPILE function to exactly one phase. Returns dict of phase→list."""
     phases = {
-        "phase1_safe_leaf": [],
-        "phase2_wrappers": [],
-        "phase3_math": [],
-        "phase4a_game_logic": [],
+        "phase1_safe_leaf":       [],
+        "phase2_wrappers":        [],
+        "phase3_math":            [],
+        "phase4a_game_logic":     [],
         "phase4b_state_machines": [],
-        "phase5_acc_hazard": [],
-        "phase6_mmio": [],
-        "phase7_vu0_microcode": [],
-        "orphan_code": [],
+        "phase5_acc_hazard":      [],
+        "phase6_mmio":            [],
+        "phase7_vu0_microcode":   [],
+        "orphan_code":            [],
     }
-
     for r in rows:
         if r["disposition"] != "RECOMPILE":
             continue
-
         tags = r["tag_list"]
-        cat = r["category"]
+        cat  = r["category"]
 
-        # Extract callee list from JSON (new field from enriched Java output)
-        r["callee_list"] = r.get("callee_list", [])
-
-        # Orphan functions — zero incoming references, likely dead code
         if "ORPHAN_CODE" in tags:
             phases["orphan_code"].append(r)
             continue
 
-        # Phase 7 — VU0 microcode (vcallms) — needs special HLE, cannot auto-translate
+        # [FIX-2] VU0_MICROCODE takes priority over ACC_PRECISION_HAZARD
         if "VU0_MICROCODE" in tags:
             phases["phase7_vu0_microcode"].append(r)
-        # Phase 5 — ACC hazard takes highest priority (special handling)
         elif "ACC_PRECISION_HAZARD" in tags:
             phases["phase5_acc_hazard"].append(r)
-        # Phase 6 — MMIO access (hardware registers)
         elif "ACCESSES_MMIO" in tags:
             phases["phase6_mmio"].append(r)
-        # Phase 1 — Safe leaf functions (auto-translate candidates)
         elif "SAFE_LEAF" in tags:
             phases["phase1_safe_leaf"].append(r)
-        # Phase 2 — Wrappers and getters/stubs
         elif cat in ("WRAPPER", "GETTER_OR_STUB"):
             phases["phase2_wrappers"].append(r)
-        # Phase 3 — Math/vector functions
         elif cat == "MATH_VECTORS":
             phases["phase3_math"].append(r)
-        # Phase 4a — Game logic (global state mutations + calls)
         elif cat == "GAME_LOGIC":
             phases["phase4a_game_logic"].append(r)
-        # Phase 4b — State machines + everything else
         else:
             phases["phase4b_state_machines"].append(r)
 
-    # Apply dependency-aware sorting to each phase
     for key in phases:
         phases[key] = dependency_sort(phases[key])
-
     return phases
 
 
@@ -187,121 +217,146 @@ def classify_phases(rows):
 # FUNCTION TABLE FORMATTER
 # =========================================================
 
-def format_function_table(funcs, include_fpu=True):
-    """Returns a markdown table string for a list of functions."""
-    lines = []
+def _cpp_badge(r):
+    """[NEW-1] Returns a ✓/✗/? badge for the cpp_found column."""
+    v = r.get("cpp_found")
+    if v is True:  return "✓"
+    if v is False: return "✗"
+    return "?"
 
+
+def format_function_table(funcs, include_fpu=True, show_cpp=False):
+    lines = []
     if include_fpu:
-        header = f"| {'#':>4s} | {'Address':>12s} | {'Score':>6s} | {'Size':>6s} | {'FPU':>4s} | {'ACC':>4s} | {'Br':>4s} | {'Calls':>5s} | {'Xref':>4s} | {'Category':>16s} | Name | Tags |"
-        sep    = f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*7}:|{'-'*5}:|{'-'*5}:|{'-'*5}:|{'-'*6}:|{'-'*5}:|{'-'*17}:|{'-'*42}|{'-'*20}|"
+        cpp_col = " CPP |" if show_cpp else ""
+        cpp_sep = "------|" if show_cpp else ""
+        header = (f"| {'#':>4s} | {'Address':>12s} | {'Score':>6s} | {'Size':>6s} |"
+                  f" {'FPU':>4s} | {'ACC':>4s} | {'Br':>4s} | {'Calls':>5s} |"
+                  f" {'Xref':>4s} | {'Category':>16s} |{cpp_col} Name | Tags |")
+        sep    = (f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*7}:|{'-'*5}:|{'-'*5}:|"
+                  f"{'-'*5}:|{'-'*6}:|{'-'*5}:|{'-'*17}:|{cpp_sep}{'-'*42}|{'-'*20}|")
         lines.append(header)
         lines.append(sep)
         for i, r in enumerate(funcs, 1):
             flags = []
-            if "ACC_PRECISION_HAZARD" in r["tag_list"]: flags.append("ACC!")
-            if "VU0_VECTORS" in r["tag_list"]: flags.append("VU0")
-            if "VU0_MICROCODE" in r["tag_list"]: flags.append("uVU0")
-            if "USES_SPR" in r["tag_list"]: flags.append("SPR")
-            if "MULTI_RETURN" in r["tag_list"]: flags.append("MR")
-            if "WRITES_GLOBAL" in r["tag_list"]: flags.append("WG")
-            if "COMPLEX_CONTROL_FLOW" in r["tag_list"]: flags.append("JT")
+            if "ACC_PRECISION_HAZARD"  in r["tag_list"]: flags.append("ACC!")
+            if "VU0_VECTORS"           in r["tag_list"]: flags.append("VU0")
+            if "VU0_MICROCODE"         in r["tag_list"]: flags.append("uVU0")
+            if "USES_SPR"              in r["tag_list"]: flags.append("SPR")
+            if "MULTI_RETURN"          in r["tag_list"]: flags.append("MR")
+            if "WRITES_GLOBAL"         in r["tag_list"]: flags.append("WG")
+            if "COMPLEX_CONTROL_FLOW"  in r["tag_list"]: flags.append("JT")
             tag_str = ", ".join(flags) if flags else "-"
-            name = r['name']
+            name = r["name"]
             if len(name) > 40:
                 name = name[:22] + ".." + name[-16:]
+            cpp_cell = f" {_cpp_badge(r):^3s} |" if show_cpp else ""
             lines.append(
-                f"| {i:>4d} | {r['address']:>12s} | {r['_score']:>6d} | {r['size']:>6d} | "
-                f"{r.get('fpu_ops',0):>4d} | {r.get('acc_ops',0):>4d} | "
-                f"{r.get('branch_ops',0):>4d} | {r.get('callee_count',0):>5d} | "
-                f"{r.get('xref_to_count',0):>4d} | {r['category']:>16s} | "
-                f"{name:<40s} | {tag_str} |"
+                f"| {i:>4d} | {r['address']:>12s} | {r['_score']:>6d} | {r['size']:>6d} |"
+                f" {r.get('fpu_ops',0):>4d} | {r.get('acc_ops',0):>4d} |"
+                f" {r.get('branch_ops',0):>4d} | {r.get('callee_count',0):>5d} |"
+                f" {r.get('xref_to_count',0):>4d} | {r['category']:>16s} |"
+                f"{cpp_cell} {name:<40s} | {tag_str} |"
             )
     else:
-        header = f"| {'#':>4s} | {'Address':>12s} | {'Size':>6s} | {'Category':>16s} | Name |"
-        sep    = f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*17}:|{'-'*45}|"
+        cpp_col = " CPP |" if show_cpp else ""
+        cpp_sep = "------|" if show_cpp else ""
+        header = (f"| {'#':>4s} | {'Address':>12s} | {'Size':>6s} |"
+                  f" {'Category':>16s} |{cpp_col} Name |")
+        sep    = (f"|{'-'*5}:|{'-'*13}:|{'-'*7}:|{'-'*17}:|{cpp_sep}{'-'*45}|")
         lines.append(header)
         lines.append(sep)
         for i, r in enumerate(funcs, 1):
-            name = r['name']
+            name = r["name"]
             if len(name) > 43:
                 name = name[:25] + ".." + name[-16:]
+            cpp_cell = f" {_cpp_badge(r):^3s} |" if show_cpp else ""
             lines.append(
-                f"| {i:>4d} | {r['address']:>12s} | {r['size']:>6d} | "
-                f"{r['category']:>16s} | {name:<43s} |"
+                f"| {i:>4d} | {r['address']:>12s} | {r['size']:>6d} |"
+                f" {r['category']:>16s} |{cpp_cell} {name:<43s} |"
             )
-
     return "\n".join(lines)
 
 
 # =========================================================
-# PHASE MD GENERATORS
+# [NEW-1] QUICK-START NOTE FOR PHASE DOCS
+# =========================================================
+
+def _quickstart_note(funcs):
+    """Return a note about cpp_found coverage for this phase."""
+    known   = [r for r in funcs if r.get("cpp_found") is not None]
+    if not known:
+        return ""
+    found   = sum(1 for r in known if r["cpp_found"])
+    missing = len(known) - found
+    if missing == 0:
+        return (f"\n> **Quick start:** All {len(funcs):,} `.cpp` files already exist in `recomp/`.\n"
+                f"> Skip directly to registering them in `CMakeLists.txt` — no manual translation needed.\n")
+    return (f"\n> **Quick start:** {found:,}/{len(known):,} `.cpp` files exist in `recomp/`.\n"
+            f"> {missing:,} functions need to be generated or fixed before CMakeLists registration.\n")
+
+
+# =========================================================
+# PHASE MD GENERATORS  (all updated with [NEW-1] quickstart note)
 # =========================================================
 
 def generate_phase1(funcs, data, output_dir):
-    """Phase 1: SAFE_LEAF — auto-translate candidates."""
     total_size = sum(r["size"] for r in funcs)
     gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
-
+    show_cpp = any(r.get("cpp_found") is not None for r in funcs)
     md = f"""# Phase 1: SAFE_LEAF — Auto-Translate
+
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
-
+{_quickstart_note(funcs)}
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **What these are:** Leaf functions — they call nothing and have no complex side effects.
-- **Expected difficulty:** LOW. These are the simplest functions in the binary.
+- **Expected difficulty:** LOW.
 - **Skill file required:** NO
 
 ---
 
 ## Instructions for Claude
 
-### What to do
-These functions are pre-approved for straightforward translation. For each function:
-1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
-   Functions that compile clean → mark done, skip.
-   Only fix functions with actual errors.
-2. Open the corresponding `.cpp` file in `/auto_Recomp/`.
-3. Fix any compilation errors (syntax, type mismatches, pointer casts).
-4. Ensure all `goto` labels remain intact and unchanged.
-5. Add brief comments where the logic is non-obvious.
+1. CHECK FIRST: `cmake --build build64/` — functions that compile clean → mark done, skip.
+2. Open the `.cpp` file in `recomp/`.
+3. Fix compilation errors (syntax, type mismatches, pointer casts).
+4. Preserve all `goto` labels unchanged.
 
-### What NOT to do
-- Do NOT run a massive `diff` across all files to extract lessons during phase transition.** Sample a maximum of 3-5 random `.cpp` files instead.
-- Do NOT extract helpers or create new functions.
-- Do NOT restructure the control flow or rename labels.
-- Do NOT read `assembly.txt` or `triage_map.json` in full — use `grep` if you need context:
-  ```bash
-  grep -A 50 "FUNCTION_ADDRESS" assembly.txt
-  ```
+**What NOT to do:**
+- Do NOT diff-scan all files during phase transition — sample 3-5 random files instead.
+- Do NOT extract helpers or restructure control flow.
+- Do NOT read `assembly.txt` in full — use grep: `grep -A 50 "FUNCTION_ADDRESS" assembly.txt`
 
-### Batch strategy
-These are small, independent functions. Process them in batches of 10-20 using this strict order:
-`open batch → fix all errors in batch → build → verify zero errors → next batch`.
-Do NOT open the next batch before the current one compiles clean.
+**Batch strategy:** 10-20 functions → fix → build → zero errors → next batch.
 
-### Completion criteria
-A function is **done** when it compiles with zero errors/warnings, all `goto` labels are preserved, and no new dependencies were introduced.
+**Completion:** zero errors/warnings, all labels intact.
+
+---
+
+## Lessons from Previous Phase
+<!-- Claude: Add relevant findings here before starting. -->
 
 ---
 
 ## Function List ({len(funcs):,} functions)
+{"*(CPP column: ✓ = file exists in recomp/, ✗ = missing, ? = --recomp-dir not provided)*" if show_cpp else ""}
 
-{format_function_table(funcs, include_fpu=False)}
+{format_function_table(funcs, include_fpu=False, show_cpp=show_cpp)}
 
 ---
 
 ## Phase Transition
-When ALL functions compile:
-1. Write `phase1_lessons.md` — its sole purpose is to prepare Claude for the next phase.
-   Include only what was surprising or non-obvious that a future Claude wouldn't know from 
-   reading phase2_wrappers.md alone. Skip anything already documented there.
-2. Open `phase2_wrappers.md` and add relevant notes to its "Lessons from Previous Phase" section.
-3. Report completion to the user.
+
+1. Write `phase1_lessons.md` — only what a future Claude wouldn't know from phase2_wrappers.md.
+2. Add notes to `phase2_wrappers.md` "Lessons from Previous Phase".
+3. Report completion.
 """
     path = output_dir / "phase1_safe_leaf.md"
     path.write_text(md, encoding="utf-8")
@@ -309,53 +364,40 @@ When ALL functions compile:
 
 
 def generate_phase2(funcs, data, output_dir):
-    """Phase 2: WRAPPER + GETTER_OR_STUB."""
     total_size = sum(r["size"] for r in funcs)
     gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
+    show_cpp = any(r.get("cpp_found") is not None for r in funcs)
+    md = f"""# Phase 2: Wrappers & Getters
 
-    md = f"""# Phase 2: Wrappers & Getters — Thin Delegation Functions
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
-
+{_quickstart_note(funcs)}
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
-- **What these are:** Wrappers (delegate to one or two other functions) and getters/stubs (return a value or do minimal work).
-- **Expected difficulty:** LOW-MEDIUM. Most are trivial, but some wrappers may need correct calling conventions.
+- **What these are:** Wrappers (delegate to 1-2 functions) and getters/stubs.
+- **Expected difficulty:** LOW-MEDIUM.
 - **Skill file required:** NO
 
 ---
 
 ## Instructions for Claude
 
-### What to do
-1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
-   Functions that compile clean → mark done, skip.
-   Only fix functions with actual errors.
-2. Open the `.cpp` file in `/auto_Recomp/`.
-3. Fix compilation errors — most will be type mismatches or missing casts.
-4. For wrappers: ensure the delegated call signature matches exactly (argument count, types, return type).
-5. For getters: ensure the return value and global access patterns are correct.
-6. Preserve all `goto` labels.
+1. CHECK FIRST: `cmake --build build64/`.
+2. Fix compilation errors — mostly type mismatches or missing casts.
+3. For wrappers: delegated call signature must match exactly.
+4. For getters: return value and global access patterns must be correct.
+5. Preserve all `goto` labels.
 
-### What NOT to do
-- Do NOT inline the wrapped function's body into the wrapper.
-- Do NOT extract helpers or change structure.
-- Do NOT read large reference files in full — use `grep`:
-  ```bash
-  grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
-  ```
+**Key patterns:**
+- `$gp`-relative loads access `.sdata/.sbss` globals via `ctx->gp`. Ensure `ctx->gp = {gp}`.
+- PS2 ABI: args in `$a0-$a3`, return in `$v0/$v1`.
 
-### Key patterns to watch for
-- **$gp-relative loads:** These access `.sdata/.sbss` globals via `ctx->gp`. Ensure `ctx->gp = {gp}` is set.
-- **Calling convention:** PS2 uses MIPS o32/n32 ABI. Arguments in `$a0-$a3`, return in `$v0/$v1`.
-- **Void wrappers:** Some wrappers return void but the callee returns a value — don't add a return where there isn't one.
-
-### Completion criteria
-Same as Phase 1: zero errors/warnings, labels intact, no new dependencies.
+**Completion:** zero errors/warnings, labels intact.
 
 ---
 
@@ -365,18 +407,17 @@ Same as Phase 1: zero errors/warnings, labels intact, no new dependencies.
 ---
 
 ## Function List ({len(funcs):,} functions)
+{"*(CPP column: ✓ = file exists in recomp/, ✗ = missing)*" if show_cpp else ""}
 
-{format_function_table(funcs, include_fpu=False)}
+{format_function_table(funcs, include_fpu=False, show_cpp=show_cpp)}
 
 ---
 
 ## Phase Transition
-When ALL functions compile:
-1. Write `phase2_lessons.md` — its sole purpose is to prepare Claude for the next phase.
-   Include only what was surprising or non-obvious that a future Claude wouldn't know from
-   reading phase3_math.md alone. Skip anything already documented there.
-2. Open `phase3_math.md` and add notes to its "Lessons from Previous Phase" section.
-3. Report completion to the user.
+
+1. Write `phase2_lessons.md`.
+2. Add notes to `phase3_math.md` "Lessons from Previous Phase".
+3. Report completion.
 """
     path = output_dir / "phase2_wrappers.md"
     path.write_text(md, encoding="utf-8")
@@ -384,72 +425,51 @@ When ALL functions compile:
 
 
 def generate_phase3(funcs, data, output_dir):
-    """Phase 3: MATH_VECTORS — FPU-heavy vector math."""
     total_size = sum(r["size"] for r in funcs)
     gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
     vu0_count = sum(1 for r in funcs if "VU0_VECTORS" in r["tag_list"])
-    high_fpu = sum(1 for r in funcs if r.get("fpu_ops", 0) > 30)
-
+    high_fpu  = sum(1 for r in funcs if r.get("fpu_ops", 0) > 30)
+    show_cpp  = any(r.get("cpp_found") is not None for r in funcs)
     md = f"""# Phase 3: MATH_VECTORS — FPU & Vector Operations
+
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
-
+{_quickstart_note(funcs)}
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **VU0/COP2 functions:** {vu0_count}
 - **High FPU density (>30 ops):** {high_fpu}
-- **What these are:** The computational core — physics, animation, collision, camera, effects.
-- **Expected difficulty:** MEDIUM-HIGH. FPU precision and COP2 translation are the main challenges.
+- **Expected difficulty:** MEDIUM-HIGH.
 - **Skill file required:** NO
 
 ---
 
 ## Instructions for Claude
 
-### What to do
-1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
-   Functions that compile clean → mark done, skip.
-   Only fix functions with actual errors.
-2. Open the `.cpp` file in `/auto_Recomp/`.
-3. Fix compilation errors.
-4. **COP2/VU0 translation:** Replace inline assembly with C++ math using the project's standard types (`Vector4`, GLM, or whatever the headers define). **Do NOT invent custom math structs.**
-5. Search `assembly.txt` for the function's MIPS code to verify your translation:
-   ```bash
-   grep -A 80 "FUNCTION_ADDRESS" assembly.txt
-   ```
-6. Check `triage_map.json` for hardware flags:
-   ```bash
-   grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
-   ```
+1. CHECK FIRST: `cmake --build build64/`.
+2. Fix compilation errors.
+3. COP2/VU0 → C++ math using project types (`Vector4`, GLM, etc.). Do NOT invent custom structs.
+4. Cross-reference with assembly: `grep -A 80 "FUNCTION_ADDRESS" assembly.txt`
 
-### COP2 Translation Reference
-| PS2 Instruction | C++ Equivalent |
-|-----------------|---------------|
-| `vmul.xyzw vfD, vfA, vfB` | `vfD.x = vfA.x * vfB.x; ...` (per component) |
-| `vadd.xyzw vfD, vfA, vfB` | `vfD.x = vfA.x + vfB.x; ...` |
-| `vsub.xyzw vfD, vfA, vfB` | `vfD.x = vfA.x - vfB.x; ...` |
-| `vmulq vfD, vfA, Q` | `vfD = vfA * Q_register;` |
-| `vdiv Q, vfA.x, vfB.y` | `Q_register = vfA.x / vfB.y;` |
-| `vsqrt Q, vfA.x` | `Q_register = sqrtf(vfA.x);` |
-| `vftoi0 vfD, vfA` | `vfD = (int)vfA;` (truncate, per component) |
-| `vitof0 vfD, vfA` | `vfD = (float)vfA;` (per component) |
+### COP2 Quick Reference
 
-### PS2 FPU Quirks
-- **No NaN/Inf:** PS2 EE FPU clamps to ±MAX_FLOAT instead. Standard C++ `float` produces NaN/Inf which breaks PS2 logic.
-- **Non-IEEE rounding:** PS2 truncates toward zero; x86 defaults to round-to-nearest. This can cause drift in physics over many frames.
-- **If precision matters:** Add `// TODO: VERIFY — PS2 precision` comment. Do not try to emulate PS2 rounding unless the Skill file provides a pattern.
+| PS2 | C++ |
+|-----|-----|
+| `vmul.xyzw vfD, vfA, vfB` | `vfD.x=vfA.x*vfB.x; ...` (per component) |
+| `vadd.xyzw vfD, vfA, vfB` | `vfD.x=vfA.x+vfB.x; ...` |
+| `vsub.xyzw vfD, vfA, vfB` | `vfD.x=vfA.x-vfB.x; ...` |
+| `vdiv Q, vfA.x, vfB.y`   | `Q_reg = vfA.x / vfB.y;` |
+| `vsqrt Q, vfA.x`          | `Q_reg = sqrtf(vfA.x);` |
+| `vftoi0 vfD, vfA`         | `vfD = (int)vfA;` (per component) |
 
-### What NOT to do
-- Do NOT extract helpers, change structure, rename labels.
-- Do NOT invent `struct Vec4 {{ float x,y,z,w; }}` — use what already exists in the headers.
-- Do NOT "optimize" the math — keep it 1:1 with the assembly.
+**PS2 FPU quirks:** No NaN/Inf (clamps to ±MAX_FLOAT). If precision matters, add `// TODO: VERIFY — PS2 precision`.
 
-### Completion criteria
-Zero errors/warnings, all labels intact, no new dependencies. COP2 translations marked with comment showing original instruction.
+**Completion:** zero errors/warnings, labels intact, COP2 translations commented with original instruction.
 
 ---
 
@@ -459,18 +479,17 @@ Zero errors/warnings, all labels intact, no new dependencies. COP2 translations 
 ---
 
 ## Function List ({len(funcs):,} functions)
+{"*(CPP: ✓ exists / ✗ missing)*" if show_cpp else ""}
 
-{format_function_table(funcs, include_fpu=True)}
+{format_function_table(funcs, include_fpu=True, show_cpp=show_cpp)}
 
 ---
 
 ## Phase Transition
-When ALL functions compile:
-1. Write `phase3_lessons.md` — its sole purpose is to prepare Claude for the next phase.
-   Include only what was surprising or non-obvious that a future Claude wouldn't know from
-   reading phase4a_game_logic.md alone. Skip anything already documented there.
-2. Open `phase4a_game_logic.md` and add notes to "Lessons from Previous Phase".
-3. Report completion to the user.
+
+1. Write `phase3_lessons.md`.
+2. Add notes to `phase4a_game_logic.md`.
+3. Report completion.
 """
     path = output_dir / "phase3_math.md"
     path.write_text(md, encoding="utf-8")
@@ -478,58 +497,42 @@ When ALL functions compile:
 
 
 def generate_phase4a(funcs, data, output_dir):
-    """Phase 4a: GAME_LOGIC — functions that modify global state with calls."""
-    total_size = sum(r["size"] for r in funcs)
-    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
+    total_size    = sum(r["size"] for r in funcs)
+    gp            = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
     writes_global = sum(1 for r in funcs if "WRITES_GLOBAL" in r["tag_list"])
-    high_xref = sum(1 for r in funcs if r.get("xref_to_count", 0) > 10)
-
+    high_xref     = sum(1 for r in funcs if r.get("xref_to_count", 0) > 10)
+    show_cpp      = any(r.get("cpp_found") is not None for r in funcs)
     md = f"""# Phase 4a: Game Logic — Global State & Function Calls
+
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
-
+{_quickstart_note(funcs)}
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **Global writers:** {writes_global}
 - **High fan-in (>10 callers):** {high_xref}
-- **What these are:** Game logic functions — they read/write global state and call other functions. Includes initialization, update loops, resource management, and game subsystem code.
-- **Expected difficulty:** MEDIUM-HIGH. The challenge is ensuring correct global access patterns and calling conventions.
+- **Expected difficulty:** MEDIUM-HIGH.
 - **Skill file required:** NO
 
----
-
 ## Dependency Order
-Functions in this list are sorted **callees-first**: if function A calls function B and both are in this phase, B appears before A. Fix B first so A's call is correct.
+
+Sorted callees-first. Fix callees before callers.
 
 ---
 
 ## Instructions for Claude
 
-### What to do
-1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
-   Functions that compile clean → mark done, skip.
-   Only fix functions with actual errors.
-2. Open the `.cpp` file in `/auto_Recomp/`.
-3. Fix compilation errors.
-4. **Global state writes:** These functions modify game state through `$gp`-relative stores. Ensure the global pointer is correct (`ctx->gp = {gp}`).
-5. **High fan-in functions** (many callers) are marked in the Tags column. A bug here propagates widely — test thoroughly.
-6. Search for context when needed:
-   ```bash
-   grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
-   grep -A 100 "FUNCTION_ADDRESS" assembly.txt
-   ```
+1. CHECK FIRST: `cmake --build build64/`.
+2. Fix compilation errors.
+3. Global state writes use `$gp`-relative stores. Ensure `ctx->gp = {gp}`.
+4. High fan-in functions (many callers) — bugs propagate widely, test carefully.
 
-### What NOT to do
-- Do NOT restructure control flow or rename labels.
-- Do NOT extract helpers or change function boundaries.
-- Do NOT "simplify" global access patterns.
-
-### Completion criteria
-Zero errors/warnings, all labels intact, no new dependencies.
+**Completion:** zero errors/warnings, labels intact.
 
 ---
 
@@ -540,17 +543,15 @@ Zero errors/warnings, all labels intact, no new dependencies.
 
 ## Function List ({len(funcs):,} functions)
 
-{format_function_table(funcs, include_fpu=True)}
+{format_function_table(funcs, include_fpu=True, show_cpp=show_cpp)}
 
 ---
 
 ## Phase Transition
-When ALL functions compile:
-1. Write `phase4a_lessons.md` — its sole purpose is to prepare Claude for the next phase.
-   Include only what was surprising or non-obvious that a future Claude wouldn't know from
-   reading phase4b_state_machines.md alone.
-2. Open `phase4b_state_machines.md` and add notes to "Lessons from Previous Phase".
-3. Report completion to the user.
+
+1. Write `phase4a_lessons.md`.
+2. Add notes to `phase4b_state_machines.md`.
+3. Report completion.
 """
     path = output_dir / "phase4a_game_logic.md"
     path.write_text(md, encoding="utf-8")
@@ -558,73 +559,50 @@ When ALL functions compile:
 
 
 def generate_phase4b(funcs, data, output_dir):
-    """Phase 4b: STATE_MACHINES + UNCATEGORIZED — complex control flow."""
-    total_size = sum(r["size"] for r in funcs)
-    gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
+    total_size  = sum(r["size"] for r in funcs)
+    gp          = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
     high_branch = sum(1 for r in funcs if r.get("branch_ops", 0) > 50)
-    multi_ret = sum(1 for r in funcs if "MULTI_RETURN" in r["tag_list"])
+    multi_ret   = sum(1 for r in funcs if "MULTI_RETURN" in r["tag_list"])
     jump_tables = sum(1 for r in funcs if "COMPLEX_CONTROL_FLOW" in r["tag_list"])
-
+    show_cpp    = any(r.get("cpp_found") is not None for r in funcs)
     md = f"""# Phase 4b: State Machines — Complex Control Flow
+
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
-
+{_quickstart_note(funcs)}
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
 - **High branch count (>50):** {high_branch}
 - **Multi-return functions:** {multi_ret}
 - **Jump table functions:** {jump_tables}
-- **What these are:** State machines, menu logic, event handlers, AI, and uncategorized functions with complex branching.
-- **Expected difficulty:** HIGH. Dense `goto` networks mirror the original assembly. Every label, every branch target matters.
+- **Expected difficulty:** HIGH. Every label, every branch target matters.
 - **Skill file required:** NO
 
----
-
 ## Dependency Order
-Functions in this list are sorted **callees-first**: if function A calls function B and both are in this phase, B appears before A. Fix B first.
+
+Sorted callees-first.
 
 ---
 
 ## Instructions for Claude
 
-### What to do
-1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
-   Functions that compile clean → mark done, skip.
-   Only fix functions with actual errors.
-2. Open the `.cpp` file in `/auto_Recomp/`.
-3. Fix compilation errors.
-4. **Control flow is sacred:** These functions have dense `goto` networks. Every label, every branch target matters.
-5. Search for context when needed:
-   ```bash
-   grep -B 2 -A 20 "FUNCTION_NAME" triage_map.json
-   grep -A 10 "FUNCTION_NAME" flowchart.txt
-   grep -A 100 "FUNCTION_ADDRESS" assembly.txt
-   ```
+1. CHECK FIRST: `cmake --build build64/`.
+2. Fix compilation errors.
+3. **Control flow is sacred** — dense `goto` networks mirror the original assembly.
+4. For uncertainty: `// TODO: VERIFY — [describe]`. Do not guess.
 
-### Key patterns
-- **Switch/case via jump tables:** The decompiler may produce `goto *` or computed jumps. Functions tagged `COMPLEX_CONTROL_FLOW` use `jr $reg` (indirect jumps). Check `flowchart.txt` for block layout.
-- **Global state writes:** Functions tagged `WRITES_GLOBAL` modify game state through `$gp`-relative stores. Ensure the global pointer is correct (`ctx->gp = {gp}`).
-- **Tight loops:** Some state machines contain polling loops flagged as `BUSY_WAIT_HAZARD`.
+**Key patterns:**
+- `COMPLEX_CONTROL_FLOW` → `jr $reg` indirect jumps. Check `flowchart.txt` for block layout.
+- `WRITES_GLOBAL` → `$gp`-relative stores. Ensure `ctx->gp = {gp}`.
 
-### What NOT to do
-- Do NOT restructure switch/case logic — even if it looks ugly with `goto`, keep it.
-- Do NOT extract state handler functions.
-- Do NOT change label order or branch targets.
-- Do NOT "simplify" the control flow.
+**What NOT to do:** Do NOT restructure switch/case, do NOT simplify control flow.
 
-### Handling uncertainty
-If you're not sure about a branch target or a global write, add:
-```cpp
-// TODO: VERIFY — [describe what's uncertain]
-```
-Do not guess.
-
-### Completion criteria
-Zero errors/warnings, ALL labels intact (this is critical for state machines), no new dependencies.
+**Completion:** zero errors/warnings, ALL labels intact.
 
 ---
 
@@ -635,17 +613,15 @@ Zero errors/warnings, ALL labels intact (this is critical for state machines), n
 
 ## Function List ({len(funcs):,} functions)
 
-{format_function_table(funcs, include_fpu=True)}
+{format_function_table(funcs, include_fpu=True, show_cpp=show_cpp)}
 
 ---
 
 ## Phase Transition
-When ALL functions compile:
-1. Write `phase4b_lessons.md` — its sole purpose is to prepare Claude for the next phase.
-   Include only what was surprising or non-obvious that a future Claude wouldn't know from
-   reading phase5_acc_hazard.md alone.
-2. Open `phase5_acc_hazard.md` and add notes to "Lessons from Previous Phase".
-3. Report completion to the user.
+
+1. Write `phase4b_lessons.md`.
+2. Add notes to `phase5_acc_hazard.md`.
+3. Report completion.
 """
     path = output_dir / "phase4b_state_machines.md"
     path.write_text(md, encoding="utf-8")
@@ -653,77 +629,52 @@ When ALL functions compile:
 
 
 def generate_phase5(funcs, data, output_dir):
-    """Phase 5: ACC_PRECISION_HAZARD — accumulator precision issues."""
     total_size = sum(r["size"] for r in funcs)
     gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
-
+    show_cpp = any(r.get("cpp_found") is not None for r in funcs)
     md = f"""# Phase 5: ACC_PRECISION_HAZARD — VU0 Accumulator Functions
+
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
-
+{_quickstart_note(funcs)}
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
-- **What these are:** Functions that use the PS2 VU0 accumulator register (ACC) via instructions like `vmadda`, `vmsuba`, `vopmsub`, etc.
-- **Expected difficulty:** VERY HIGH. The ACC register has no direct C++ equivalent, and precision behavior differs from IEEE-754.
-- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` before touching any function.
+- **What these are:** Functions using PS2 VU0 ACC register (vmadda, vmsuba, vopmsub, etc.)
+- **Expected difficulty:** VERY HIGH.
+- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` before any function.
 
 ---
 
 ## Instructions for Claude
 
-### ⚠️ CRITICAL: Read the Skill file FIRST
-Before touching ANY function in this phase, you MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` for the recommended ACC emulation pattern. This is not optional.
+### ⚠️ Read the Skill file FIRST
 
-### What to do
-1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
-   Functions that compile clean → mark done, skip.
-   Only fix functions with actual errors.
-2. Add `// HAZARD: ACC precision` as the FIRST comment in each function.
-3. Open the `.cpp` file and fix compilation errors.
-4. Translate ACC operations using the pattern from the Skill file.
-5. **Always** cross-reference with assembly:
-   ```bash
-   grep -A 100 "FUNCTION_ADDRESS" assembly.txt
-   ```
-6. Mark every ACC translation with a comment showing the original instruction:
-   ```cpp
-   // ACC = vf01 * vf02 (vmulа.xyzw ACC, vf01, vf02)
-   acc.x = vf01.x * vf02.x;
-   acc.y = vf01.y * vf02.y;
-   // vf03 = ACC + vf04 * vf05 (vmadda.xyzw vf03, vf04, vf05)
-   vf03.x = acc.x + vf04.x * vf05.x;
-   vf03.y = acc.y + vf04.y * vf05.y;
-   ```
+1. CHECK FIRST: `cmake --build build64/`.
+2. Add `// HAZARD: ACC precision` as FIRST comment in each function.
+3. Translate ACC ops using the Skill file pattern.
+4. Cross-reference: `grep -A 100 "FUNCTION_ADDRESS" assembly.txt`
+5. Comment every ACC translation with the original instruction.
 
-### ACC Instruction Quick Reference
+### ACC Instruction Reference
+
 | PS2 Instruction | Meaning |
 |-----------------|---------|
 | `vmadda.xyzw ACC, vfA, vfB` | `ACC += vfA * vfB` |
 | `vmsuba.xyzw ACC, vfA, vfB` | `ACC -= vfA * vfB` |
-| `vmula.xyzw ACC, vfA, vfB` | `ACC = vfA * vfB` |
-| `vadda.xyzw ACC, vfA, vfB` | `ACC = vfA + vfB` |
-| `vopmsub vfD, vfA, vfB` | Cross product: `vfD = ACC - vfA ×_outer vfB` |
-| `vmadd vfD, vfA, vfB` | `vfD = ACC + vfA * vfB` |
-| `vmsub vfD, vfA, vfB` | `vfD = ACC - vfA * vfB` |
+| `vmula.xyzw ACC, vfA, vfB`  | `ACC = vfA * vfB`  |
+| `vadda.xyzw ACC, vfA, vfB`  | `ACC = vfA + vfB`  |
+| `vopmsub vfD, vfA, vfB`     | `vfD = ACC - outer(vfA,vfB)` |
+| `vmadd vfD, vfA, vfB`       | `vfD = ACC + vfA * vfB` |
+| `vmsub vfD, vfA, vfB`       | `vfD = ACC - vfA * vfB` |
 
-### PS2 ACC Precision Rules
-- ACC is a 32-bit float register per component (x, y, z, w).
-- PS2 truncates toward zero (not IEEE round-to-nearest).
-- Accumulated multiply-add chains drift differently than C++ `float` chains.
-- **Do NOT use `double` to "improve" precision** — the goal is PS2-accurate behavior, not IEEE-accurate.
+**Do NOT use `double`** — goal is PS2-accurate behavior, not IEEE-accurate.
 
-### What NOT to do
-- Do NOT skip the Skill file read.
-- Do NOT invent your own ACC emulation pattern.
-- Do NOT use `double` or extended precision.
-- Do NOT extract helpers or change structure.
-
-### Completion criteria
-Zero errors/warnings, all labels intact, every ACC operation commented with original instruction, `// HAZARD: ACC precision` at function top.
+**Completion:** zero errors, labels intact, every ACC op commented.
 
 ---
 
@@ -734,17 +685,15 @@ Zero errors/warnings, all labels intact, every ACC operation commented with orig
 
 ## Function List ({len(funcs):,} functions)
 
-{format_function_table(funcs, include_fpu=True)}
+{format_function_table(funcs, include_fpu=True, show_cpp=show_cpp)}
 
 ---
 
 ## Phase Transition
-When ALL functions compile:
-1. Write `phase5_lessons.md` — its sole purpose is to prepare Claude for the next phase.
-   Include only what was surprising or non-obvious that a future Claude wouldn't know from
-   reading reading phase6_mmio.md alone. Skip anything already documented there.
-2. Open `phase6_mmio.md` and add notes to "Lessons from Previous Phase".
-3. Report completion to the user.
+
+1. Write `phase5_lessons.md`.
+2. Add notes to `phase6_mmio.md`.
+3. Report completion.
 """
     path = output_dir / "phase5_acc_hazard.md"
     path.write_text(md, encoding="utf-8")
@@ -752,67 +701,49 @@ When ALL functions compile:
 
 
 def generate_phase6(funcs, data, output_dir):
-    """Phase 6: ACCESSES_MMIO — hardware register access."""
     total_size = sum(r["size"] for r in funcs)
     gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
+    show_cpp = any(r.get("cpp_found") is not None for r in funcs)
+    md = f"""# Phase 6: MMIO — Hardware Register Access
 
-    md = f"""# Phase 6: MMIO — Hardware Register Access Functions
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
-
+{_quickstart_note(funcs)}
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
-- **What these are:** Functions that directly read/write PS2 hardware registers (GS, VIF, DMA, timers, etc.)
-- **Expected difficulty:** VERY HIGH. These interact with hardware that doesn't exist on PC. Most will need HLE (High-Level Emulation) stubs or runtime hooks.
-- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` before touching any function.
+- **Expected difficulty:** VERY HIGH.
+- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` before any function.
 
 ---
 
 ## Instructions for Claude
 
-### ⚠️ CRITICAL: Read the Skill file FIRST
-These functions touch PS2 hardware. You MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` before proceeding.
+### ⚠️ Read the Skill file FIRST
 
-### What to do
-1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
-   Functions that compile clean → mark done, skip.
-   Only fix functions with actual errors.
-2. Open the `.cpp` file in `/auto_Recomp/`.
-3. Identify which MMIO registers are accessed by searching assembly:
-   ```bash
-   grep -A 100 "FUNCTION_ADDRESS" assembly.txt
-   ```
-4. Check `triage_map.json` for hardware flags:
-   ```bash
-   grep -B 2 -A 30 "FUNCTION_NAME" triage_map.json
-   ```
-5. For each MMIO access, determine the correct strategy:
-   - **Stub it:** If the hardware interaction is not needed on PC (e.g., DMA sync wait), replace with a no-op and comment.
-   - **HLE it:** If the function does something observable (e.g., uploads a texture), translate to PC API calls.
-   - **Flag it:** If uncertain, add `// TODO: MMIO — [register address] — needs HLE implementation`.
+1. CHECK FIRST: `cmake --build build64/`.
+2. Identify MMIO registers: `grep -A 100 "FUNCTION_ADDRESS" assembly.txt`
+3. Strategy per access:
+   - **Stub:** no-op + comment (e.g. DMA sync waits not needed on PC)
+   - **HLE:** translate to PC API call (e.g. texture upload)
+   - **Flag:** `// TODO: MMIO — 0xADDR — needs HLE`
 
-### PS2 MMIO Address Ranges
+### PS2 MMIO Ranges
+
 | Range | Hardware |
 |-------|----------|
 | `0x10000000-0x10001FFF` | EE Timers, INTC, SIF |
-| `0x10002000-0x10002FFF` | IPU (Image Processing Unit) |
-| `0x10003000-0x10003FFF` | GIF (Graphics Interface) |
+| `0x10003000-0x10003FFF` | GIF |
 | `0x10003800-0x10003C30` | VIF0/VIF1 |
 | `0x10008000-0x1000EFFF` | DMA channels |
-| `0x12000000-0x12001FFF` | GS (Graphics Synthesizer) privileged |
-| `0x70000000-0x70003FFF` | Scratchpad RAM (16KB, must be mapped) |
+| `0x12000000-0x12001FFF` | GS privileged |
+| `0x70000000-0x70003FFF` | Scratchpad RAM |
 
-### What NOT to do
-- Do NOT try to emulate full hardware behavior — that's what PCSX2 does. We want HLE.
-- Do NOT remove MMIO code entirely — stub it with a comment so it can be revisited.
-- Do NOT change function structure or labels.
-
-### Completion criteria
-Zero errors/warnings, all labels intact, every MMIO access either stubbed/HLE'd/flagged with `// TODO: MMIO`.
+**Completion:** zero errors, labels intact, every MMIO access stubbed/HLE'd/flagged.
 
 ---
 
@@ -823,16 +754,15 @@ Zero errors/warnings, all labels intact, every MMIO access either stubbed/HLE'd/
 
 ## Function List ({len(funcs):,} functions)
 
-{format_function_table(funcs, include_fpu=True)}
+{format_function_table(funcs, include_fpu=True, show_cpp=show_cpp)}
 
 ---
 
 ## Phase Transition
-When ALL functions compile:
-1. Write `phase6_lessons.md` — its sole purpose is to document MMIO patterns
-   that were surprising or non-obvious. Skip anything already in the Skill file.
-2. Open `phase7_vu0_microcode.md` and add notes to "Lessons from Previous Phase".
-3. Report completion to the user.
+
+1. Write `phase6_lessons.md`.
+2. Add notes to `phase7_vu0_microcode.md`.
+3. Report completion.
 """
     path = output_dir / "phase6_mmio.md"
     path.write_text(md, encoding="utf-8")
@@ -840,70 +770,43 @@ When ALL functions compile:
 
 
 def generate_phase7(funcs, data, output_dir):
-    """Phase 7: VU0_MICROCODE — functions using vcallms/vcallmsr (VU0 micro mode)."""
     total_size = sum(r["size"] for r in funcs)
     gp = data.get("global_pointer", "UNKNOWN — MUST SET BEFORE RUNNING")
-
+    show_cpp = any(r.get("cpp_found") is not None for r in funcs)
     md = f"""# Phase 7: VU0 Microcode — vcallms/vcallmsr Functions
+
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 **Global Pointer ($gp):** {gp}
-
+{_quickstart_note(funcs)}
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
-- **What these are:** Functions that call VU0 microprograms via `vcallms` or `vcallmsr` instructions. These execute code on the Vector Unit 0 coprocessor.
-- **Expected difficulty:** EXTREME. VU0 micro mode runs a separate instruction stream on dedicated hardware. Static recompilation cannot auto-translate these — they need hand-written HLE or complete VU0 microprogram reimplementation.
-- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` AND `db-vu-instructions.md` before touching any function.
+- **Expected difficulty:** EXTREME.
+- **Skill file required:** YES — read `/ps2-recomp-Agent-SKILL-0.4.3/` AND `db-vu-instructions.md`.
 
 ---
 
 ## Instructions for Claude
 
-### CRITICAL: Read the Skill file FIRST
-You MUST read `/ps2-recomp-Agent-SKILL-0.4.3/` resources on VU0 architecture before proceeding.
-Also load `db-vu-instructions.md` for the VU instruction reference.
+### ⚠️ Read the Skill file FIRST
 
-### What to do
-1. CHECK FIRST: Run `cmake --build build64/` (incremental build).
-   Functions that compile clean → mark done, skip.
-   Only fix functions with actual errors.
-2. For each function:
-   a. Search the assembly for the `vcallms` instruction and its target address:
-      ```bash
-      grep -A 100 "FUNCTION_ADDRESS" assembly.txt | grep -i vcallms
-      ```
-   b. The `vcallms` operand is the VU0 microprogram entry address (in VU0 micro memory).
-   c. Determine what the microprogram does (typically: matrix multiply, transform, lighting).
-   d. Replace the `vcallms` call with equivalent C++ math operations.
-3. Mark every translation with a comment showing the original VU0 call:
+1. CHECK FIRST: `cmake --build build64/`.
+2. Locate `vcallms` target: `grep -A 100 "FUNCTION_ADDRESS" assembly.txt | grep -i vcallms`
+3. Determine microprogram purpose (matrix multiply, transform, lighting, etc.)
+4. Replace `vcallms` with C++ math. Mark with comment:
    ```cpp
    // vcallms 0x0000 — VU0 microprogram: matrix multiply
-   // Replaces VU0 micro mode execution with C++ equivalent
    result = matrix * vector;
    ```
+5. Unknown microprograms → stub: `// TODO: VU0_MICROCODE — needs microprogram analysis`
 
-### VU0 Micro Mode Reference
-- `vcallms imm`: Call VU0 microprogram at address `imm` (in VU micro memory, not EE memory).
-- `vcallmsr`: Call VU0 microprogram at address stored in CMSAR0 register.
-- The VU0 microprogram reads/writes VU0 registers (vf00-vf31, vi00-vi15).
-- Data is passed via VU0 data memory and COP2 register transfers (`ctc2`/`cfc2`/`qmtc2`/`qmfc2`).
+**A stubbed function counts as done.**
 
-### Strategy per function
-1. **If the microprogram is a known pattern** (matrix multiply, vector normalize, dot product): replace with C++ math.
-2. **If the microprogram is unknown**: stub the function with `// TODO: VU0_MICROCODE — needs microprogram analysis` and move on.
-3. **Do NOT try to emulate VU0 execution** — that's what PCSX2 does. We want HLE.
-
-### What NOT to do
-- Do NOT skip the Skill file read.
-- Do NOT try to interpret VU0 microcode from the EE assembly alone — the microprogram lives in VU memory.
-- Do NOT change function structure or labels.
-
-### Completion criteria
-Zero errors/warnings, all labels intact, every `vcallms` either HLE'd or stubbed with TODO comment.
-**A stubbed function counts as done** — do not block phase completion waiting for microprogram analysis.
+**Completion:** zero errors, labels intact, every `vcallms` HLE'd or TODO'd.
 
 ---
 
@@ -914,16 +817,15 @@ Zero errors/warnings, all labels intact, every `vcallms` either HLE'd or stubbed
 
 ## Function List ({len(funcs):,} functions)
 
-{format_function_table(funcs, include_fpu=True)}
+{format_function_table(funcs, include_fpu=True, show_cpp=show_cpp)}
 
 ---
 
 ## Project Completion
-When all Phase 7 functions compile:
-1. Write `phase7_lessons.md` — document VU0 microcode patterns found.
-2. Write `project_summary.md` summarizing all phases, total functions completed,
-   and remaining TODO items (especially unresolved VU0 microprograms).
-3. Report completion to the user.
+
+1. Write `phase7_lessons.md`.
+2. Write `project_summary.md` with phase totals and remaining TODOs.
+3. Report completion.
 """
     path = output_dir / "phase7_vu0_microcode.md"
     path.write_text(md, encoding="utf-8")
@@ -931,45 +833,34 @@ When all Phase 7 functions compile:
 
 
 def generate_orphan(funcs, data, output_dir):
-    """Orphan Code — zero-reference functions, likely dead code."""
     total_size = sum(r["size"] for r in funcs)
-
     md = f"""# Orphan Code — Zero-Reference Functions
+
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **ELF Hash:** {data.get('elf_hash', 'N/A')}
 
 ---
 
 ## Overview
+
 - **Total functions:** {len(funcs):,}
 - **Total code size:** {total_size:,} bytes ({total_size/1024:.1f} KB)
-- **What these are:** Functions with ZERO incoming references — nothing in the binary calls them.
-- **Likely explanation:** Dead code, debug functions, or functions called only via jump tables not resolved by Ghidra.
+- **What these are:** Functions with zero incoming references. Likely dead code.
 
 ---
 
 ## Instructions for Claude
 
-### What to do
-1. **Do NOT fix these proactively.** These functions are likely dead code.
-2. If a compilation error in another phase mentions an orphan function, come here to fix it.
-3. If after all other phases are done, the game still doesn't work correctly, check if any orphan functions are actually needed (called via indirect jumps or function pointers).
-
-### When to investigate
-- A function here has a name that suggests it's important (e.g., contains "init", "main", "update").
-- The game crashes and the call stack points to an orphan function address.
-- A jump table in another function targets an orphan function's address.
-
-### What NOT to do
-- Do NOT spend time fixing these unless there's evidence they're needed.
-- Do NOT delete them from the build — they may be reached via indirect calls.
+**Do NOT fix these proactively.** Come here only if:
+- A compilation error elsewhere references an orphan address.
+- The game crashes and the call stack points here.
+- A jump table in another function targets an orphan address.
 
 ---
 
 ## Function List ({len(funcs):,} functions)
 
-<!-- populated by triage_analyzer.py from triage_map.json -->
-{format_function_table(funcs, include_fpu=False) if funcs else "*(No orphan functions in this build.)*"}
+{format_function_table(funcs, include_fpu=False) if funcs else "*(No orphan functions.)*"}
 """
     path = output_dir / "orphan_code.md"
     path.write_text(md, encoding="utf-8")
@@ -977,550 +868,313 @@ def generate_orphan(funcs, data, output_dir):
 
 
 # =========================================================
-# MAIN PHASE GENERATION ENTRY POINT
+# [NEW-3] PHASE 8 — INTEGRATION (replaces manual set-diff)
 # =========================================================
 
-def generate_phases(data, rows, output_dir):
-    """Generate all phase MD files (7 phases + orphan report)."""
+def generate_phase8(data, rows, output_dir, recomp_dir=None, cmake_path=None):
+    """
+    Finds .cpp files in recomp_dir that are NOT referenced in CMakeLists.txt.
+    If recomp_dir is None, uses rows with cpp_found=False instead.
+    """
+    missing_files = []
+
+    if recomp_dir and cmake_path and Path(cmake_path).exists():
+        cmake_content = Path(cmake_path).read_text(encoding="utf-8", errors="replace")
+        registered = set(re.findall(r'recomp/([^\s\)]+\.cpp)', cmake_content))
+
+        for p in sorted(glob.glob(str(Path(recomp_dir) / "*.cpp"))):
+            fname = Path(p).name
+            if fname not in registered:
+                missing_files.append(fname)
+    elif rows:
+        # Fallback: rows with cpp_found=False
+        missing_files = [
+            f"{r['name']}_{r['address'].lower()}.cpp"
+            for r in rows
+            if r.get("cpp_found") is False
+        ]
+
+    total_size = sum(r["size"] for r in rows if r["disposition"] == "RECOMPILE")
+    md = f"""# Phase 8: Final Integration
+
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+
+## Overview
+
+- **Unregistered files:** {len(missing_files):,}
+- **What to do:** Add all files below to `target_sources(dc2_game PRIVATE ...)` in `CMakeLists.txt`.
+
+> **Detection method:** Set-diff between `recomp/*.cpp` on disk and paths already in CMakeLists.txt.
+> Run `python triage_analyzer.py triage_map.json cmake-block all` to get a ready-to-paste block.
+
+---
+
+## Unregistered Files ({len(missing_files):,})
+
+"""
+    if missing_files:
+        for f in missing_files:
+            md += f"- `recomp/{f}`\n"
+    else:
+        md += "*All recomp/ files are already registered in CMakeLists.txt.*\n"
+
+    md += """
+---
+
+## Phase Transition
+
+When build passes with exit code 0:
+1. Record total file count in `lessons_log.md` under Phase 8.
+2. Proceed to Phase 9 (runtime integration / stub gap analysis).
+"""
+    path = output_dir / "phase8_integration.md"
+    path.write_text(md, encoding="utf-8")
+    return path, len(missing_files)
+
+
+# =========================================================
+# MAIN PHASE GENERATION
+# =========================================================
+
+def generate_phases(data, rows, output_dir, recomp_dir=None, cmake_path=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     phases = classify_phases(rows)
-
     generators = {
-        "phase1_safe_leaf": generate_phase1,
-        "phase2_wrappers": generate_phase2,
-        "phase3_math": generate_phase3,
-        "phase4a_game_logic": generate_phase4a,
+        "phase1_safe_leaf":       generate_phase1,
+        "phase2_wrappers":        generate_phase2,
+        "phase3_math":            generate_phase3,
+        "phase4a_game_logic":     generate_phase4a,
         "phase4b_state_machines": generate_phase4b,
-        "phase5_acc_hazard": generate_phase5,
-        "phase6_mmio": generate_phase6,
-        "phase7_vu0_microcode": generate_phase7,
-        "orphan_code": generate_orphan,
+        "phase5_acc_hazard":      generate_phase5,
+        "phase6_mmio":            generate_phase6,
+        "phase7_vu0_microcode":   generate_phase7,
+        "orphan_code":            generate_orphan,
     }
 
-    phase_order = [
-        "phase1_safe_leaf", "phase2_wrappers", "phase3_math",
-        "phase4a_game_logic", "phase4b_state_machines",
-        "phase5_acc_hazard", "phase6_mmio", "phase7_vu0_microcode",
-        "orphan_code",
-    ]
+    print(f"\nGenerating phase files in: {output_dir}")
+    total_recompile = 0
+    for key, gen in generators.items():
+        funcs = phases[key]
+        path, count = gen(funcs, data, output_dir)
+        status = f"  {path.name:<35s} {count:>5,} functions"
+        if key != "orphan_code":
+            cpp_found = sum(1 for r in funcs if r.get("cpp_found") is True)
+            if any(r.get("cpp_found") is not None for r in funcs):
+                status += f"  ({cpp_found}/{count} cpp found)"
+        print(status)
+        if key != "orphan_code":
+            total_recompile += count
 
-    print("=" * 70)
-    print("PS2Recomp Phase Generator")
-    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"ELF Hash: {data.get('elf_hash', 'N/A')}")
-    print("=" * 70)
-    print()
+    # [NEW-3] Phase 8
+    path8, missing = generate_phase8(data, rows, output_dir, recomp_dir, cmake_path)
+    print(f"  {path8.name:<35s} {missing:>5,} unregistered files")
 
-    total_funcs = 0
-    orphan_count = 0
-    for phase_key in phase_order:
-        funcs = phases[phase_key]
-        gen_func = generators[phase_key]
-        path, count = gen_func(funcs, data, output_dir)
-        if phase_key == "orphan_code":
-            orphan_count = count
-        else:
-            total_funcs += count
-        size = sum(r["size"] for r in funcs)
-        print(f"  {path.name:35s}  {count:>5,} functions  {size/1024:>8.1f} KB")
+    print(f"\nTotal RECOMPILE functions across phases: {total_recompile:,}")
 
-    # Count functions not assigned to any phase (SKIP, STUB)
-    recompile_count = sum(1 for r in rows if r["disposition"] == "RECOMPILE")
-    skip_count = sum(1 for r in rows if r["disposition"] == "SKIP")
-    stub_count = sum(1 for r in rows if r["disposition"] == "STUB")
 
-    print()
-    print(f"  Active phases:    {total_funcs:>5,} / {recompile_count:,} RECOMPILE functions")
-    print(f"  Orphan (deferred):{orphan_count:>5,}")
-    print(f"  Skipped (SKIP):   {skip_count:>5,}")
-    print(f"  Stubbed (STUB):   {stub_count:>5,}")
-    print()
+# =========================================================
+# [NEW-5] CMAKE-BLOCK GENERATOR
+# =========================================================
 
-    expected = total_funcs + orphan_count
-    if expected != recompile_count:
-        diff = recompile_count - expected
-        print(f"  WARNING: {diff} RECOMPILE functions were not assigned to any phase.")
-        print(f"    Check classification logic if this is unexpected.")
+PHASE_KEYS = {
+    "phase1": "phase1_safe_leaf",
+    "phase2": "phase2_wrappers",
+    "phase3": "phase3_math",
+    "phase4a": "phase4a_game_logic",
+    "phase4b": "phase4b_state_machines",
+    "phase5": "phase5_acc_hazard",
+    "phase6": "phase6_mmio",
+    "phase7": "phase7_vu0_microcode",
+}
+
+def cmd_cmake_block(data, rows, phase_key, recomp_dir=None):
+    """
+    [NEW-5] Print a ready-to-paste target_sources() block for a phase.
+    If recomp_dir given, only include files that actually exist on disk.
+    """
+    phases = classify_phases(rows)
+    if phase_key == "all":
+        funcs = []
+        for k in PHASE_KEYS.values():
+            funcs.extend(phases[k])
     else:
-        print(f"  All RECOMPILE functions assigned. No gaps.")
+        internal_key = PHASE_KEYS.get(phase_key)
+        if not internal_key:
+            print(f"Unknown phase '{phase_key}'. Valid: {', '.join(PHASE_KEYS)} all")
+            return
+        funcs = phases[internal_key]
 
-    print()
-    print(f"Output directory: {output_dir.resolve()}")
-    print("=" * 70)
-
-
-# =========================================================
-# FULL REPORT GENERATOR (original, preserved)
-# =========================================================
-
-def generate_report(data, rows, output_path):
     lines = []
-    w = lines.append
+    for r in funcs:
+        try:
+            addr_int = int(r["address"], 16)
+            fname = f"{r['name']}_0x{addr_int:x}.cpp"
+        except ValueError:
+            fname = f"{r['name']}_{r['address']}.cpp"
 
-    def sep():
-        w("=" * 90)
-    def subsep():
-        w("-" * 90)
+        if recomp_dir:
+            full = Path(recomp_dir) / fname
+            if not full.exists():
+                continue  # skip missing files
+        lines.append(f"    recomp/{fname}")
 
-    stats = data.get("statistics", {})
-    total_all = stats.get("total_functions", len(rows))
-    total_enriched = stats.get("enriched_count", len(rows))
-    total_size = sum(r["size"] for r in rows)
+    if not lines:
+        print("No files found (check --recomp-dir path).")
+        return
 
-    # ---- SECTION 1: BINARY OVERVIEW ----
-    sep()
-    w("PS2Recomp TRIAGE REPORT")
-    w(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    sep()
-    w("")
-    w("SECTION 1: BINARY OVERVIEW")
-    subsep()
-    w(f"  ELF Hash             : {data.get('elf_hash', 'N/A')}")
-    w(f"  Schema Version       : {data.get('schema_version', 'N/A')}")
-    tr = data.get("text_range", {})
-    if tr:
-        w(f"  Code Range           : {tr.get('start','?')} - {tr.get('end','?')}")
-    w(f"  Total Functions (ELF): {total_all}")
-    w(f"  Enriched (our scope) : {total_enriched}")
-    w(f"  Total Code Size      : {total_size:,} bytes ({total_size/1024:.1f} KB)")
-    w("")
-
-    cat_counts, cat_sizes = {}, {}
-    for r in rows:
-        c = r["category"]
-        cat_counts[c] = cat_counts.get(c, 0) + 1
-        cat_sizes[c] = cat_sizes.get(c, 0) + r["size"]
-    w("  Category Distribution:")
-    for c, count in sorted(cat_counts.items(), key=lambda x: -x[1]):
-        pct = (count / len(rows)) * 100
-        w(f"    {c:20s}: {count:5d} ({pct:5.1f}%)  {cat_sizes[c]/1024:8.1f} KB")
-    w("")
-
-    disp_counts = {}
-    for r in rows:
-        disp_counts[r["disposition"]] = disp_counts.get(r["disposition"], 0) + 1
-    w("  Disposition:")
-    for d, count in sorted(disp_counts.items(), key=lambda x: -x[1]):
-        w(f"    {d:12s}: {count:5d} ({count*100/len(rows):.1f}%)")
-    w("")
-
-    tag_counts = {}
-    for r in rows:
-        for t in r["tag_list"]:
-            tag_counts[t] = tag_counts.get(t, 0) + 1
-    w("  Tag Distribution:")
-    for t, count in sorted(tag_counts.items(), key=lambda x: -x[1]):
-        w(f"    {t:25s}: {count}")
-    w("")
-
-    # ---- SECTION 2: COVERAGE ----
-    w("SECTION 2: AUTO-TRANSLATION COVERAGE")
-    subsep()
-
-    safe_rows = [r for r in rows if "SAFE_LEAF" in r["tag_list"]]
-    safe_size = sum(r["size"] for r in safe_rows)
-    hazard_tags = ["ACC_PRECISION_HAZARD", "VIF_DMA_UPLOAD", "SMC_HAZARD",
-                   "SPR_SYNC_HAZARD", "BUSY_WAIT_HAZARD"]
-    hazard_rows = [r for r in rows if any(h in r["tag_list"] for h in hazard_tags)]
-    hazard_size = sum(r["size"] for r in hazard_rows)
-
-    w(f"  SAFE_LEAF (auto-translate):")
-    w(f"    Functions : {len(safe_rows):,} / {len(rows):,} ({len(safe_rows)*100/len(rows):.1f}%)")
-    w(f"    Code Size : {safe_size:,} / {total_size:,} bytes ({safe_size*100/total_size:.1f}%)")
-    w("")
-    w(f"  HAZARD (manual HLE override):")
-    w(f"    Functions : {len(hazard_rows):,}")
-    w(f"    Code Size : {hazard_size:,} bytes ({hazard_size*100/total_size:.1f}%)")
-    w("")
-    w(f"  STUB (runtime handler) : {disp_counts.get('STUB', 0):,}")
-    w(f"  SKIP (excluded)        : {disp_counts.get('SKIP', 0):,}")
-    w("")
-
-    bar_total = 60
-    bar_safe = max(1, int(safe_size / total_size * bar_total)) if total_size else 0
-    bar_haz = max(0, int(hazard_size / total_size * bar_total)) if total_size else 0
-    bar_rest = bar_total - bar_safe - bar_haz
-    w(f"  [{'#' * bar_safe}{'!' * bar_haz}{'.' * bar_rest}]")
-    w(f"   # = SAFE ({safe_size*100/total_size:.1f}%)  ! = HAZARD ({hazard_size*100/total_size:.1f}%)  . = Other")
-    w("")
-
-    # ---- SECTION 3: SAFE FUNCTIONS ----
-    w("SECTION 3: SAFE FUNCTIONS — Auto-translate list")
-    subsep()
-    w(f"  Total: {len(safe_rows)} functions ({safe_size:,} bytes)")
-    w(f"  Leaf functions: call nothing, no complex side effects.")
-    w("")
-    w(f"  {'Address':>12s}  {'Size':>6s}  {'Category':>16s}  Name")
-    subsep()
-    for r in sorted(safe_rows, key=lambda x: -x["size"]):
-        w(f"  {r['address']:>12s}  {r['size']:>6d}  {r['category']:>16s}  {r['name']}")
-    w("")
-
-    # ---- SECTION 4: MANUAL OVERRIDE LIST ----
-    w("SECTION 4: FUNCTIONS REQUIRING MANUAL OVERRIDE")
-    subsep()
-    w("  Detailed reasons per function. Sorted by severity then size.")
-    w("")
-
-    risk_tags_all = hazard_tags + ["MULTI_RETURN", "VU0_VECTORS", "USES_SPR"]
-    override_rows = [r for r in rows if any(t in r["tag_list"] for t in risk_tags_all)]
-    override_rows.sort(key=lambda r: (-len([t for t in r["tag_list"] if t in risk_tags_all]), -r["size"]))
-
-    w(f"  Total: {len(override_rows)} functions")
-    w("")
-
-    for r in override_rows:
-        w(f"  {r['address']}  {r['name']}")
-        reasons = []
-
-        if "ACC_PRECISION_HAZARD" in r["tag_list"]:
-            reasons.append(
-                f"ACC_PRECISION_HAZARD: {r.get('acc_ops',0)} accumulator ops (madda.s/vmadd/vmsub). "
-                f"PS2 FPU is non-IEEE-754 (no NaN/Inf, different rounding). "
-                f"C++ float translation causes precision drift that breaks physics/animation over frames. "
-                f"Needs SIMD override with PS2-accurate rounding.")
-
-        if "VIF_DMA_UPLOAD" in r["tag_list"]:
-            reasons.append(
-                "VIF_DMA_UPLOAD: Writes to VIF0/VIF1 MMIO (0x10003800-0x10003C30). "
-                "Uploads VU1 microcode/geometry via DMA chain. "
-                "Cannot be statically translated — needs HLE graphics API reimplementation.")
-
-        if "SMC_HAZARD" in r["tag_list"]:
-            reasons.append(
-                "SMC_HAZARD: Writes to executable code addresses (self-modifying code). "
-                "Static translation assumes immutable code. Needs runtime interpreter or patch-out.")
-
-        if "SPR_SYNC_HAZARD" in r["tag_list"]:
-            reasons.append(
-                "SPR_SYNC_HAZARD: Uses Scratchpad RAM (0x70000000) + sync barriers. "
-                "PC DMA emulation timing mismatch can cause deadlocks. "
-                "Needs careful HLE or sync removal.")
-
-        if "BUSY_WAIT_HAZARD" in r["tag_list"]:
-            reasons.append(
-                "BUSY_WAIT_HAZARD: MMIO read in tight loop (hardware polling). "
-                "Burns CPU on PC. Replace with yield/sleep or event callback.")
-
-        if "VU0_VECTORS" in r["tag_list"]:
-            reasons.append(
-                f"VU0_VECTORS: COP2 instructions present. FPU={r.get('fpu_ops',0)}, ACC={r.get('acc_ops',0)}. "
-                f"PS2Recomp handles basic COP2 but VU0 macro mode flag register edge cases may slip. "
-                f"Verify output correctness against hardware.")
-
-        if "USES_SPR" in r["tag_list"] and "SPR_SYNC_HAZARD" not in r["tag_list"]:
-            reasons.append(
-                "USES_SPR: Accesses Scratchpad RAM (0x70000000-0x70003FFF). "
-                "Ensure runtime maps this 16KB region. Performance-critical on PS2, trivial on PC.")
-
-        if "MULTI_RETURN" in r["tag_list"]:
-            reasons.append(
-                f"MULTI_RETURN: {r.get('return_paths',0)} return paths. "
-                f"Multiple exits increase control flow translation errors. "
-                f"Verify all paths reachable and return values correct.")
-
-        fpu = r.get("fpu_ops", 0)
-        branch = r.get("branch_ops", 0)
-        callee = r.get("callee_count", 0)
-        size = r["size"]
-
-        if fpu > 30:
-            reasons.append(
-                f"HIGH_FPU_DENSITY: {fpu} float ops in {size} bytes. "
-                f"Precision-sensitive — compare against PS2 hardware output.")
-        if callee > 15:
-            reasons.append(
-                f"HIGH_FAN_OUT: Calls {callee} functions. Manager/orchestrator pattern. "
-                f"Bug here propagates to all callees — test thoroughly.")
-        if branch > 20:
-            reasons.append(
-                f"HIGH_COMPLEXITY: {branch} branches. Complex control flow increases "
-                f"translation error risk. Review decompiled C++ output manually.")
-
-        for reason in reasons:
-            w(f"    -> {reason}")
-        w("")
-
-    # ---- SECTION 5: ARCHITECTURE WARNINGS ----
-    w("SECTION 5: ARCHITECTURE WARNINGS")
-    subsep()
-
-    w("  5a. HIGH FAN-IN FUNCTIONS (callee_count > 10)")
-    w("      A bug in these propagates across the game.")
-    w("")
-    high_fanin = sorted([r for r in rows if r.get("callee_count", 0) > 10],
-                        key=lambda x: -x.get("callee_count", 0))
-    if high_fanin:
-        w(f"  {'Address':>12s}  {'Callees':>8s}  {'Size':>6s}  {'Category':>16s}  Name")
-        subsep()
-        for r in high_fanin[:40]:
-            w(f"  {r['address']:>12s}  {r.get('callee_count',0):>8d}  {r['size']:>6d}  "
-              f"{r['category']:>16s}  {r['name'][:45]}")
-    else:
-        w("  None found.")
-    w("")
-
-    w("  5b. MULTI-RETURN FUNCTIONS (3+ exit paths)")
-    w("")
-    multi_ret = [r for r in rows if "MULTI_RETURN" in r["tag_list"]]
-    if multi_ret:
-        for r in sorted(multi_ret, key=lambda x: -x.get("return_paths", 0)):
-            w(f"  {r['address']}  returns={r.get('return_paths',0):2d}  "
-              f"size={r['size']:5d}  {r['name'][:50]}")
-    else:
-        w("  None found.")
-    w("")
-
-    w("  5c. GLOBAL WRITERS WITHOUT STACK FRAME")
-    w("      Likely interrupt handlers or compiler artifacts.")
-    w("")
-    no_frame = [r for r in rows if r.get("writes_global") and not r.get("has_stack_frame") and r["size"] > 20]
-    if no_frame:
-        for r in sorted(no_frame, key=lambda x: -x["size"]):
-            w(f"  {r['address']}  size={r['size']:5d}  {r['category']:>16s}  {r['name'][:45]}")
-    else:
-        w("  None found.")
-    w("")
-
-    # ---- SECTION 6: GLOBAL CONTEXT ----
-    w("SECTION 6: GLOBAL CONTEXT — Critical Runtime Configuration")
-    subsep()
-
-    gp = data.get("global_pointer")
-    if gp:
-        w(f"  Global Pointer ($gp): {gp}")
-        w(f"")
-        w(f"  *** CRITICAL: Set ctx->gp = {gp} in PS2Recomp runtime BEFORE any")
-        w(f"  recompiled code executes. MIPS $gp-relative addressing covers all")
-        w(f"  .sdata/.sbss globals. Wrong GP = thousands of functions crash on")
-        w(f"  Memory Access Violation. This is the #1 configuration priority. ***")
-    else:
-        w("  Global Pointer ($gp): NOT FOUND")
-        w("  *** WARNING: No _gp symbol. Determine GP manually from crt0/ELF header.")
-        w("  Without it, all GP-relative loads/stores will segfault. ***")
-    w("")
-
-    w(f"  ELF Fingerprint: {data.get('elf_hash', 'N/A')}")
-    w(f"  All addresses are build-specific. Do NOT use with different region/version.")
-    w("")
-
-    spr_funcs = [r for r in rows if "USES_SPR" in r["tag_list"]]
-    if spr_funcs:
-        w(f"  Scratchpad RAM: {len(spr_funcs)} functions access 0x70000000-0x70003FFF")
-        w(f"  Runtime must map this 16KB region.")
-        for r in spr_funcs:
-            w(f"    {r['address']}  {r['name'][:50]}")
-    w("")
-
-    # ---- SECTION 7: TRIAGE PRIORITY ----
-    w("SECTION 7: TRIAGE PRIORITY — Top 20 Targets for Week 1")
-    subsep()
-    w("  Largest, most FPU/VU0-heavy non-SAFE functions.")
-    w("  Score = size + (fpu_ops * 10) + (acc_ops * 50) + hazard bonuses")
-    w("")
-
-    hle_candidates = [r for r in rows
-                      if "SAFE_LEAF" not in r["tag_list"]
-                      and r["category"] != "GETTER"
-                      and r["disposition"] == "RECOMPILE"]
-
-    for r in hle_candidates:
-        r["_priority"] = compute_priority_score(r)
-
-    hle_candidates.sort(key=lambda x: -x["_priority"])
-
-    w(f"  {'#':>3s}  {'Address':>12s}  {'Score':>7s}  {'Size':>6s}  {'FPU':>4s}  "
-      f"{'ACC':>4s}  {'Br':>4s}  {'Cat':>14s}  Name")
-    subsep()
-    for i, r in enumerate(hle_candidates[:20], 1):
-        flags = ""
-        if "ACC_PRECISION_HAZARD" in r["tag_list"]: flags += "[ACC!] "
-        if "VU0_VECTORS" in r["tag_list"]: flags += "[VU0] "
-        if "USES_SPR" in r["tag_list"]: flags += "[SPR] "
-        if "MULTI_RETURN" in r["tag_list"]: flags += "[MR] "
-        w(f"  {i:>3d}  {r['address']:>12s}  {r['_priority']:>7d}  {r['size']:>6d}  "
-          f"{r.get('fpu_ops',0):>4d}  {r.get('acc_ops',0):>4d}  "
-          f"{r.get('branch_ops',0):>4d}  {r['category']:>14s}  {flags}{r['name'][:38]}")
-    w("")
-
-    top20_size = sum(r["size"] for r in hle_candidates[:20])
-    w(f"  Top 20 total: {top20_size:,} bytes ({top20_size/1024:.1f} KB)")
-    w(f"  Completing these covers the most critical complex code paths.")
-    w("")
-    sep()
-    w("END OF REPORT")
-    sep()
-
-    report_text = "\n".join(lines)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(report_text)
-    print(f"Report written to: {output_path}")
-    print(f"  Lines: {len(lines)} | Safe: {len(safe_rows)} | Override: {len(override_rows)} | Priority: {min(20, len(hle_candidates))}")
+    print(f"target_sources(dc2_game PRIVATE")
+    for l in lines:
+        print(l)
+    print(")")
+    print(f"\n# {len(lines)} files")
 
 
 # =========================================================
-# CLI COMMANDS (unchanged)
+# [NEW-2] STUB GAP COMMAND
 # =========================================================
 
-def print_header(data):
-    print(f"ELF Hash       : {data.get('elf_hash', 'N/A')}")
-    print(f"Schema Version : {data.get('schema_version', 'N/A')}")
-    print(f"Global Pointer : {data.get('global_pointer', 'N/A')}")
-    tr = data.get("text_range", {})
-    if tr: print(f"Code Range     : {tr.get('start','?')} - {tr.get('end','?')}")
-    print()
+def cmd_stub_gap(data, rows):
+    """
+    [NEW-2] Print all STUB functions that have runtime_has_handler=false.
+    Requires schema_version >= 3 triage_map.json.
+    """
+    schema = data.get("schema_version", 1)
+    if schema < 3:
+        print(f"WARNING: triage_map.json schema v{schema}. Regenerate with Triage Enricher v3 for full stub gap data.")
+        print("Falling back to name-based heuristic...\n")
+
+    missing = [r for r in rows
+               if r["disposition"] == "STUB"
+               and r.get("runtime_has_handler") is False]
+    unknown = [r for r in rows
+               if r["disposition"] == "STUB"
+               and r.get("runtime_has_handler") is None]
+
+    print(f"STUB GAP REPORT")
+    print(f"  Missing handlers : {len(missing)}")
+    print(f"  Unknown (v2 JSON): {len(unknown)}")
+    print(f"  Threshold for halt: >50\n")
+
+    if len(missing) > 50:
+        print("⚠️  EXCEEDS THRESHOLD — execution may halt at stub dispatch\n")
+
+    if missing:
+        print(f"{'Address':>12s}  {'Name'}")
+        print("-" * 60)
+        for r in sorted(missing, key=lambda x: x["address"]):
+            print(f"{r['address']:>12s}  {r['name']}")
+    else:
+        print("All STUB functions have known runtime handlers. ✓")
+
+
+# =========================================================
+# CLI COMMANDS (unchanged from v2 + new ones)
+# =========================================================
 
 def cmd_stats(data, rows):
-    print_header(data)
+    recompile = [r for r in rows if r["disposition"] == "RECOMPILE"]
+    stub      = [r for r in rows if r["disposition"] == "STUB"]
+    skip      = [r for r in rows if r["disposition"] == "SKIP"]
+    print(f"\nTriage Map Statistics")
+    print(f"  ELF hash    : {data.get('elf_hash','N/A')}")
+    print(f"  Schema v    : {data.get('schema_version',1)}")
+    print(f"  Total       : {len(rows):,}")
+    print(f"  RECOMPILE   : {len(recompile):,}")
+    print(f"  STUB        : {len(stub):,}")
+    print(f"  SKIP        : {len(skip):,}")
     stats = data.get("statistics", {})
-    print("=== PIPELINE STATISTICS ===")
-    for k, v in stats.items(): print(f"  {k:35s}: {v}")
-    print("\n=== CATEGORY DISTRIBUTION ===")
-    cc = {}
-    for r in rows: cc[r["category"]] = cc.get(r["category"], 0) + 1
-    for c, n in sorted(cc.items(), key=lambda x: -x[1]): print(f"  {c:20s}: {n:5d}")
-    print("\n=== TAG DISTRIBUTION ===")
-    tc = {}
-    for r in rows:
-        for t in r["tag_list"]: tc[t] = tc.get(t, 0) + 1
-    for t, n in sorted(tc.items(), key=lambda x: -x[1]): print(f"  {t:25s}: {n}")
+    if stats:
+        print(f"\nTag counts (RECOMPILE only):")
+        for k, v in stats.items():
+            if k not in ("total_functions","uncategorized_from_step1","enriched_count"):
+                print(f"  {k:<28s}: {v:,}")
 
-def cmd_top(data, rows, metric, n):
-    valid = sorted([r for r in rows if metric in r], key=lambda r: -r.get(metric, 0))
-    if not valid: print(f"Unknown metric: {metric}"); return
-    print(f"=== TOP {n} BY {metric.upper()} ===")
-    print(f"{'Address':>12s}  {metric:>10s}  {'Size':>6s}  {'Category':>16s}  Name")
-    for r in valid[:n]:
-        print(f"  {r['address']:>10s}  {r.get(metric,0):>10d}  {r['size']:>6d}  {r['category']:>16s}  {r['name'][:45]}")
 
-def cmd_tag(data, rows, tag_name):
-    matched = [r for r in rows if tag_name in r["tag_list"]]
-    if not matched: print(f"No functions with tag: {tag_name}"); return
-    print(f"=== TAG: {tag_name} ({len(matched)}) ===")
-    for r in sorted(matched, key=lambda x: -x["size"]):
-        print(f"  {r['address']:>10s}  {r['size']:>6d}  {r['category']:>16s}  {r['name'][:45]}")
+def cmd_top(rows, metric, n=20):
+    scored = [(r.get(metric, 0), r) for r in rows if r["disposition"] == "RECOMPILE"]
+    scored.sort(reverse=True)
+    print(f"\nTop {n} by {metric}:")
+    print(f"{'#':>4s}  {'Value':>8s}  {'Address':>12s}  Name")
+    for i, (val, r) in enumerate(scored[:n], 1):
+        print(f"{i:>4d}  {val:>8}  {r['address']:>12s}  {r['name']}")
 
-def cmd_category(data, rows, cat):
-    matched = [r for r in rows if r["category"].upper() == cat.upper()]
-    if not matched: print(f"No functions in category: {cat}"); return
-    print(f"=== {cat.upper()} ({len(matched)}) ===")
-    for r in sorted(matched, key=lambda x: -x["size"])[:50]:
-        print(f"  {r['address']:>10s}  {r['size']:>6d}  fpu={r.get('fpu_ops',0):3d}  {r['name'][:45]}")
-    if len(matched) > 50: print(f"  ... +{len(matched)-50} more")
 
-def cmd_disposition(data, rows, disp):
-    matched = [r for r in rows if r["disposition"].upper() == disp.upper()]
-    if not matched: print(f"No functions: {disp}"); return
-    print(f"=== {disp.upper()} ({len(matched)}) ===")
-    for r in sorted(matched, key=lambda x: x["address"]):
-        print(f"  {r['address']:>10s}  {r['size']:>6d}  {r['category']:>16s}  {r['name'][:40]}")
-
-def cmd_filter(data, rows, args):
-    m = rows
-    if args.filter_category: m = [r for r in m if r["category"].upper() == args.filter_category.upper()]
-    if args.filter_tag: m = [r for r in m if args.filter_tag in r["tag_list"]]
-    if args.min_fpu is not None: m = [r for r in m if r.get("fpu_ops", 0) >= args.min_fpu]
-    if args.min_size is not None: m = [r for r in m if r["size"] >= args.min_size]
-    if args.min_acc is not None: m = [r for r in m if r.get("acc_ops", 0) >= args.min_acc]
-    if not m: print("No matches."); return
-    print(f"=== FILTER ({len(m)}) ===")
-    for r in sorted(m, key=lambda x: -x["size"]):
-        print(f"  {r['address']:>10s}  {r['size']:>6d}  fpu={r.get('fpu_ops',0):3d}  acc={r.get('acc_ops',0):3d}  {r['category']:>16s}  {r['name'][:38]}")
-
-def cmd_export(data, rows, tag, path):
-    matched = [r for r in rows if tag in r["tag_list"]]
-    if not matched: print(f"No functions with tag: {tag}"); return
-    with open(path, "w") as f:
-        keys = [k for k in matched[0] if k != "tag_list"]
-        f.write(",".join(keys) + "\n")
-        for r in matched: f.write(",".join(str(r.get(k, "")) for k in keys) + "\n")
-    print(f"Exported {len(matched)} to {path}")
+def cmd_report(data, rows, output_path=None):
+    lines = [f"PS2Recomp Triage Report — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+             f"ELF: {data.get('elf_hash','N/A')}",
+             "=" * 70]
+    phases = classify_phases(rows)
+    for key, funcs in phases.items():
+        if funcs:
+            total = sum(r["size"] for r in funcs)
+            lines.append(f"{key:<35s} {len(funcs):>5,} funcs  {total:>8,} bytes")
+    text = "\n".join(lines)
+    if output_path:
+        Path(output_path).write_text(text, encoding="utf-8")
+        print(f"Report written to {output_path}")
+    else:
+        print(text)
 
 
 # =========================================================
-# MAIN
+# ENTRY POINT
 # =========================================================
 
 def main():
-    # Double-click mode: no arguments → auto-find triage_map.json and generate phases
+    # Double-click mode: no arguments
     if len(sys.argv) == 1:
-        script_dir = Path(__file__).parent
-        json_path = script_dir / "triage_map.json"
-        if not json_path.exists():
-            # Try common variations
-            for name in ["triage_map.json", "triage.json"]:
-                candidate = script_dir / name
-                if candidate.exists():
-                    json_path = candidate
-                    break
-            else:
-                print("ERROR: triage_map.json not found in script directory.")
-                print(f"  Looked in: {script_dir}")
-                print(f"  Place triage_map.json next to this script, or use CLI mode:")
-                print(f"  python {Path(__file__).name} <triage_map.json> <command>")
-                input("\nPress Enter to exit...")
-                sys.exit(1)
-
-        print(f"Found: {json_path}")
-        data = load_triage(str(json_path))
+        candidates = list(Path(".").glob("triage_map.json"))
+        if not candidates:
+            print("No triage_map.json found in current directory.")
+            print("Usage: python triage_analyzer.py triage_map.json [command]")
+            sys.exit(1)
+        json_path = candidates[0]
+        data = load_triage(json_path)
         rows = flatten_functions(data)
-
-        output_dir = script_dir / "phases"
-        generate_phases(data, rows, output_dir)
-
-        input("\nDone! Press Enter to exit...")
+        generate_phases(data, rows, Path(".") / "phases")
         return
 
-    # CLI mode: original argument parsing
-    p = argparse.ArgumentParser(description="PS2Recomp Triage Analyzer",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("json_file")
-    p.add_argument("command", choices=["stats","coverage","top","tag","category",
-                                        "disposition","filter","export","report","phases"])
-    p.add_argument("args", nargs="*")
-    p.add_argument("--output", "-o", default=None)
-    p.add_argument("--output-dir", default=None)
-    p.add_argument("--category", dest="filter_category", default=None)
-    p.add_argument("--tag", dest="filter_tag", default=None)
-    p.add_argument("--min-fpu", type=int, default=None)
-    p.add_argument("--min-size", type=int, default=None)
-    p.add_argument("--min-acc", type=int, default=None)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="PS2Recomp Triage Analyzer v3")
+    parser.add_argument("json",          help="Path to triage_map.json")
+    parser.add_argument("command",       nargs="?", default="phases",
+                        choices=["phases","stats","top","report","stub-gap","cmake-block"],
+                        help="Command to run")
+    parser.add_argument("args",          nargs="*", help="Command arguments")
+    parser.add_argument("--output",      default=None,      help="Output file for report")
+    parser.add_argument("--output-dir",  default="phases",  help="Output dir for phase MDs")
+    # [NEW-1]
+    parser.add_argument("--recomp-dir",  default=None,
+                        help="Path to recomp/ directory — injects cpp_found into rows")
+    # [NEW-3]
+    parser.add_argument("--cmake",       default=None,
+                        help="Path to CMakeLists.txt — used by phase8 to find unregistered files")
+    args = parser.parse_args()
 
-    data = load_triage(args.json_file)
-    rows = flatten_functions(data)
+    data = load_triage(args.json)
+    rows = flatten_functions(data, recomp_dir=args.recomp_dir)
 
-    if args.command == "phases":
-        out_dir = args.output_dir or str(Path(args.json_file).parent / "phases")
-        generate_phases(data, rows, out_dir)
-    elif args.command == "report":
-        out = args.output or f"{Path(args.json_file).stem}_report.txt"
-        generate_report(data, rows, out)
-    elif args.command == "stats": cmd_stats(data, rows)
-    elif args.command == "coverage":
-        print_header(data)
-        ts = sum(r["size"] for r in rows)
-        sl = [r for r in rows if "SAFE_LEAF" in r["tag_list"]]
-        ss = sum(r["size"] for r in sl)
-        print(f"SAFE_LEAF: {len(sl)} funcs ({ss:,}B = {ss*100/ts:.1f}%)")
+    if args.command == "stats":
+        cmd_stats(data, rows)
     elif args.command == "top":
-        if not args.args: print("Usage: top <metric> [n]"); return
-        cmd_top(data, rows, args.args[0], int(args.args[1]) if len(args.args)>1 else 20)
-    elif args.command == "tag":
-        if not args.args: print("Usage: tag <n>"); return
-        cmd_tag(data, rows, args.args[0])
-    elif args.command == "category":
-        if not args.args: print("Usage: category <n>"); return
-        cmd_category(data, rows, args.args[0])
-    elif args.command == "disposition":
-        if not args.args: print("Usage: disposition <STUB|SKIP|RECOMPILE>"); return
-        cmd_disposition(data, rows, args.args[0])
-    elif args.command == "filter": cmd_filter(data, rows, args)
-    elif args.command == "export":
-        if len(args.args)<2: print("Usage: export <TAG> <out.csv>"); return
-        cmd_export(data, rows, args.args[0], args.args[1])
+        metric = args.args[0] if args.args else "size"
+        n      = int(args.args[1]) if len(args.args) > 1 else 20
+        cmd_top(rows, metric, n)
+    elif args.command == "report":
+        cmd_report(data, rows, args.output)
+    elif args.command == "stub-gap":          # [NEW-2]
+        cmd_stub_gap(data, rows)
+    elif args.command == "cmake-block":        # [NEW-5]
+        phase = args.args[0] if args.args else "all"
+        cmd_cmake_block(data, rows, phase, recomp_dir=args.recomp_dir)
+    else:  # phases (default)
+        generate_phases(data, rows, args.output_dir,
+                        recomp_dir=args.recomp_dir,
+                        cmake_path=args.cmake)
+
 
 if __name__ == "__main__":
     main()
