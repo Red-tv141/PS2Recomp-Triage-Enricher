@@ -112,10 +112,14 @@ def dependency_sort(funcs):
                 if callee_addr != r["address"]:
                     deps[r["address"]].add(callee_addr)
 
-    reverse = {addr: [] for addr in phase_addrs}
+    # [FIX] reverse must be a set per node, not a list.
+    # A list allows duplicate entries when two callee slots map to the same
+    # caller address (overloaded names / multiple callees with same name),
+    # causing in_degree to go negative and breaking topological order.
+    reverse = {addr: set() for addr in phase_addrs}
     for caller_addr, callee_addrs in deps.items():
         for callee_addr in callee_addrs:
-            reverse[callee_addr].append(caller_addr)
+            reverse[callee_addr].add(caller_addr)
 
     in_degree = {addr: len(callees) for addr, callees in deps.items()}
 
