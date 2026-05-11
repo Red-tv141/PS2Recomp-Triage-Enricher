@@ -433,8 +433,16 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 List<String> tags = new ArrayList<>();
                 String category = assignCategory(traits);
 
-                if (traits.calleeCount==0&&traits.callOps==0&&!traits.isThunk&&traits.byteSize>0)
+                // SAFE_LEAF: no callees, no call ops, not a thunk, and not VU0 microcode
+                // (vcallms implicitly "calls" VU0 — not safe for auto-translation)
+                if (traits.calleeCount==0&&traits.callOps==0&&!traits.isThunk&&
+                    traits.byteSize>0&&!traits.hasVcallms)
                     {tags.add("SAFE_LEAF");safeLeafCount++;}
+                // [FIX] VU0_MICROCODE tagged before ACC_PRECISION_HAZARD so that
+                // classify_phases() in triage_analyzer.py routes consistently:
+                // a function with both tags lands in phase7, not phase5.
+                if (traits.hasVcallms)
+                    {tags.add("VU0_MICROCODE");vcallmsCount++;}
                 if (traits.accOps>=3)
                     {tags.add("ACC_PRECISION_HAZARD");accHazardCount++;}
                 if (traits.writesToText)
@@ -443,8 +451,6 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     {tags.add("SPR_SYNC_HAZARD");sprSyncCount++;}
                 if (traits.hasBusyWait)
                     {tags.add("BUSY_WAIT_HAZARD");busyWaitCount++;}
-                if (traits.hasVcallms)
-                    {tags.add("VU0_MICROCODE");vcallmsCount++;}
                 if (traits.hasJumpTable)
                     {tags.add("COMPLEX_CONTROL_FLOW");jumpTableCount++;}
                 if (traits.accessesMMIO)
@@ -729,8 +735,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         for(Function callee:callees) {
             String cn=callee.getName();
             traits.calleeNames.add(cn);
-            // Rule 21: DMA send detection
-            if(cn.startsWith("sceDmaSend")||cn.startsWith("sceDmaChain"))
+            // Rule 21: DMA send detection — all sceDmaSend* / sceDmaChain* variants
+            if(cn.startsWith("sceDmaSend")||cn.startsWith("sceDmaChain")||
+               cn.equals("sceDmaRecv")||cn.equals("sceDmaRecvN"))
                 traits.callsDmaSend=true;
             // Rule 22: SIF RPC detection
             if(cn.equals("sceSifCallRpc")||cn.equals("sceSifBindRpc"))
@@ -778,7 +785,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                ml.startsWith("vmtir")||ml.contains("c2")) traits.usesCop2=true;
             if(ml.equals("lqc2")||ml.equals("sqc2")){traits.usesCop2=true;traits.quadwordVU++;}
 
-            if(ml.startsWith("madda")||ml.startsWith("vmadd")||ml.startsWith("vmsub")||ml.startsWith("madd"))
+            // ACC ops: all instructions that read or write the VU0 accumulator register.
+            // vmadda/vmsuba/vmula/vadda: write ACC. vmadd/vmsub/vopmsub: read ACC.
+            // [FIX] v3 was missing vmadda, vmsuba, vmula, vadda, vopmsub — the exact
+            // instructions listed in the phase5 table. Phase5 functions were mis-classified.
+            if(ml.startsWith("vmadda")||ml.startsWith("vmsuba")||ml.startsWith("vmula")||
+               ml.startsWith("vadda") ||ml.equals("vopmsub")||
+               ml.startsWith("madda") ||ml.startsWith("vmadd")||ml.startsWith("vmsub")||
+               ml.startsWith("madd"))
                 traits.accOps++;
             if(ml.equals("sync.l")||ml.equals("sync.p")||ml.equals("sync")) traits.hasSyncInstr=true;
             if(ml.equals("vcallms")||ml.equals("vcallmsr")) traits.hasVcallms=true;
@@ -819,13 +833,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                         if(ti!=null) traits.writesToText=true;
                     }
                 }
-                // Rule 19 (v3): Detect write to $a1-addressed buffer (convention violation pattern)
-                // Pattern: sw $xx, 0($a1) or sw $xx, offset($a1) near function entry
-                if(instrIdx<30) {
+                // Rule 19 (v3): Detect STORE to $a1-addressed buffer near function entry.
+                // [FIX] Only scalar stores (sw/sh/sb/swc1) — NOT sqc2 (VU0 register dump).
+                // sqc2 stores 128-bit VU0 regs, not output buffers.
+                if(instrIdx<30 && (ml.equals("sw")||ml.equals("sh")||
+                                   ml.equals("sb")||ml.equals("swc1"))) {
                     for(Object op:inst.getInputObjects())
                         if(op instanceof ghidra.program.model.lang.Register) {
                             String rn=((ghidra.program.model.lang.Register)op).getName().toLowerCase();
-                            if(rn.equals("a1")) {traits.writesToA1Buffer=true;}
+                            if(rn.equals("a1")) { traits.writesToA1Buffer=true; }
                         }
                 }
             }
