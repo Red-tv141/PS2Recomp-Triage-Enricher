@@ -207,6 +207,11 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         boolean hasBackwardBranch=false;     // improved BUSY_WAIT
         boolean writesToA1Buffer=false;      // Rule 19: convention violation detector
         boolean isLargeInitFunc=false;       // Rule 20
+        // Rule 25: Thread sync point — syscall + backward branch + small size, NOT IOP module.
+        // Phase F blocker: EE thread parked at pc=0x100008 waiting on IOP response.
+        // These functions spin on a syscall (WaitSema/SleepThread/etc.) until IOP replies.
+        // They must NOT be nop-stubbed — the thread scheduler depends on them.
+        boolean isThreadSyncPoint=false;
     }
 
     // =========================================================
@@ -245,6 +250,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private int dmaTteRiskCount=0, iopRpcCount=0;
     private int archiveIoCount=0, padPollLoopCount=0;
     private int gameOverrideImportedCount=0;
+    private int threadSyncCount=0; // Rule 25
 
     // =========================================================
     // ENTRY POINT
@@ -479,6 +485,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 // Rule 23
                 if (traits.refsArchiveStrings)
                     {tags.add("ARCHIVE_IO");archiveIoCount++;}
+                // Rule 25
+                if (traits.isThreadSyncPoint)
+                    {tags.add("THREAD_SYNC_POINT");threadSyncCount++;}
                 // Rule 24
                 if (traits.callsPadPollCallee&&traits.hasBusyWait)
                     {tags.add("PAD_POLL_LOOP");padPollLoopCount++;}
@@ -495,9 +504,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             println(String.format("  v2 tags: SAFE=%d MMIO=%d ACC=%d SMC=%d SPR=%d VCALLMS=%d JTABLE=%d ORPHAN=%d",
                 safeLeafCount,mmioCount,accHazardCount,smcHazardCount,
                 sprSyncCount,vcallmsCount,jumpTableCount,orphanCount));
-            println(String.format("  v3 tags: CONV_VIOLATION=%d INIT_LARGE=%d DMA_TTE=%d IOP_RPC=%d ARCHIVE_IO=%d PAD_POLL=%d",
+            println(String.format("  v3 tags: CONV_VIOLATION=%d INIT_LARGE=%d DMA_TTE=%d IOP_RPC=%d ARCHIVE_IO=%d PAD_POLL=%d THREAD_SYNC=%d",
                 conventionViolationCount,initLargeFuncCount,dmaTteRiskCount,
-                iopRpcCount,archiveIoCount,padPollLoopCount));
+                iopRpcCount,archiveIoCount,padPollLoopCount,threadSyncCount));
 
             writeUnifiedConfig(unifiedToml,configToml,newStubs,newSkips);
             writeTriageJson(triageJson,results,elfHash,gpValue,totalFuncs,uncategorized);
@@ -761,6 +770,13 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if(isInitNamed&&(traits.calleeCount>10||traits.byteSize>2000))
             traits.isLargeInitFunc=true;
 
+        // Rule 25: Thread sync point detection.
+        // Pattern: contains a syscall instruction, has a backward branch (spin loop),
+        // is small (< 300 bytes), and is NOT an IOP module loader (those are stubs).
+        // Phase F blocker: EE thread at pc=0x100008 was stuck in one of these.
+        // Detection deferred to post-scan (needs containsSyscall result).
+        // Computed after instruction scan below — see traits.isThreadSyncPoint assignment.
+
         InstructionIterator asmIter=currentProgram.getListing().getInstructions(func.getBody(),true);
         int instrIdx=0,mmioReadCount=0,totalInstrs=0;
         long firstInstrOffset = func.getEntryPoint().getOffset();
@@ -900,6 +916,12 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // v3 addition: backward branch + call to pad/vsync polling callee (Phase F3.5 pattern)
         boolean padVsyncBusyWait = traits.hasBackwardBranch&&traits.callsPadPollCallee&&traits.byteSize<400;
         traits.hasBusyWait = originalBusyWait||padVsyncBusyWait;
+
+        // Rule 25: Thread sync point — set after full instruction scan.
+        // syscall present + backward branch (spinning) + small + not IOP module loader.
+        if(containsSyscall(func) && traits.hasBackwardBranch &&
+           traits.byteSize < 300 && !referencesIopModule(func, traits))
+            traits.isThreadSyncPoint = true;
 
         cache.put(key,traits);
         return traits;
@@ -1053,7 +1075,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"dma_tte_risk\": "+dmaTteRiskCount+",");
         w.println("    \"iop_rpc_dispatch\": "+iopRpcCount+",");
         w.println("    \"archive_io\": "+archiveIoCount+",");
-        w.println("    \"pad_poll_loop\": "+padPollLoopCount);
+        w.println("    \"pad_poll_loop\": "+padPollLoopCount+",");
+        w.println("    \"thread_sync_point\": "+threadSyncCount);
         w.println("  },");
         // Known IOP SIDs for cross-reference
         w.println("  \"known_iop_sids\": {");
@@ -1113,7 +1136,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"calls_pad_poll_callee\": "+t.callsPadPollCallee+", ");
             w.print("\"has_backward_branch\": "+t.hasBackwardBranch+", ");
             w.print("\"writes_to_a1_buffer\": "+t.writesToA1Buffer+", ");
-            w.print("\"is_large_init_func\": "+t.isLargeInitFunc);
+            w.print("\"is_large_init_func\": "+t.isLargeInitFunc+", ");
+            w.print("\"is_thread_sync_point\": "+t.isThreadSyncPoint);
             w.print("}, ");
             w.print("\"tags\": [");
             for(int j=0;j<r.tags.size();j++){if(j>0)w.print(", ");w.print("\""+r.tags.get(j)+"\"");}
