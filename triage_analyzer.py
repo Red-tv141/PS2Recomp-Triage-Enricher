@@ -226,8 +226,8 @@ def classify_phases(rows):
         elif "SAFE_LEAF" in tags:
             phases["phase1_safe_leaf"].append(r)
 
-        # Phase 4b sub: PAD_POLL_LOOP → state machines
-        elif "PAD_POLL_LOOP" in tags or "BUSY_WAIT_HAZARD" in tags:
+        # Phase 4b sub: PAD_POLL_LOOP / THREAD_SYNC_POINT / BUSY_WAIT_HAZARD → state machines
+        elif "PAD_POLL_LOOP" in tags or "THREAD_SYNC_POINT" in tags or "BUSY_WAIT_HAZARD" in tags:
             phases["phase4b_state_machines"].append(r)
 
         # Phase 2 — Wrappers / getters
@@ -272,6 +272,7 @@ TAG_ABBREVS = [
     ("IOP_RPC_DISPATCH",      "RPC"),
     ("ARCHIVE_IO",            "ARC"),
     ("PAD_POLL_LOOP",         "PAD!"),
+    ("THREAD_SYNC_POINT",     "TSP!"),
 ]
 
 def format_tag_flags(tag_list):
@@ -345,6 +346,8 @@ When ALL functions compile:
 def generate_phase1(funcs, data, output_dir):
     total_size = sum(r["size"] for r in funcs)
     md = _header("Phase 1: SAFE_LEAF — Auto-Translate", data) + f"""
+> **Recommended model:** claude-sonnet-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -388,6 +391,8 @@ def generate_phase2(funcs, data, output_dir):
     total_size = sum(r["size"] for r in funcs)
     gp = data.get("global_pointer", "UNKNOWN")
     md = _header("Phase 2: Wrappers & Getters — Thin Delegation Functions", data) + f"""
+> **Recommended model:** claude-sonnet-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -430,6 +435,8 @@ def generate_phase3(funcs, data, output_dir):
     vu0_count   = sum(1 for r in funcs if "VU0_VECTORS" in r["tag_list"])
     high_fpu    = sum(1 for r in funcs if r.get("fpu_ops", 0) > 30)
     md = _header("Phase 3: MATH_VECTORS — FPU & Vector Operations", data) + f"""
+> **Recommended model:** claude-sonnet-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -480,6 +487,8 @@ def generate_phase4a(funcs, data, output_dir):
     high_xref     = sum(1 for r in funcs if r.get("xref_to_count", 0) > 10)
     large_init    = sum(1 for r in funcs if "INIT_LARGE_FUNC" in r["tag_list"])
     md = _header("Phase 4a: Game Logic — Global State & Function Calls", data) + f"""
+> **Recommended model:** claude-sonnet-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -532,6 +541,7 @@ def generate_phase4b(funcs, data, output_dir):
     jump_tables = sum(1 for r in funcs if "COMPLEX_CONTROL_FLOW" in r["tag_list"])
     pad_poll    = sum(1 for r in funcs if "PAD_POLL_LOOP"         in r["tag_list"])
     busy_wait   = sum(1 for r in funcs if "BUSY_WAIT_HAZARD"      in r["tag_list"])
+    tsp_funcs   = [r for r in funcs if "THREAD_SYNC_POINT"        in r["tag_list"]]
 
     pad_section = ""
     pad_funcs   = [r for r in funcs if "PAD_POLL_LOOP" in r["tag_list"]]
@@ -551,7 +561,35 @@ On the real PS2 they are busy-wait loops; in the recompiler they must NOT spin f
 |---------|------|
 """ + "\n".join(f"| `{r['address']}` | `{r['name']}` |" for r in pad_funcs) + "\n"
 
+    tsp_section = ""
+    if tsp_funcs:
+        tsp_section = f"""
+### THREAD_SYNC_POINT Functions ({len(tsp_funcs)}) — ⚠️ Phase F blocker lesson
+
+These functions contain a `syscall` instruction inside a backward branch (spin loop)
+and are small (< 300 bytes). They are EE-side thread synchronization primitives —
+the EE thread spins calling a kernel syscall (WaitSema / SleepThread / etc.) until
+the IOP or another thread signals completion.
+
+**Phase F root cause:** `pc=0x100008` stall was the EE main thread parked in exactly
+this pattern waiting on IOP sync. The thread never woke because the IOP response
+stub returned immediately without signalling the semaphore.
+
+**Rules:**
+- Do NOT nop-stub these functions. The thread scheduler depends on the syscall.
+- Do NOT add a `registerFunction` shim that returns 0 — it bypasses the wait.
+- The fix is in the IOP-side response: the stub for the IOP command that this thread
+  is waiting on must call `iSignalSema` / `iWakeupThread` after completing.
+- If a function here still stalls: add `[TSP] <name> spinning` stderr trace inside
+  the syscall stub it calls, confirm the IOP response fires, then signal.
+
+| Address | Name |
+|---------|------|
+""" + "\n".join(f"| `{r['address']}` | `{r['name']}` |" for r in tsp_funcs) + "\n"
+
     md = _header("Phase 4b: State Machines — Complex Control Flow", data) + f"""
+> **Recommended model:** claude-sonnet-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -561,10 +599,12 @@ On the real PS2 they are busy-wait loops; in the recompiler they must NOT spin f
 - **Jump table functions:** {jump_tables}
 - **PAD_POLL_LOOP (busy-wait hazard):** {pad_poll}
 - **BUSY_WAIT_HAZARD (general):** {busy_wait}
+- **THREAD_SYNC_POINT (IOP sync stall risk):** {len(tsp_funcs)}
 - **Expected difficulty:** HIGH.
 
 ---
 {pad_section}
+{tsp_section}
 ---
 
 ## Instructions for Claude
@@ -575,6 +615,8 @@ On the real PS2 they are busy-wait loops; in the recompiler they must NOT spin f
 4. `WRITES_GLOBAL` (`WG`) = `$gp`-relative store, ensure `ctx->gp = {gp}`.
 5. `BUSY_WAIT_HAZARD` (`BW`) = polling loop. If it spins forever in runner, add a
    `runtime->registerFunction(addr, shim)` in `dc2_game_override.cpp`.
+6. `THREAD_SYNC_POINT` (`TSP!`) = EE thread blocked on IOP response. See section above —
+   fix is on the IOP side, NOT in this function.
 
 **Do NOT:** restructure switch/case, reorder labels, extract state handlers.
 
@@ -599,6 +641,8 @@ On the real PS2 they are busy-wait loops; in the recompiler they must NOT spin f
 def generate_phase5(funcs, data, output_dir):
     total_size = sum(r["size"] for r in funcs)
     md = _header("Phase 5: ACC_PRECISION_HAZARD — VU0 Accumulator Functions", data) + f"""
+> **Recommended model:** claude-opus-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -688,6 +732,8 @@ or a zero-return shim.
 """
 
     md = _header("Phase 6: MMIO — Hardware Register Access Functions", data) + f"""
+> **Recommended model:** claude-opus-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -740,6 +786,8 @@ or a zero-return shim.
 def generate_phase7(funcs, data, output_dir):
     total_size = sum(r["size"] for r in funcs)
     md = _header("Phase 7: VU0 Microcode — vcallms/vcallmsr Functions", data) + f"""
+> **Recommended model:** claude-opus-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -823,6 +871,8 @@ def generate_phase_gifpk(funcs, data, output_dir):
 """
 
     md = _header("Phase GifPk: sceGifPk* / sceVif1Pk* Packet Builders", data) + f"""
+> **Recommended model:** claude-opus-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -915,6 +965,8 @@ def generate_phase_iop_rpc(funcs, data, output_dir):
             sid_table += f"| `{sid}` | `{name}` |\n"
 
     md = _header("Phase IOP RPC: sceSifCallRpc / sceSifBindRpc Dispatch Functions", data) + f"""
+> **Recommended model:** claude-opus-4-6
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -988,6 +1040,8 @@ Game EE code
 def generate_phase_archive_io(funcs, data, output_dir):
     total_size = sum(r["size"] for r in funcs)
     md = _header("Phase Archive IO: DATA.DAT / DATA.HD2 Archive-Backed Functions", data) + f"""
+> **Recommended model:** claude-haiku-4-5-20251001
+
 ## Overview
 
 - **Total functions:** {len(funcs):,}
@@ -1189,6 +1243,7 @@ def generate_summary(data, rows, phases_results, output_dir):
 | IOP_RPC_DISPATCH *(v3)* | {stats.get('iop_rpc_dispatch', tag_count('IOP_RPC_DISPATCH')):,} |
 | ARCHIVE_IO *(v3)* | {stats.get('archive_io', tag_count('ARCHIVE_IO')):,} |
 | PAD_POLL_LOOP *(v3)* | {stats.get('pad_poll_loop', tag_count('PAD_POLL_LOOP')):,} |
+| THREAD_SYNC_POINT *(v3)* | {stats.get('thread_sync_point', tag_count('THREAD_SYNC_POINT')):,} |
 
 ---
 
