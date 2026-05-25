@@ -1,4 +1,4 @@
-// PS2Recomp Triage Enricher v6 - Ghidra Script (Step 2 of Pipeline)
+// PS2Recomp Triage Enricher v7 - Ghidra Script (Step 2 of Pipeline)
 // ==================================================================
 // Run AFTER ExportPS2Functions.java on the same Ghidra project.
 //
@@ -63,6 +63,68 @@
 //   Rule 73 PSMT4HH_REFERENCE      lui/ori constant == 0x2C (font Z-buffer alias PSM)
 //   Rule 74 SBUS_IOP_COMM_TOUCHER  0x1000F200 (MSCOM) / 0x1000F210 (SMCOM)
 //   Plus: known_gs_priv_regs, vif_opcode_constants, dma_tag_ids, pcsx2_baseline metadata
+//
+// WHAT'S NEW IN v7 (GS-dump runtime corroboration):
+//   Input: optional folder of `*.gs.summary.json` produced by
+//          gs_dump_to_summary.py from PCSX2 .gs dumps. One per checkpoint
+//          (SCE_Logo / Title / 3D_Scene / Inventory / Pause / Cutscene / ...).
+//          Merged into runtime evidence used to corroborate static rules.
+//   Rule 75 DISPFB_SDK_WRITER       Callee in {sceGsPutDispEnv,sceGsSetDispEnv,
+//                                   sceGsSetCRTC,mgSetDispEnv,sceGsResetGraph}
+//                                   — picks up SDK-routed DISPFB writers that
+//                                   the raw-MMIO Rule 35/58 misses.
+//   Rule 76 PATH3_KICK_VIA_DMA_API  Caller of sceDmaSend*/sceGifSendChain*/
+//                                   sceGsSwapDBuff/sceGsExecStoreImage — the
+//                                   SDK-routed Path3 starters (raw-CHCR
+//                                   Rule 44 misses them).
+//   Rule 78 VRAM_TBP_OVERLAY        Constants (lui/ori/addiu/li) matching
+//                                   runtime-witnessed tex0_tbps or
+//                                   vram_upload_tbps; emitted as
+//                                   `tbp_constants_loaded` + intersection
+//                                   with merged runtime as
+//                                   `tbp_runtime_confirmed`.
+//   Rule 79 GS_IRQ_HANDLER_SAFE_STUB Name matches Signal/Finish/Label/Intc/
+//                                   sceGsSyncH/V handler shape AND all
+//                                   loaded GS-dump captures show IMR fully
+//                                   masking GS IRQs → tag as safe-stub
+//                                   candidate (decoration; no auto disposition flip).
+//   Rule 80 runtime_corroboration   Per-function block cross-checking
+//                                   static bullseye predictions against the
+//                                   merged runtime evidence. Adds tags:
+//                                   RUNTIME_CONFIRMED         — at least one
+//                                       bullseye prediction has a witness.
+//                                   RUNTIME_DORMANT_GLOBAL    — bullseye
+//                                       predictions but zero runtime witness
+//                                       across loaded checkpoints.
+//                                   RUNTIME_MENU_ONLY         — PSMT4HH_REFERENCE
+//                                       only witnessed in UI checkpoints
+//                                       (Inventory/Pause/Character/UI scenes),
+//                                       not in 3D-scene captures.
+//   Rule 81 focus_set re-rank       Confirmed entries first, dormant last.
+//   Plus: gs_runtime_evidence top-level JSON block with per-checkpoint
+//         facts + merged unions; auto-populated pcsx2_baseline checkpoints.
+//
+// WHAT'S NEW IN v7.1 (F32-F34 retrospective):
+//   Rule 82 CTOR_MULTI_FIELD_INITIALIZER  Ctor / Initialize that writes
+//          >= 5 distinct this+K slots in first 40 instructions. F33 caught
+//          __ct__11mgCDrawPrimFv nop-stubbed → manager/PRIM/Q/Z slots all
+//          garbage → entire Begin/Texture/Color chain dead. Firewalled
+//          against STUB classification (forceRecompile).
+//   Rule 83 DRAWING_CHAIN_DEPTH         BFS from GS-bullseye roots
+//          (sceGifPk family, PATH3_INITIATOR, mgEndFrame, Begin__11mgCDrawPrim).
+//          Functions with chain_depth <= 6 firewalled against STUB. Locks in
+//          F33's TitleModeDraw -> PrimQuad -> SetSpriteEnv -> Begin chain.
+//   Rule 84 LIFECYCLE_LAZY_INIT_GUARD   Initialize* / Begin__ / Open* / Acquire*
+//          whose first instructions read this+0x00 and branch on zero, with
+//          byteSize > 50. The "if (manager==null) { install manager; }"
+//          pattern that F33 had to manually override. Firewalled.
+//   Rule 85 BITBLTBUF_T4HH_UPLOADER     Function writes BITBLTBUF (GIF reg 0x50)
+//          AND loads PSMT4HH/4HL/8H constant. The F32 BITBLTBUF.dpsm=0x2C
+//          upload bullseye. Tagged separately from generic PSMT4HH_REFERENCE
+//          (which is sampler-side TEX0.psm) so runtime menu_only does not
+//          deprioritize these.
+//   Plus: RUNTIME_MENU_ONLY refinement — skip the tag when the function is
+//         a BITBLTBUF_T4HH_UPLOADER or drawing_chain_depth <= 3.
 //
 // RULES IMPLEMENTED (17 + tags):
 //   1.  No DANGEROUS_KEYWORDS (removed - was killing game logic)
@@ -496,6 +558,116 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         "sceGsSyncV","sceGsSyncVCallback","WaitVSync"
     ));
 
+    // ===== v7 (GS-dump runtime corroboration) =====
+    // Rule 75: SDK-routed DISPFB writers. Direct-MMIO Rule 35/58 only catches
+    // raw writes to 0x12000070/0x12000090; real games usually call the SDK
+    // wrapper sceGsPutDispEnv etc., which then writes the priv reg from kernel.
+    private static final String[] DISPFB_SDK_CALLEES = {
+        "sceGsPutDispEnv","sceGsSetDispEnv","sceGsSetCRTC",
+        "sceGsResetGraph","mgSetDispEnv","sceGsSetDispMask",
+        "sceGsSwapDBuff"
+    };
+
+    // Rule 76: SDK-routed Path3 kicks. Raw-CHCR Rule 44 only matches direct
+    // writes to 0x1000A000; SDK uses sceDmaSend/sceGifSendChain wrappers.
+    private static final String[] PATH3_KICK_API_CALLEES = {
+        "sceDmaSend","sceDmaSendN","sceDmaSendChain","sceDmaSendChainN",
+        "sceGifSendChain","sceGifSendPacket","sceGsExecStoreImage",
+        "sceGsExecLoadImage","sceDmaChain"
+    };
+
+    // Rule 79: GS IRQ handler names. IMR (priv reg 0x1010) controls which GS
+    // IRQs reach the EE. When every loaded checkpoint shows IMR=0x7F00
+    // (all GS IRQs masked) these handlers can never fire — safe-stub label.
+    private static final String[] GS_IRQ_HANDLER_NAME_FRAGMENTS = {
+        "GsSignal","GsFinish","GsLabel","SignalHandler","FinishHandler",
+        "LabelHandler","sceGsSyncH","sceGsSyncV"
+    };
+
+    // PSM code constants (PCSX2 GSRegs.h) for VRAM/Z-alias decoding.
+    private static final int PSM_PSMT4HH = 44;   // 0x2C — UI/font Z-buffer alias
+    private static final int PSM_PSMT4HL = 36;   // 0x24
+    private static final int PSM_PSMT8H  = 27;   // 0x1B
+
+    // Checkpoint name fragments treated as "menu/UI" for RUNTIME_MENU_ONLY
+    // classification. Lowercase comparison.
+    private static final String[] MENU_CHECKPOINT_FRAGMENTS = {
+        "menu","inventory","pause","character","title","select","ui","hud"
+    };
+
+    // =========================================================
+    // v7: GS RUNTIME EVIDENCE MODEL
+    // =========================================================
+    /** Per-checkpoint snapshot loaded from gs_dump_to_summary.py output. */
+    static class GsCheckpoint {
+        String name;                       // e.g. "Inventory", "3D_Scene"
+        boolean path1Active, path2Active, path3Active;
+        boolean psmt4hhUsed, psmt4hlUsed, psmt8hUsed;
+        // F32 retro: BITBLTBUF.dpsm witnesses (upload-side PSM).
+        boolean psmt4hhUpload, psmt4hlUpload, psmt8hUpload;
+        Set<Integer> bitbltbufDpsms = new LinkedHashSet<>();
+        boolean primGarbage;
+        boolean ipuActive;                 // derived: any IPU MMIO would show; here
+                                           // we don't see it in summary_for_enricher
+                                           // but readfifo2_calls is a proxy.
+        boolean readfifo2Active;
+        boolean signalFinishLabelSeen;     // SIGNAL/FINISH/LABEL in a_d_regs_written_named
+        boolean reglistUsed, image2Used;
+        Set<Integer> psmTex0    = new LinkedHashSet<>();
+        Set<Integer> psmFrame   = new LinkedHashSet<>();
+        Set<Integer> psmZbuf    = new LinkedHashSet<>();
+        Set<String>  adRegs     = new LinkedHashSet<>();
+        Set<Long>    tex0Tbps   = new LinkedHashSet<>();
+        Set<Long>    vramTbps   = new LinkedHashSet<>();
+        Set<Long>    primValues = new LinkedHashSet<>();
+        long imr = -1L;                    // -1 == unknown / not loaded
+        long pmode = -1L;
+        int  gifTagCount, packedCount, imageCount, reglistCount, image2Count;
+        int  malformedTags;
+        int  vsyncs;
+        int  path1Count, path2Count, path3Count;
+        long path1Bytes, path2Bytes, path3Bytes;
+        Integer frameFbp, frameFbw, framePsm;
+        Integer zbufZbp, zbufPsm, zbufZmsk;
+        Integer dispfb1Fbp, dispfb2Fbp;
+        String  sourceFile;
+        long stateSizeBytes;
+        int  stateVersion;
+        String serial, crc;
+    }
+
+    /** Merged union across all loaded checkpoints. */
+    static class GsRuntimeEvidence {
+        List<GsCheckpoint> checkpoints = new ArrayList<>();
+        // Union flags
+        boolean anyPath1, anyPath2, anyPath3;
+        boolean anyPsmt4hh, anyPsmt4hl, anyPsmt8h;
+        boolean anyPsmt4hhUpload, anyPsmt4hlUpload, anyPsmt8hUpload;
+        Set<Integer> bitbltbufDpsmsUnion = new LinkedHashSet<>();
+        boolean anyPrimGarbage;
+        boolean anyReadfifo2;
+        boolean anyReglist, anyImage2;
+        boolean anySignalFinishLabel;
+        Set<Integer> psmTex0Union  = new LinkedHashSet<>();
+        Set<Integer> psmFrameUnion = new LinkedHashSet<>();
+        Set<Integer> psmZbufUnion  = new LinkedHashSet<>();
+        Set<String>  adRegsUnion   = new LinkedHashSet<>();
+        Set<Long>    tex0TbpsUnion = new LinkedHashSet<>();
+        Set<Long>    vramTbpsUnion = new LinkedHashSet<>();
+        Set<Long>    primUnion     = new LinkedHashSet<>();
+        long imrIntersection = -1L;        // bit-AND of every checkpoint's IMR
+        boolean imrAllMaskedGsIrqs;        // all loaded checkpoints had IMR & 0x7F00 == 0x7F00
+        // Per-PSM-witness which checkpoints saw it (lower-cased name list)
+        Map<Integer, Set<String>> psmTex0Witnesses = new LinkedHashMap<>();
+        // Path3 confirmation strength: total path3 transfers across all checkpoints
+        long totalPath3Count = 0L;
+        long totalPath3Bytes = 0L;
+        // True if no captures loaded — disables corroboration tags.
+        boolean empty() { return checkpoints.isEmpty(); }
+    }
+
+    private GsRuntimeEvidence gsEvidence = new GsRuntimeEvidence();
+
     // =========================================================
     // DNA ANALYSIS: FuncTraits
     // =========================================================
@@ -626,6 +798,44 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         Set<String> vifOpcodesBuilt = new LinkedHashSet<>();
         // DMAtag IDs constructed via lui constant scan.
         Set<String> dmaTagIdsBuilt = new LinkedHashSet<>();
+
+        // ===== v7 fields (GS-dump runtime corroboration) =====
+        // Rule 75: callee in DISPFB_SDK_CALLEES set
+        boolean writesDispfbViaSdk=false;
+        // Rule 76: callee in PATH3_KICK_API_CALLEES set
+        boolean path3KickViaDmaApi=false;
+        // Rule 79: name matches GS_IRQ_HANDLER_NAME_FRAGMENTS
+        boolean isGsIrqHandlerName=false;
+        // Rule 78: lui/ori/addiu/li constants observed in this function (tracks
+        // 14-bit TBP-shape values, i.e. < 0x4000 with non-trivial bit pattern).
+        // Filled in instruction-scan; intersected against runtime later.
+        Set<Long> tbpConstantsLoaded = new LinkedHashSet<>();
+        // Rule 80: runtime corroboration outputs (post-pass).
+        Set<String> runtimeBullseyePredictions = new LinkedHashSet<>();
+        Map<String,Boolean> runtimeWitness = new LinkedHashMap<>();
+        Set<Long> tbpRuntimeConfirmed = new LinkedHashSet<>();
+        Set<String> runtimeAdRegMatch = new LinkedHashSet<>();
+        String runtimeStatus = "INDETERMINATE";   // CONFIRMED / DORMANT / MENU_ONLY / INDETERMINATE
+        boolean runtimeConfirmed=false;
+        boolean runtimeDormantGlobal=false;
+        boolean runtimeMenuOnly=false;
+        boolean gsIrqSafeStubCandidate=false;
+
+        // ===== v7.1 fields (F32-F34 retrospective) =====
+        // Rule 82: distinct this+K offsets a ctor / initializer writes in its
+        // first 40 instructions. F33 root cause: __ct__11mgCDrawPrimFv (7+
+        // slots) was nop-stubbed.
+        Set<Long> ctorSlotsWritten = new LinkedHashSet<>();
+        boolean isCtorMultiFieldInit=false;       // Rule 82
+        // Rule 83: BFS depth from GS-bullseye render roots (sceGifPk*, mgEndFrame,
+        // Begin__11mgCDrawPrim, PATH3_INITIATOR). -1 == not reachable.
+        int drawingChainDepth=-1;
+        // Rule 84: lifecycle method with lazy-init pattern (lw $rN,0($a0); beq/bne $zero).
+        boolean isLifecycleLazyInit=false;
+        // Rule 85: BITBLTBUF reg writer (any of GIF A+D reg 0x50). Combined with
+        // loadsPsm4hhConstant -> BITBLTBUF_T4HH_UPLOADER.
+        boolean writesBitbltbufReg=false;
+        boolean isBitbltbufT4hhUploader=false;
     }
 
     // =========================================================
@@ -693,6 +903,19 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private int vifMscalBuilderCount=0, vifDirectBuilderCount=0;
     private int vifUnpackBuilderCount=0, dmaTagBuilderCount=0;
 
+    // v7 counters (GS runtime corroboration)
+    private int dispfbSdkWriterCount=0, path3KickViaApiCount=0;
+    private int gsIrqHandlerCount=0, gsIrqSafeStubCount=0;
+    private int runtimeConfirmedCount=0, runtimeDormantCount=0;
+    private int runtimeMenuOnlyCount=0;
+    private int tbpRuntimeConfirmedFuncCount=0;
+
+    // v7.1 counters (F32-F34 retrospective rules)
+    private int ctorMultiFieldInitCount=0;
+    private int lifecycleLazyInitCount=0;
+    private int bitbltbufT4hhUploaderCount=0;
+    private int drawingChainCount=0;       // funcs with chain_depth >= 0
+
     // v4: BFS roots. main_loop_addr stays optional; entry/_start used for init chain.
     private Long mainLoopAddrOpt = null;
     private Long entryAddrOpt    = null;
@@ -739,6 +962,30 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             }
         } catch (Exception ignored) {
             println("[OVERRIDE] Skipped (dialog cancelled).");
+        }
+
+        // v7 (NEW): GS-dump runtime evidence folder. Optional.
+        try {
+            File gsDir = askDirectory(
+                "Select folder of *.gs.summary.json files (Cancel to skip)","Open");
+            if (gsDir!=null && gsDir.isDirectory()) {
+                loadGsSummaryFolder(gsDir);
+                int n = gsEvidence.checkpoints.size();
+                if (n > 0) {
+                    println(String.format("[GS-EVIDENCE] Loaded %d checkpoints from %s.",
+                        n, gsDir.getName()));
+                    println(String.format("[GS-EVIDENCE] anyP1=%s anyP2=%s anyP3=%s any4HH=%s anyPrimGarb=%s imrAllMasked=%s",
+                        gsEvidence.anyPath1, gsEvidence.anyPath2, gsEvidence.anyPath3,
+                        gsEvidence.anyPsmt4hh, gsEvidence.anyPrimGarbage,
+                        gsEvidence.imrAllMaskedGsIrqs));
+                } else {
+                    println("[GS-EVIDENCE] Folder selected but no .summary.json found.");
+                }
+            } else {
+                println("[GS-EVIDENCE] Skipped - no folder selected.");
+            }
+        } catch (Exception ex) {
+            println("[GS-EVIDENCE] Skipped: "+ex.getMessage());
         }
 
         // Rule 11: MainLoop shield
@@ -870,11 +1117,17 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 // v4: extend to vtable-setter ctors, A0/A1 passthrough returners,
                 // libgcc intrinsics, and process terminators. All four were
                 // historically auto-stubbed and caused multi-phase debugging trips.
+                // v7.1: add F33-derived firewalls — multi-field ctors and
+                // lifecycle lazy-init guards. drawing_chain_depth firewall is
+                // applied in a post-pass after BFS runs.
                 boolean forceRecompile = traits.isLargeInitFunc
                                        || traits.ctorWritesVTablePointer
                                        || traits.returnsA0 || traits.returnsA1
                                        || traits.isLibgccIntrinsic
-                                       || traits.isProcessTerminator;
+                                       || traits.isProcessTerminator
+                                       || traits.isCtorMultiFieldInit
+                                       || traits.isLifecycleLazyInit
+                                       || traits.isBitbltbufT4hhUploader;
 
                 // --- Disposition decision ---
                 String disposition = "RECOMPILE";
@@ -982,6 +1235,27 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 // Rule 35
                 if (traits.writesDispfbReg)
                     {tags.add("DISPFB_WRITER");dispfbWriterCount++;}
+                // v7 Rule 75: SDK-routed DISPFB writer
+                if (traits.writesDispfbViaSdk) {
+                    if(!tags.contains("DISPFB_SDK_WRITER")) tags.add("DISPFB_SDK_WRITER");
+                    if(!tags.contains("DISPFB_WRITER")) {
+                        tags.add("DISPFB_WRITER");
+                        dispfbWriterCount++;
+                    }
+                    dispfbSdkWriterCount++;
+                }
+                // v7 Rule 76: SDK-routed Path3 kicker
+                if (traits.path3KickViaDmaApi) {
+                    if(!tags.contains("PATH3_KICK_VIA_DMA_API")) tags.add("PATH3_KICK_VIA_DMA_API");
+                    if(!tags.contains("PATH3_INITIATOR")) {
+                        tags.add("PATH3_INITIATOR");
+                        path3InitiatorCount++;
+                    }
+                    path3KickViaApiCount++;
+                }
+                // v7 Rule 79 name-match counter (the safe-stub TAG is added in
+                // the post-pass once runtime IMR is known).
+                if (traits.isGsIrqHandlerName) gsIrqHandlerCount++;
                 // Rule 36 - VIF1 tag-high builder
                 if (traits.accessesVif1MMIO && traits.hasDsll32OrDsrl32)
                     {tags.add("VIF1_TAGHI_BUILDER");vif1TagHiBuilderCount++;}
@@ -1042,6 +1316,21 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 if (traits.accessesVuDatamem)  {tags.add("ACCESSES_VU_DATAMEM");vuDatamemCount++;}
                 if (traits.touchesSbus)     {tags.add("SBUS_IOP_COMM_TOUCHER");sbusCount++;}
                 if (traits.loadsPsm4hhConstant) {tags.add("PSMT4HH_REFERENCE");psm4hhCount++;}
+                // v7.1 Rule 82
+                if (traits.isCtorMultiFieldInit) {
+                    tags.add("CTOR_MULTI_FIELD_INITIALIZER");
+                    ctorMultiFieldInitCount++;
+                }
+                // v7.1 Rule 84
+                if (traits.isLifecycleLazyInit) {
+                    tags.add("LIFECYCLE_LAZY_INIT_GUARD");
+                    lifecycleLazyInitCount++;
+                }
+                // v7.1 Rule 85
+                if (traits.isBitbltbufT4hhUploader) {
+                    tags.add("BITBLTBUF_T4HH_UPLOADER");
+                    bitbltbufT4hhUploaderCount++;
+                }
                 if (!traits.vifOpcodesBuilt.isEmpty()) {
                     tags.add("VIF_OPCODE_BUILDER");vifOpcodeBuilderCount++;
                     if (traits.vifOpcodesBuilt.contains("MPG"))
@@ -1063,6 +1352,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 // v6 adds: WRITES_IPU_CMD, GIF_PATH3_REG_TOUCHER, PSMT4HH_REFERENCE,
                 // VIF_MPG_OPCODE_BUILDER (microcode upload bullseye).
                 if (traits.isSceGifPkRefLoadImage || traits.path3Initiator ||
+                    traits.path3KickViaDmaApi || traits.writesDispfbViaSdk ||
+                    traits.isBitbltbufT4hhUploader ||
                     (traits.writesZbufReg && (traits.hasShift24Pattern||traits.hasDsll32OrDsrl32)) ||
                     traits.writesGsPrimReg || traits.touchesGifCtrl ||
                     traits.callsMpegFamily || traits.writesIpuCmd ||
@@ -1106,6 +1397,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 sbusCount,psm4hhCount,vifOpcodeBuilderCount,vifMpgBuilderCount,
                 vifMscalBuilderCount,vifDirectBuilderCount,vifUnpackBuilderCount,
                 dmaTagBuilderCount));
+            println(String.format("  v7.1 tags: CTOR_MULTI=%d LAZY_INIT=%d BITBLTBUF_T4HH=%d",
+                ctorMultiFieldInitCount, lifecycleLazyInitCount, bitbltbufT4hhUploaderCount));
 
             // F21-prep: build reverse call-graph. After all FuncResults are
             // built and each carries its outgoing jalSites, fill every callee's
@@ -1143,6 +1436,27 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 bfsAssignDepth(fwd, resultsByAddr, mainLoopAddrOpt, true);
             if (entryAddrOpt != null)
                 bfsAssignDepth(fwd, resultsByAddr, entryAddrOpt, false);
+            // v7.1 Rule 83: BFS from GS-bullseye render roots; populates
+            // traits.drawingChainDepth.
+            bfsAssignDrawingChainDepth(fwd, resultsByAddr, results);
+            // v7.1: drawing_chain_depth <= 6 firewall against STUB. Promote any
+            // such already-classified STUB back to RECOMPILE and drop it from
+            // newStubs so writeUnifiedConfig emits the corrected disposition.
+            int promotedFromStub = 0;
+            for(FuncResult r : results) {
+                if(r.traits == null) continue;
+                int d = r.traits.drawingChainDepth;
+                if(d < 0 || d > 6) continue;
+                if("STUB".equals(r.disposition)) {
+                    r.disposition = "RECOMPILE";
+                    newStubs.remove(r.name + "@" + hex(r.address));
+                    promotedFromStub++;
+                }
+                if(!r.tags.contains("DRAWING_CHAIN_NEAR_ROOT"))
+                    r.tags.add("DRAWING_CHAIN_NEAR_ROOT");
+            }
+            println(String.format("  v7.1 post: drawing_chain_funcs=%d (promoted_from_stub=%d)",
+                drawingChainCount, promotedFromStub));
 
             // v4 Rule 28: POLL_RETURN_CONSUMER — a tiny returner is likely a
             // poll target if any caller contains a backward branch. We can't
@@ -1168,6 +1482,19 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             println(String.format("  v4 post: MAINLOOP_DEPTH set | INIT_DEPTH set | POLL_TARGET=%d",
                 pollTargetCount));
 
+            // v7 Rule 80: runtime corroboration pass. Walks every function,
+            // compares static bullseye predictions against merged GS evidence,
+            // attaches RUNTIME_CONFIRMED / RUNTIME_DORMANT_GLOBAL /
+            // RUNTIME_MENU_ONLY decorations. No-op when no GS dumps loaded.
+            if (!gsEvidence.empty()) {
+                runtimeCorroborationPass(results);
+                println(String.format("  v7 post: RUNTIME_CONFIRMED=%d RUNTIME_DORMANT_GLOBAL=%d RUNTIME_MENU_ONLY=%d TBP_CONFIRMED_FUNCS=%d GS_IRQ_SAFE_STUB=%d",
+                    runtimeConfirmedCount, runtimeDormantCount, runtimeMenuOnlyCount,
+                    tbpRuntimeConfirmedFuncCount, gsIrqSafeStubCount));
+            } else {
+                println("  v7 post: GS evidence empty — corroboration skipped.");
+            }
+
             writeUnifiedConfig(unifiedToml,configToml,newStubs,newSkips);
             writeTriageJson(triageJson,results,elfHash,gpValue,totalFuncs,uncategorized);
 
@@ -1182,6 +1509,507 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             flowWriter.close();
             decomp.dispose();
         }
+    }
+
+    // =========================================================
+    // v7: GS-DUMP SUMMARY LOADER + RUNTIME CORROBORATION PASS
+    // =========================================================
+    /**
+     * Walk {@code dir}, parse every *.gs.summary.json with the minimal hand-
+     * rolled reader, populate {@link #gsEvidence}. No-op if folder empty.
+     */
+    private void loadGsSummaryFolder(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        // Stable order: sort by name so output is deterministic.
+        List<File> jsonFiles = new ArrayList<>();
+        for (File f : files) {
+            String nm = f.getName().toLowerCase();
+            if (f.isFile() && nm.endsWith(".summary.json")) jsonFiles.add(f);
+        }
+        jsonFiles.sort(Comparator.comparing(File::getName));
+        for (File f : jsonFiles) {
+            try {
+                GsCheckpoint cp = parseGsSummary(f);
+                if (cp != null) {
+                    gsEvidence.checkpoints.add(cp);
+                    println(String.format("[GS-EVIDENCE]   + %s (P3=%d giftags=%d psm_tex0=%s 4HH=%s)",
+                        cp.name, cp.path3Count, cp.gifTagCount, cp.psmTex0,
+                        cp.psmt4hhUsed));
+                }
+            } catch (Exception ex) {
+                println("[GS-EVIDENCE]   ! failed "+f.getName()+": "+ex.getMessage());
+            }
+        }
+        mergeGsEvidence();
+    }
+
+    /**
+     * Minimal JSON reader keyed on the fixed schema emitted by
+     * gs_dump_to_summary.py. Only fields under {@code summary_for_enricher},
+     * {@code gif}, {@code transfers}, and the top-level metadata are extracted.
+     * Tolerates whitespace + ordering changes; not a full JSON parser.
+     */
+    private GsCheckpoint parseGsSummary(File f) throws IOException {
+        String s = readFileFully(f);
+        GsCheckpoint cp = new GsCheckpoint();
+        // Checkpoint name: strip ".gs.summary.json" suffix; if file embeds an
+        // ELF-name prefix like "Dark Cloud 2_SCUS-..._20260524..." keep the
+        // leading non-date portion.
+        String nm = f.getName();
+        int dot = nm.toLowerCase().indexOf(".gs.summary.json");
+        if (dot > 0) nm = nm.substring(0, dot);
+        cp.name = nm;
+        cp.sourceFile = f.getAbsolutePath();
+
+        cp.serial         = jsonStringField(s, "serial");
+        cp.crc            = jsonStringField(s, "crc");
+        cp.stateVersion   = (int) jsonNumberField(s, "state_version", 0);
+        cp.stateSizeBytes =      jsonNumberField(s, "state_size_bytes", 0);
+        cp.vsyncs         = (int) jsonNumberField(s, "vsyncs", 0);
+
+        // transfers.{PATH1,PATH2,PATH3}.{count,total_bytes}
+        cp.path1Count = (int) jsonScopedNumber(s, "PATH1", "count", 0);
+        cp.path2Count = (int) jsonScopedNumber(s, "PATH2", "count", 0);
+        cp.path3Count = (int) jsonScopedNumber(s, "PATH3", "count", 0);
+        cp.path1Bytes =       jsonScopedNumber(s, "PATH1", "total_bytes", 0);
+        cp.path2Bytes =       jsonScopedNumber(s, "PATH2", "total_bytes", 0);
+        cp.path3Bytes =       jsonScopedNumber(s, "PATH3", "total_bytes", 0);
+        cp.path1Active = cp.path1Count > 0;
+        cp.path2Active = cp.path2Count > 0;
+        cp.path3Active = cp.path3Count > 0;
+
+        cp.gifTagCount    = (int) jsonNumberField(s, "giftag_count", 0);
+        cp.malformedTags  = (int) jsonNumberField(s, "malformed_tags", 0);
+        cp.packedCount    = (int) jsonScopedNumber(s, "gif_flg_counts", "PACKED", 0);
+        cp.reglistCount   = (int) jsonScopedNumber(s, "gif_flg_counts", "REGLIST", 0);
+        cp.imageCount     = (int) jsonScopedNumber(s, "gif_flg_counts", "IMAGE", 0);
+        cp.image2Count    = (int) jsonScopedNumber(s, "gif_flg_counts", "IMAGE2", 0);
+        cp.reglistUsed = cp.reglistCount > 0;
+        cp.image2Used  = cp.image2Count  > 0;
+
+        cp.readfifo2Active = jsonNumberField(s, "readfifo2_calls", 0) > 0;
+
+        // summary_for_enricher block
+        cp.psmt4hhUsed   = jsonBooleanField(s, "psmt4hh_used", false);
+        cp.psmt4hlUsed   = jsonBooleanField(s, "psmt4hl_used", false);
+        cp.psmt8hUsed    = jsonBooleanField(s, "psmt8h_used",  false);
+        // F32 retro upload-side witnesses (only present in summaries produced by
+        // the upgraded gs_dump_to_summary.py; older summaries default false).
+        cp.psmt4hhUpload = jsonBooleanField(s, "psmt4hh_upload", false);
+        cp.psmt4hlUpload = jsonBooleanField(s, "psmt4hl_upload", false);
+        cp.psmt8hUpload  = jsonBooleanField(s, "psmt8h_upload",  false);
+        for (long v : jsonIntArrayField(s, "bitbltbuf_dpsms_used"))
+            cp.bitbltbufDpsms.add((int) v);
+        cp.primGarbage   = jsonBooleanField(s, "prim_garbage_detected", false);
+
+        for (long v : jsonIntArrayField(s, "psm_seen_tex0"))  cp.psmTex0.add((int)v);
+        for (long v : jsonIntArrayField(s, "psm_seen_frame")) cp.psmFrame.add((int)v);
+        for (long v : jsonIntArrayField(s, "psm_seen_zbuf"))  cp.psmZbuf.add((int)v);
+        for (long v : jsonIntArrayField(s, "tex0_tbps_used")) cp.tex0Tbps.add(v);
+        for (long v : jsonIntArrayField(s, "vram_upload_tbps")) cp.vramTbps.add(v);
+        for (String name : jsonStringArrayField(s, "a_d_regs_written_named"))
+            cp.adRegs.add(name);
+        for (String hx : jsonStringArrayField(s, "prim_distinct_values")) {
+            try { cp.primValues.add(Long.parseLong(hx.replace("0x","").replace("0X",""), 16)); }
+            catch (NumberFormatException ignored) {}
+        }
+        if (cp.adRegs.contains("SIGNAL") || cp.adRegs.contains("FINISH") || cp.adRegs.contains("LABEL"))
+            cp.signalFinishLabelSeen = true;
+
+        // priv regs (PMODE/IMR/CSR) — string hex form
+        String imrStr   = jsonStringField(s, "IMR");
+        String pmodeStr = jsonStringField(s, "PMODE");
+        if (imrStr   != null) cp.imr   = parseHexULong(imrStr);
+        if (pmodeStr != null) cp.pmode = parseHexULong(pmodeStr);
+
+        // frame_final / zbuf_final / dispfb1/2 sub-objects
+        cp.frameFbp   = (int) jsonScopedNumber(s, "frame_final", "fbp", -1);
+        cp.frameFbw   = (int) jsonScopedNumber(s, "frame_final", "fbw", -1);
+        cp.framePsm   = (int) jsonScopedNumber(s, "frame_final", "psm", -1);
+        cp.zbufZbp    = (int) jsonScopedNumber(s, "zbuf_final",  "zbp", -1);
+        cp.zbufPsm    = (int) jsonScopedNumber(s, "zbuf_final",  "psm", -1);
+        cp.zbufZmsk   = (int) jsonScopedNumber(s, "zbuf_final",  "zmsk", -1);
+        cp.dispfb1Fbp = (int) jsonScopedNumber(s, "dispfb1",     "fbp", -1);
+        cp.dispfb2Fbp = (int) jsonScopedNumber(s, "dispfb2",     "fbp", -1);
+        return cp;
+    }
+
+    /** Compute union flags and intersections across {@link #gsEvidence}. */
+    private void mergeGsEvidence() {
+        GsRuntimeEvidence ev = gsEvidence;
+        long imrAnd = ~0L;
+        boolean haveImr = false;
+        boolean allMasked = true;
+        for (GsCheckpoint c : ev.checkpoints) {
+            if (c.path1Active) ev.anyPath1 = true;
+            if (c.path2Active) ev.anyPath2 = true;
+            if (c.path3Active) ev.anyPath3 = true;
+            if (c.psmt4hhUsed) ev.anyPsmt4hh = true;
+            if (c.psmt4hlUsed) ev.anyPsmt4hl = true;
+            if (c.psmt8hUsed)  ev.anyPsmt8h  = true;
+            if (c.psmt4hhUpload) ev.anyPsmt4hhUpload = true;
+            if (c.psmt4hlUpload) ev.anyPsmt4hlUpload = true;
+            if (c.psmt8hUpload)  ev.anyPsmt8hUpload  = true;
+            ev.bitbltbufDpsmsUnion.addAll(c.bitbltbufDpsms);
+            if (c.primGarbage) ev.anyPrimGarbage = true;
+            if (c.readfifo2Active) ev.anyReadfifo2 = true;
+            if (c.reglistUsed) ev.anyReglist = true;
+            if (c.image2Used)  ev.anyImage2  = true;
+            if (c.signalFinishLabelSeen) ev.anySignalFinishLabel = true;
+            ev.psmTex0Union.addAll(c.psmTex0);
+            ev.psmFrameUnion.addAll(c.psmFrame);
+            ev.psmZbufUnion.addAll(c.psmZbuf);
+            ev.adRegsUnion.addAll(c.adRegs);
+            ev.tex0TbpsUnion.addAll(c.tex0Tbps);
+            ev.vramTbpsUnion.addAll(c.vramTbps);
+            ev.primUnion.addAll(c.primValues);
+            ev.totalPath3Count += c.path3Count;
+            ev.totalPath3Bytes += c.path3Bytes;
+            for (Integer p : c.psmTex0)
+                ev.psmTex0Witnesses.computeIfAbsent(p, k -> new LinkedHashSet<>()).add(c.name);
+            if (c.imr >= 0) {
+                imrAnd &= c.imr;
+                haveImr = true;
+                if ((c.imr & 0x7F00L) != 0x7F00L) allMasked = false;
+            }
+        }
+        ev.imrIntersection = haveImr ? imrAnd : -1L;
+        ev.imrAllMaskedGsIrqs = haveImr && allMasked;
+    }
+
+    /**
+     * Rule 80: per-function corroboration. Decoration only — no disposition
+     * flip. Predictions checked:
+     *  • PSMT4HH_REFERENCE         <-> any checkpoint witness PSMT4HH (44)
+     *  • MICROCODE_UPLOADER / VIF_*_BUILDER <-> any path1/path2 witness
+     *  • PATH3_INITIATOR / GIF_PATH3_HAZARD <-> any path3 witness +
+     *                                          (prim_garbage in any cp for hazard)
+     *  • MPEG_DECODER_TRAP / IPU   <-> readfifo2 OR ipuActive
+     *  • TEX0_REG_WRITER + tbp constants <-> tex0_tbps_union / vram_tbps_union
+     *  • SIGNAL/FINISH/LABEL handler names <-> imrAllMaskedGsIrqs → safe-stub
+     * Status precedence:
+     *  CONFIRMED > MENU_ONLY > DORMANT > INDETERMINATE
+     */
+    private void runtimeCorroborationPass(List<FuncResult> results) {
+        GsRuntimeEvidence ev = gsEvidence;
+        for (FuncResult r : results) {
+            FuncTraits t = r.traits;
+            if (t == null) continue;
+
+            // Build prediction list + witness map
+            if (t.loadsPsm4hhConstant) {
+                t.runtimeBullseyePredictions.add("PSMT4HH_REFERENCE");
+                // Witnessed if either sampler-side or upload-side observed it.
+                t.runtimeWitness.put("PSMT4HH_REFERENCE",
+                    ev.anyPsmt4hh || ev.anyPsmt4hhUpload ||
+                    ev.anyPsmt4hl || ev.anyPsmt4hlUpload ||
+                    ev.anyPsmt8h  || ev.anyPsmt8hUpload);
+            }
+            if (t.isBitbltbufT4hhUploader) {
+                t.runtimeBullseyePredictions.add("BITBLTBUF_T4HH_UPLOADER");
+                t.runtimeWitness.put("BITBLTBUF_T4HH_UPLOADER",
+                    ev.anyPsmt4hhUpload || ev.anyPsmt4hlUpload || ev.anyPsmt8hUpload);
+            }
+            if (t.isMicrocodeUploader || t.vifOpcodesBuilt.contains("MPG")) {
+                t.runtimeBullseyePredictions.add("MICROCODE_UPLOADER");
+                t.runtimeWitness.put("MICROCODE_UPLOADER", ev.anyPath1 || ev.anyPath2);
+            }
+            if (t.vifOpcodesBuilt.contains("MSCAL") || t.vifOpcodesBuilt.contains("MSCALF")
+                || t.vifOpcodesBuilt.contains("MSCNT")) {
+                t.runtimeBullseyePredictions.add("VIF_MSCAL");
+                t.runtimeWitness.put("VIF_MSCAL", ev.anyPath1);
+            }
+            if (t.path3Initiator || t.path3KickViaDmaApi || t.touchesGifP3Reg) {
+                t.runtimeBullseyePredictions.add("PATH3_KICK");
+                t.runtimeWitness.put("PATH3_KICK", ev.anyPath3);
+            }
+            if (t.touchesGifCtrl) {
+                t.runtimeBullseyePredictions.add("GIF_PATH3_HAZARD");
+                t.runtimeWitness.put("GIF_PATH3_HAZARD", ev.anyPath3 && ev.anyPrimGarbage);
+            }
+            if (t.callsMpegFamily || t.writesIpuCmd || t.accessesIpuMmio) {
+                t.runtimeBullseyePredictions.add("MPEG_DECODER_TRAP");
+                t.runtimeWitness.put("MPEG_DECODER_TRAP", ev.anyReadfifo2);
+            }
+            if (t.writesTex0Reg) {
+                t.runtimeBullseyePredictions.add("TEX0_REG_WRITER");
+                // TEX0 writers are confirmed if game uploaded *any* tex data —
+                // every PATH3-active capture qualifies.
+                t.runtimeWitness.put("TEX0_REG_WRITER", ev.anyPath3);
+            }
+            if (t.writesRgbaqReg) {
+                t.runtimeBullseyePredictions.add("RGBAQ_WRITER");
+                t.runtimeWitness.put("RGBAQ_WRITER", ev.adRegsUnion.contains("RGBAQ"));
+            }
+            if (t.writesZbufReg) {
+                t.runtimeBullseyePredictions.add("ZBUF_REG_WRITER");
+                t.runtimeWitness.put("ZBUF_REG_WRITER", ev.adRegsUnion.contains("ZBUF_1")
+                    || ev.adRegsUnion.contains("ZBUF_2"));
+            }
+            if (t.writesDispfbReg || t.writesDispfbViaSdk) {
+                t.runtimeBullseyePredictions.add("DISPFB_WRITER");
+                // Every checkpoint where PMODE/DISPFB sampled differs = witness.
+                boolean dispfbWitness = false;
+                for (GsCheckpoint c : ev.checkpoints) {
+                    if (c.dispfb1Fbp != null && c.dispfb1Fbp >= 0) { dispfbWitness = true; break; }
+                }
+                t.runtimeWitness.put("DISPFB_WRITER", dispfbWitness);
+            }
+
+            // Rule 78: TBP constant matches against runtime upload heatmap.
+            for (Long c : t.tbpConstantsLoaded) {
+                if (ev.vramTbpsUnion.contains(c) || ev.tex0TbpsUnion.contains(c))
+                    t.tbpRuntimeConfirmed.add(c);
+            }
+            if (!t.tbpRuntimeConfirmed.isEmpty()) {
+                tbpRuntimeConfirmedFuncCount++;
+                if (!r.tags.contains("VRAM_TBP_OVERLAY")) r.tags.add("VRAM_TBP_OVERLAY");
+            }
+
+            // A+D register intersection (informational)
+            for (String s : t.gsRegHits) if (ev.adRegsUnion.contains(s)) t.runtimeAdRegMatch.add(s);
+
+            // Rule 79: GS IRQ handler safe-stub candidate.
+            if (t.isGsIrqHandlerName && ev.imrAllMaskedGsIrqs) {
+                t.gsIrqSafeStubCandidate = true;
+                if (!r.tags.contains("GS_IRQ_SAFE_STUB")) {
+                    r.tags.add("GS_IRQ_SAFE_STUB");
+                    gsIrqSafeStubCount++;
+                }
+            }
+
+            // Status calculation
+            boolean anyConfirmed = false, anyDormant = false;
+            for (Boolean w : t.runtimeWitness.values()) {
+                if (Boolean.TRUE.equals(w)) anyConfirmed = true; else anyDormant = true;
+            }
+            // RUNTIME_MENU_ONLY: PSMT4HH predicted AND only UI/menu checkpoints
+            // witnessed it (no 3D-scene checkpoint witness).
+            // v7.1 refinement: F32 showed BITBLTBUF.dpsm=0x2C uploads are NOT
+            // menu-only — they also occur during 3D scene loads. Same for any
+            // function close to the render roots (drawing_chain_depth <= 3) or
+            // explicitly tagged BITBLTBUF_T4HH_UPLOADER. Skipping the MENU_ONLY
+            // tag in those cases prevents deprioritizing F32-critical uploaders.
+            if (t.runtimeBullseyePredictions.contains("PSMT4HH_REFERENCE") && ev.anyPsmt4hh) {
+                Set<String> witnesses = ev.psmTex0Witnesses.getOrDefault(PSM_PSMT4HH,
+                                                              Collections.<String>emptySet());
+                boolean menuOnly = !witnesses.isEmpty();
+                for (String wname : witnesses) {
+                    if (!isMenuCheckpointName(wname)) { menuOnly = false; break; }
+                }
+                boolean exempt = t.isBitbltbufT4hhUploader ||
+                                 (t.drawingChainDepth >= 0 && t.drawingChainDepth <= 3);
+                if (menuOnly && !exempt) {
+                    t.runtimeMenuOnly = true;
+                    if (!r.tags.contains("RUNTIME_MENU_ONLY")) {
+                        r.tags.add("RUNTIME_MENU_ONLY");
+                        runtimeMenuOnlyCount++;
+                    }
+                }
+            }
+            if (anyConfirmed) {
+                t.runtimeConfirmed = true;
+                t.runtimeStatus = t.runtimeMenuOnly ? "CONFIRMED_MENU_ONLY" : "CONFIRMED";
+                if (!r.tags.contains("RUNTIME_CONFIRMED")) {
+                    r.tags.add("RUNTIME_CONFIRMED");
+                    runtimeConfirmedCount++;
+                }
+            } else if (anyDormant) {
+                t.runtimeDormantGlobal = true;
+                t.runtimeStatus = "DORMANT";
+                if (!r.tags.contains("RUNTIME_DORMANT_GLOBAL")) {
+                    r.tags.add("RUNTIME_DORMANT_GLOBAL");
+                    runtimeDormantCount++;
+                }
+            }
+        }
+    }
+
+    private static boolean isMenuCheckpointName(String nm) {
+        String low = nm.toLowerCase();
+        for (String frag : MENU_CHECKPOINT_FRAGMENTS) if (low.contains(frag)) return true;
+        return false;
+    }
+
+    // ---------- minimal JSON readers ----------
+
+    private static String readFileFully(File f) throws IOException {
+        StringBuilder sb = new StringBuilder((int)Math.min(f.length()+16, 1<<20));
+        BufferedReader br = new BufferedReader(new InputStreamReader(
+            new FileInputStream(f), "UTF-8"));
+        try {
+            char[] buf = new char[8192];
+            int n;
+            while ((n = br.read(buf)) > 0) sb.append(buf, 0, n);
+        } finally { br.close(); }
+        return sb.toString();
+    }
+
+    /** Find {@code "key": <value>} after position {@code from} in {@code s}. Returns -1 if absent. */
+    private static int findKey(String s, String key, int from) {
+        String needle = "\"" + key + "\"";
+        int i = s.indexOf(needle, from);
+        if (i < 0) return -1;
+        // Skip optional whitespace and colon
+        int j = i + needle.length();
+        while (j < s.length() && Character.isWhitespace(s.charAt(j))) j++;
+        if (j >= s.length() || s.charAt(j) != ':') return -1;
+        j++;
+        while (j < s.length() && Character.isWhitespace(s.charAt(j))) j++;
+        return j;
+    }
+
+    private static String jsonStringField(String s, String key) {
+        int v = findKey(s, key, 0);
+        if (v < 0 || s.charAt(v) != '"') return null;
+        int end = v + 1;
+        StringBuilder out = new StringBuilder();
+        while (end < s.length()) {
+            char c = s.charAt(end);
+            if (c == '\\' && end+1 < s.length()) { out.append(s.charAt(end+1)); end += 2; continue; }
+            if (c == '"') break;
+            out.append(c); end++;
+        }
+        return out.toString();
+    }
+
+    private static long jsonNumberField(String s, String key, long deflt) {
+        int v = findKey(s, key, 0);
+        if (v < 0) return deflt;
+        return parseScalarAt(s, v, deflt);
+    }
+
+    private static boolean jsonBooleanField(String s, String key, boolean deflt) {
+        int v = findKey(s, key, 0);
+        if (v < 0) return deflt;
+        if (s.startsWith("true",  v)) return true;
+        if (s.startsWith("false", v)) return false;
+        return deflt;
+    }
+
+    private static long parseScalarAt(String s, int v, long deflt) {
+        int end = v;
+        // hex like "0x..." inside quotes? Strip quotes first.
+        boolean quoted = (v < s.length() && s.charAt(v) == '"');
+        if (quoted) {
+            int e = s.indexOf('"', v+1);
+            if (e < 0) return deflt;
+            return parseHexULong(s.substring(v+1, e));
+        }
+        while (end < s.length()) {
+            char c = s.charAt(end);
+            if ((c>='0'&&c<='9') || c=='-' || c=='+' || c=='.' ||
+                c=='x' || c=='X' || (c>='a'&&c<='f') || (c>='A'&&c<='F')) end++;
+            else break;
+        }
+        if (end == v) return deflt;
+        String tok = s.substring(v, end);
+        try {
+            if (tok.startsWith("0x") || tok.startsWith("0X"))
+                return Long.parseLong(tok.substring(2), 16);
+            return Long.parseLong(tok);
+        } catch (NumberFormatException ex) { return deflt; }
+    }
+
+    private static long parseHexULong(String tok) {
+        try {
+            String t = tok.trim();
+            if (t.startsWith("0x") || t.startsWith("0X")) t = t.substring(2);
+            // 64-bit unsigned: use BigInteger to dodge sign issues
+            return new java.math.BigInteger(t, 16).longValue();
+        } catch (Exception ex) { return -1L; }
+    }
+
+    /**
+     * Find {@code "scope": { ... "key": <v> ... }}. The scope opens at the
+     * nearest '{' after the colon; we read up to the matching '}'.
+     */
+    private static long jsonScopedNumber(String s, String scope, String key, long deflt) {
+        int o = findKey(s, scope, 0);
+        if (o < 0 || s.charAt(o) != '{') return deflt;
+        int end = matchBrace(s, o);
+        if (end < 0) return deflt;
+        int v = findKey(s.substring(o, end), key, 0);
+        if (v < 0) return deflt;
+        return parseScalarAt(s.substring(o, end), v, deflt);
+    }
+
+    private static int matchBrace(String s, int openIdx) {
+        int depth = 0;
+        boolean inStr = false; boolean esc = false;
+        for (int i = openIdx; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+            } else {
+                if (c == '"') inStr = true;
+                else if (c == '{') depth++;
+                else if (c == '}') { depth--; if (depth == 0) return i+1; }
+            }
+        }
+        return -1;
+    }
+
+    private static long[] jsonIntArrayField(String s, String key) {
+        int v = findKey(s, key, 0);
+        if (v < 0 || s.charAt(v) != '[') return new long[0];
+        int end = v;
+        // Walk to matching ']'
+        int depth = 0; boolean inStr = false; boolean esc = false;
+        for (int i = v; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (inStr) { if (esc) esc=false; else if (c=='\\') esc=true; else if (c=='"') inStr=false; }
+            else if (c == '"') inStr = true;
+            else if (c == '[') depth++;
+            else if (c == ']') { depth--; if (depth == 0) { end = i+1; break; } }
+        }
+        String body = s.substring(v+1, Math.max(v+1, end-1));
+        List<Long> out = new ArrayList<>();
+        for (String tok : body.split(",")) {
+            String t = tok.trim();
+            if (t.isEmpty()) continue;
+            try { out.add(Long.parseLong(t)); }
+            catch (NumberFormatException ex) {
+                if (t.startsWith("0x") || t.startsWith("0X"))
+                    try { out.add(Long.parseLong(t.substring(2), 16)); }
+                    catch (NumberFormatException ignored) {}
+            }
+        }
+        long[] arr = new long[out.size()];
+        for (int i = 0; i < out.size(); i++) arr[i] = out.get(i);
+        return arr;
+    }
+
+    private static List<String> jsonStringArrayField(String s, String key) {
+        List<String> out = new ArrayList<>();
+        int v = findKey(s, key, 0);
+        if (v < 0 || s.charAt(v) != '[') return out;
+        int depth = 0; int end = v;
+        for (int i = v; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '[') depth++;
+            else if (c == ']') { depth--; if (depth == 0) { end = i+1; break; } }
+        }
+        String body = s.substring(v+1, Math.max(v+1, end-1));
+        int i = 0;
+        while (i < body.length()) {
+            while (i < body.length() && body.charAt(i) != '"') i++;
+            if (i >= body.length()) break;
+            int j = i+1;
+            StringBuilder sb = new StringBuilder();
+            while (j < body.length()) {
+                char c = body.charAt(j);
+                if (c == '\\' && j+1 < body.length()) { sb.append(body.charAt(j+1)); j += 2; continue; }
+                if (c == '"') break;
+                sb.append(c); j++;
+            }
+            out.add(sb.toString());
+            i = j+1;
+        }
+        return out;
     }
 
     // =========================================================
@@ -1315,6 +2143,54 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
+    // v7.1 Rule 83: multi-root BFS for drawing_chain_depth. Roots = all
+    // FuncResults whose traits flag them as a GS-bullseye render entrypoint:
+    //  - isSceGifPkRefLoadImage / isSceGifPkFamily / path3Initiator /
+    //    path3KickViaDmaApi / writesDispfbViaSdk / writesGsPrimReg
+    //  - name starts with mgEndFrame / Begin__11mgCDrawPrim
+    // Records min depth across all roots into traits.drawingChainDepth.
+    private void bfsAssignDrawingChainDepth(Map<Long,List<Long>> fwd,
+                                            Map<Long,FuncResult> byAddr,
+                                            List<FuncResult> results) {
+        Set<Long> roots = new HashSet<>();
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            FuncTraits t = r.traits;
+            boolean isRoot = t.isSceGifPkRefLoadImage || t.isSceGifPkFamily ||
+                             t.path3Initiator || t.path3KickViaDmaApi ||
+                             t.writesDispfbViaSdk || t.writesGsPrimReg ||
+                             t.isBitbltbufT4hhUploader;
+            if(!isRoot && r.name != null) {
+                String n = r.name;
+                if(n.startsWith("mgEndFrame") || n.startsWith("Begin__11mgCDrawPrim") ||
+                   n.startsWith("Begin__11mgCDrawEnv") || n.startsWith("mgFlipDrawEnv"))
+                    isRoot = true;
+            }
+            if(isRoot) roots.add(r.address & 0xFFFFFFFFL);
+        }
+        if(roots.isEmpty()) return;
+        Map<Long,Integer> depth = new HashMap<>();
+        Deque<Long> q = new ArrayDeque<>();
+        for(Long r : roots) { depth.put(r, 0); q.add(r); }
+        while(!q.isEmpty()) {
+            long cur = q.poll();
+            int dc = depth.get(cur);
+            List<Long> outs = fwd.get(cur);
+            if(outs == null) continue;
+            for(long n : outs) {
+                if(depth.containsKey(n)) continue;
+                depth.put(n, dc + 1);
+                q.add(n);
+            }
+        }
+        for(Map.Entry<Long,Integer> e : depth.entrySet()) {
+            FuncResult r = byAddr.get(e.getKey());
+            if(r == null || r.traits == null) continue;
+            r.traits.drawingChainDepth = e.getValue();
+            drawingChainCount++;
+        }
+    }
+
     // =========================================================
     // TEXT SECTION DETECTION
     // =========================================================
@@ -1428,6 +2304,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if(cache.containsKey(key)) return cache.get(key);
         FuncTraits traits=new FuncTraits();
         traits.byteSize=func.getBody().getNumAddresses();
+        String fname=func.getName();
 
         Set<Function> callees=func.getCalledFunctions(monitor);
         traits.calleeCount=callees.size();
@@ -1444,7 +2321,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             // Rule 24: Pad poll callee detection
             if(PAD_POLL_CALLEES.contains(cn))
                 traits.callsPadPollCallee=true;
+            // v7 Rule 75: SDK-routed DISPFB writer
+            for(String s : DISPFB_SDK_CALLEES) if(cn.equals(s)) { traits.writesDispfbViaSdk=true; break; }
+            // v7 Rule 76: SDK-routed Path3 kicker
+            for(String s : PATH3_KICK_API_CALLEES) if(cn.equals(s)) { traits.path3KickViaDmaApi=true; break; }
         }
+        // v7 Rule 79: GS IRQ handler name shape (decided here so it's available
+        // for the corroboration pass even on functions with empty callee sets).
+        for(String frag : GS_IRQ_HANDLER_NAME_FRAGMENTS)
+            if(fname.contains(frag)) { traits.isGsIrqHandlerName=true; break; }
 
         int xrefCount=0;
         for(Reference ref:refManager.getReferencesTo(func.getEntryPoint()))
@@ -1454,7 +2339,6 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if(traits.isThunk){cache.put(key,traits);return traits;}
 
         // Rule 20 (v3): Large init function detection
-        String fname=func.getName();
         boolean isInitNamed = fname.toLowerCase().contains("init")||
                               fname.contains("__ct__")||fname.startsWith("__sinit_");
         if(isInitNamed&&(traits.calleeCount>10||traits.byteSize>2000))
@@ -1678,6 +2562,10 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                         if(fname.contains("__ct__")||fname.startsWith("__sinit_")||
                            fname.toLowerCase().contains("init"))
                             traits.ctorWritesA0Slot = true;
+                        // v7.1 Rule 82: distinct slot tracking for the multi-field
+                        // ctor / initializer test. F33: __ct__11mgCDrawPrimFv writes
+                        // 7+ slots (manager / draw env / texture / PRIM / flag / Q / C-Z).
+                        traits.ctorSlotsWritten.add(offset);
                     }
                 }
             }
@@ -1852,6 +2740,11 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     for(Object op : inst.getInputObjects()) {
                         if(!(op instanceof ghidra.program.model.scalar.Scalar)) continue;
                         long c = ((ghidra.program.model.scalar.Scalar)op).getUnsignedValue();
+                        // v7 Rule 78: capture small positive immediates that fit
+                        // in TEX0.TBP / BITBLTBUF.DBP shape (14-bit, 1..0x3FFF).
+                        // Runtime intersection filters noise later.
+                        if(ml.equals("ori") && c > 0 && c <= 0x3FFFL)
+                            traits.tbpConstantsLoaded.add(c);
                         // For lui, the immediate is the upper 16 bits of a 32-bit
                         // word — the high byte is what we test against VIF opcodes.
                         long highByte;
@@ -1903,6 +2796,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     if((srcZero || ml.equals("li")) && imm >= 0) {
                         if(imm == PSMT4HH || imm == PSMT4HL || imm == PSMT8H)
                             traits.loadsPsm4hhConstant = true;
+                        // v7 Rule 78: TBP-shape constant via addiu/li (14-bit positive).
+                        if(imm > 0 && imm <= 0x3FFFL)
+                            traits.tbpConstantsLoaded.add(imm);
                     }
                 }
                 // Rule 22: SID literal scan near sceSifBindRpc calls
@@ -2029,8 +2925,96 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(traits.byteSize >= 40) traits.ctorWritesVTablePointer = true;
         }
 
+        // v7.1 Rule 82: CTOR_MULTI_FIELD_INITIALIZER. F33 root cause: a ctor that
+        // initializes 5+ distinct slots (manager / embedded objects / packet
+        // pointers / defaults). Auto-stubbing such a ctor leaves the entire
+        // object in undefined state and breaks the call chain downstream.
+        boolean ctorLike = fname.contains("__ct__") || fname.startsWith("__sinit_")
+                        || fname.toLowerCase().contains("init");
+        if(ctorLike && traits.ctorSlotsWritten.size() >= 5)
+            traits.isCtorMultiFieldInit = true;
+
+        // v7.1 Rule 84: LIFECYCLE_LAZY_INIT_GUARD. F33: Initialize__11mgCDrawPrim
+        // tested this+0x00 for null and only installed manager when zero. If
+        // auto-stubbed, manager never installed across all subsequent draws.
+        // Pattern: name matches lifecycle verb AND function body opens with
+        // `lw $rN, 0($a0)` followed within a few instructions by `beq $rN, $zero`
+        // / `bne $rN, $zero` / `beqz` / `bnez`. We pre-scanned the first ~8
+        // instructions in detectLifecycleLazyInit() below.
+        if(isLifecycleVerbName(fname) && traits.byteSize > 50)
+            traits.isLifecycleLazyInit = detectLifecycleLazyInit(func);
+
+        // v7.1 Rule 85: BITBLTBUF_T4HH_UPLOADER. F32 bug: BITBLTBUF.dpsm=0x2C
+        // (PSMT4HH destination) upload paths. writesBitbltbufReg is gathered
+        // alongside the existing gsRegHits set; here we collapse the two
+        // signals: BITBLTBUF reg writer that also loads a 4HH/4HL/8H constant.
+        if(traits.gsRegHits.contains("BITBLTBUF")) traits.writesBitbltbufReg = true;
+        if(traits.writesBitbltbufReg && traits.loadsPsm4hhConstant)
+            traits.isBitbltbufT4hhUploader = true;
+
         cache.put(key,traits);
         return traits;
+    }
+
+    // v7.1 Rule 84: lifecycle-verb name match. Includes the F33 culprit
+    // Initialize__11mgCDrawPrim variants plus the broader category.
+    private static boolean isLifecycleVerbName(String name) {
+        if(name == null) return false;
+        if(name.startsWith("Initialize")) return true;
+        if(name.startsWith("Begin__"))    return true;
+        if(name.startsWith("Open"))       return true;
+        if(name.startsWith("Acquire"))    return true;
+        if(name.startsWith("Setup"))      return true;
+        if(name.startsWith("Reset"))      return true;
+        return false;
+    }
+
+    // v7.1 Rule 84: scan first ~8 instructions for `lw $rN, 0($a0)` followed by
+    // a branch-on-zero / branch-not-zero of the same register. This is the F33
+    // "if (this->manager == null) install manager" guard. False positive risk
+    // is low because the verb-name match restricts the search.
+    private boolean detectLifecycleLazyInit(Function func) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        String loadDestReg = null;
+        int scanned = 0;
+        while(it.hasNext() && scanned < 8) {
+            Instruction inst = it.next();
+            scanned++;
+            String ml = inst.getMnemonicString();
+            if(ml == null) continue;
+            ml = ml.toLowerCase();
+            if(loadDestReg == null && (ml.equals("lw") || ml.equals("ld") || ml.equals("lwu"))) {
+                // dest is opObjects(0); base+offset in opObjects(1).
+                Object[] dop = inst.getOpObjects(0);
+                Object[] aop = inst.getOpObjects(1);
+                String destName = null;
+                boolean baseIsA0 = false;
+                long off = -1;
+                if(dop != null && dop.length > 0 &&
+                   dop[0] instanceof ghidra.program.model.lang.Register)
+                    destName = ((ghidra.program.model.lang.Register)dop[0]).getName();
+                if(aop != null) {
+                    for(Object o : aop) {
+                        if(o instanceof ghidra.program.model.lang.Register &&
+                           ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("a0"))
+                            baseIsA0 = true;
+                        else if(o instanceof ghidra.program.model.scalar.Scalar)
+                            off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(destName != null && baseIsA0 && off == 0) loadDestReg = destName;
+                continue;
+            }
+            if(loadDestReg != null && (ml.equals("beq") || ml.equals("bne") ||
+                                       ml.equals("beqz") || ml.equals("bnez"))) {
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register &&
+                       ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase(loadDestReg))
+                        return true;
+                }
+            }
+        }
+        return false;
     }
 
     // =========================================================
@@ -2129,7 +3113,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                                  int totalFuncs,int uncategorized) throws IOException {
         PrintWriter w=new PrintWriter(new FileWriter(outFile));
         w.println("{");
-        w.println("  \"schema_version\": 6,");
+        w.println("  \"schema_version\": 7.1,");
         w.println("  \"elf_hash\": \""+elfHash+"\",");
         if(gpValue!=0)w.println("  \"global_pointer\": \""+hex(gpValue)+"\",");
         w.println("  \"text_range\": { \"start\": \""+hex(textStart)+"\", \"end\": \""+hex(textEnd)+"\" },");
@@ -2196,7 +3180,22 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"vif_mscal_builder\": "+vifMscalBuilderCount+",");
         w.println("    \"vif_direct_builder\": "+vifDirectBuilderCount+",");
         w.println("    \"vif_unpack_builder\": "+vifUnpackBuilderCount+",");
-        w.println("    \"dma_tag_builder\": "+dmaTagBuilderCount);
+        w.println("    \"dma_tag_builder\": "+dmaTagBuilderCount+",");
+        // v7 stats
+        w.println("    \"dispfb_sdk_writer\": "+dispfbSdkWriterCount+",");
+        w.println("    \"path3_kick_via_dma_api\": "+path3KickViaApiCount+",");
+        w.println("    \"gs_irq_handler_name_funcs\": "+gsIrqHandlerCount+",");
+        w.println("    \"gs_irq_safe_stub_funcs\": "+gsIrqSafeStubCount+",");
+        w.println("    \"runtime_confirmed\": "+runtimeConfirmedCount+",");
+        w.println("    \"runtime_dormant_global\": "+runtimeDormantCount+",");
+        w.println("    \"runtime_menu_only\": "+runtimeMenuOnlyCount+",");
+        w.println("    \"tbp_runtime_confirmed_funcs\": "+tbpRuntimeConfirmedFuncCount+",");
+        w.println("    \"gs_evidence_checkpoints\": "+gsEvidence.checkpoints.size()+",");
+        // v7.1 stats
+        w.println("    \"ctor_multi_field_initializer\": "+ctorMultiFieldInitCount+",");
+        w.println("    \"lifecycle_lazy_init_guard\": "+lifecycleLazyInitCount+",");
+        w.println("    \"bitbltbuf_t4hh_uploader\": "+bitbltbufT4hhUploaderCount+",");
+        w.println("    \"drawing_chain_funcs\": "+drawingChainCount);
         w.println("  },");
 
         // v5 Rule 55: known DC2 gp-relative globals (labels for literal_refs decode).
@@ -2248,15 +3247,32 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
         w.println("\n  },");
 
-        // v6: PCSX2 baseline metadata. User runs PCSX2 paused at known checkpoints
-        // (e.g. SCE Logo) and pastes the EE PC + thread state here. Consumer tools
-        // can correlate to our static analysis. Empty placeholder; user fills in.
+        // v6: PCSX2 baseline metadata. v7 auto-populates checkpoint slots from
+        // loaded gs_dump_to_summary.py outputs (filename → checkpoint name).
+        // Slots without a matching GS dump remain null.
         w.println("  \"pcsx2_baseline\": {");
-        w.println("    \"_note\": \"Populate with PCSX2 paused-state captures (pc, ra, callee chain) at known checkpoints.\",");
-        w.println("    \"sce_logo\": null,");
-        w.println("    \"title_screen\": null,");
-        w.println("    \"menu_main\": null");
+        w.println("    \"_note\": \"v7: checkpoint slots auto-populated from gs_runtime_evidence.checkpoints[]\",");
+        {
+            String[] standardSlots = {"sce_logo","title_screen","menu_main","3d_scene","cutscene","inventory","pause_menu","character_select"};
+            for (int si = 0; si < standardSlots.length; si++) {
+                String slot = standardSlots[si];
+                GsCheckpoint match = findCheckpointForSlot(slot);
+                w.print("    \""+slot+"\": ");
+                if (match == null) w.print("null");
+                else {
+                    w.print("{\"source\": "+jsonString(match.name)+
+                            ", \"path3_count\": "+match.path3Count+
+                            ", \"giftags\": "+match.gifTagCount+
+                            ", \"psmt4hh\": "+match.psmt4hhUsed+
+                            ", \"psm_tex0\": "+intSetToJsonArray(match.psmTex0)+"}");
+                }
+                w.println(si == standardSlots.length-1 ? "" : ",");
+            }
+        }
         w.println("  },");
+
+        // v7: GS runtime evidence block — per-checkpoint facts + merged union.
+        emitGsRuntimeEvidence(w);
 
         // v4: GS register name map (consumers can label MMIO_GS hits).
         w.println("  \"known_gs_registers\": {");
@@ -2440,11 +3456,22 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     w.print(jsonString(s));
                 }
             }
-            w.print("]");
+            w.print("], ");
+            // v7 hardware-shape fields
+            w.print("\"writes_dispfb_via_sdk\": "+t.writesDispfbViaSdk+", ");
+            w.print("\"path3_kick_via_dma_api\": "+t.path3KickViaDmaApi+", ");
+            w.print("\"is_gs_irq_handler_name\": "+t.isGsIrqHandlerName+", ");
+            // v7.1 hardware-shape fields
+            w.print("\"writes_bitbltbuf_reg\": "+t.writesBitbltbufReg+", ");
+            w.print("\"is_bitbltbuf_t4hh_uploader\": "+t.isBitbltbufT4hhUploader+", ");
+            w.print("\"is_ctor_multi_field_init\": "+t.isCtorMultiFieldInit+", ");
+            w.print("\"ctor_slots_written_count\": "+t.ctorSlotsWritten.size()+", ");
+            w.print("\"is_lifecycle_lazy_init\": "+t.isLifecycleLazyInit);
             w.print("}, ");
             // v4 graph-derived fields, hoisted above tags so consumers can sort.
             w.print("\"mainloop_depth\": "+t.mainLoopDepth+", ");
             w.print("\"init_chain_depth\": "+t.initChainDepth+", ");
+            w.print("\"drawing_chain_depth\": "+t.drawingChainDepth+", ");
             w.print("\"tags\": [");
             for(int j=0;j<r.tags.size();j++){if(j>0)w.print(", ");w.print("\""+r.tags.get(j)+"\"");}
             w.print("], ");
@@ -2487,6 +3514,64 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 }
                 w.print("]");
             }
+            // v7: runtime_corroboration block. Emitted only when there is
+            // either a prediction or a TBP-constant match; omitted otherwise
+            // to keep JSON size bounded for leaf/utility functions.
+            if (!t.runtimeBullseyePredictions.isEmpty() || !t.tbpConstantsLoaded.isEmpty()
+                || t.gsIrqSafeStubCandidate) {
+                w.print(", \"runtime_corroboration\": {");
+                w.print("\"status\": "+jsonString(t.runtimeStatus)+", ");
+                w.print("\"confirmed\": "+t.runtimeConfirmed+", ");
+                w.print("\"dormant_global\": "+t.runtimeDormantGlobal+", ");
+                w.print("\"menu_only\": "+t.runtimeMenuOnly+", ");
+                w.print("\"gs_irq_safe_stub_candidate\": "+t.gsIrqSafeStubCandidate+", ");
+                w.print("\"predicted_bullseye\": [");
+                {
+                    boolean f=true;
+                    for(String s:t.runtimeBullseyePredictions){
+                        if(!f) w.print(", "); f=false;
+                        w.print(jsonString(s));
+                    }
+                }
+                w.print("], ");
+                w.print("\"witness\": {");
+                {
+                    boolean f=true;
+                    for(Map.Entry<String,Boolean> e:t.runtimeWitness.entrySet()){
+                        if(!f) w.print(", "); f=false;
+                        w.print(jsonString(e.getKey())+": "+e.getValue());
+                    }
+                }
+                w.print("}, ");
+                w.print("\"a_d_reg_runtime_match\": [");
+                {
+                    boolean f=true;
+                    for(String s:t.runtimeAdRegMatch){
+                        if(!f) w.print(", "); f=false;
+                        w.print(jsonString(s));
+                    }
+                }
+                w.print("], ");
+                w.print("\"tbp_constants_loaded\": [");
+                {
+                    boolean f=true;
+                    for(Long c:t.tbpConstantsLoaded){
+                        if(!f) w.print(", "); f=false;
+                        w.print(c);
+                    }
+                }
+                w.print("], ");
+                w.print("\"tbp_runtime_confirmed\": [");
+                {
+                    boolean f=true;
+                    for(Long c:t.tbpRuntimeConfirmed){
+                        if(!f) w.print(", "); f=false;
+                        w.print(c);
+                    }
+                }
+                w.print("]");
+                w.print("}");
+            }
             w.print("}");
             if(i<results.size()-1)w.println(",");else w.println();
         }
@@ -2501,6 +3586,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             List<FuncResult> focus = new ArrayList<>();
             for(FuncResult r : results)
                 if(r.traits != null && r.traits.isTopPriorityFix) focus.add(r);
+            // v7 Rule 81: re-rank — CONFIRMED first, INDETERMINATE next,
+            // MENU_ONLY then DORMANT. Stable within a bucket by address.
+            focus.sort((a,b) -> {
+                int ra = focusRank(a.traits);
+                int rb = focusRank(b.traits);
+                if (ra != rb) return Integer.compare(ra, rb);
+                return Long.compare(a.address & 0xFFFFFFFFL, b.address & 0xFFFFFFFFL);
+            });
             for(int i=0;i<focus.size();i++) {
                 FuncResult r = focus.get(i);
                 FuncTraits t = r.traits;
@@ -2512,7 +3605,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     w.print(jsonString(r.tags.get(j)));
                 }
                 w.print("], \"mainloop_depth\": "+t.mainLoopDepth+
-                        ", \"caller_count\": "+t.callers.size()+"}");
+                        ", \"drawing_chain_depth\": "+t.drawingChainDepth+
+                        ", \"caller_count\": "+t.callers.size()+
+                        ", \"runtime_status\": "+jsonString(t.runtimeStatus)+"}");
                 if(i<focus.size()-1) w.println(","); else w.println();
             }
         }
@@ -2526,6 +3621,159 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private static String jsonString(String v){
         if(v==null)return "\"\"";
         return "\""+v.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n").replace("\r","\\r").replace("\t","\\t")+"\"";
+    }
+
+    // v7: bucket sort for focus_set rerank.
+    //  0 = CONFIRMED (true bullseye, witnessed at runtime)
+    //  1 = INDETERMINATE (no runtime evidence loaded OR mixed)
+    //  2 = MENU_ONLY (UI pipeline; non-3D-critical)
+    //  3 = DORMANT (predicted bullseye, never witnessed anywhere)
+    private static int focusRank(FuncTraits t) {
+        if (t == null) return 1;
+        if (t.runtimeConfirmed && !t.runtimeMenuOnly) return 0;
+        if (t.runtimeConfirmed && t.runtimeMenuOnly)  return 2;
+        if (t.runtimeMenuOnly) return 2;
+        if (t.runtimeDormantGlobal) return 3;
+        return 1;
+    }
+
+    /**
+     * Heuristic match between a fixed checkpoint slot name and any loaded
+     * {@link GsCheckpoint}. Loose substring matching on lower-case names.
+     * Returns the first match, or null.
+     */
+    private GsCheckpoint findCheckpointForSlot(String slot) {
+        String low = slot.toLowerCase();
+        // Synonyms: collapse common variations the user files might use.
+        String[] aliases;
+        if (low.equals("sce_logo"))         aliases = new String[]{"sce_logo","scelogo"};
+        else if (low.equals("title_screen"))aliases = new String[]{"title","main_title"};
+        else if (low.equals("menu_main"))   aliases = new String[]{"menu","main_menu"};
+        else if (low.equals("3d_scene"))    aliases = new String[]{"3d_scene","3dscene","gameplay","field"};
+        else if (low.equals("cutscene"))    aliases = new String[]{"cutscene","movie","fmv"};
+        else if (low.equals("inventory"))   aliases = new String[]{"inventory"};
+        else if (low.equals("pause_menu"))  aliases = new String[]{"pause"};
+        else if (low.equals("character_select")) aliases = new String[]{"character","select"};
+        else                                aliases = new String[]{low};
+        for (GsCheckpoint c : gsEvidence.checkpoints) {
+            String cn = c.name.toLowerCase();
+            for (String a : aliases) if (cn.contains(a)) return c;
+        }
+        return null;
+    }
+
+    private static String intSetToJsonArray(Set<Integer> s) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean f = true;
+        for (Integer v : s) { if(!f) sb.append(", "); f=false; sb.append(v); }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String longSetToJsonArray(Set<Long> s) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean f = true;
+        for (Long v : s) { if(!f) sb.append(", "); f=false; sb.append(v); }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String stringSetToJsonArray(Set<String> s) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean f = true;
+        for (String v : s) { if(!f) sb.append(", "); f=false; sb.append(jsonString(v)); }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    /** v7: emit the gs_runtime_evidence top-level block. */
+    private void emitGsRuntimeEvidence(PrintWriter w) {
+        GsRuntimeEvidence ev = gsEvidence;
+        w.println("  \"gs_runtime_evidence\": {");
+        w.println("    \"checkpoint_count\": "+ev.checkpoints.size()+",");
+        w.println("    \"merged\": {");
+        w.println("      \"any_path1\": "+ev.anyPath1+",");
+        w.println("      \"any_path2\": "+ev.anyPath2+",");
+        w.println("      \"any_path3\": "+ev.anyPath3+",");
+        w.println("      \"any_psmt4hh\": "+ev.anyPsmt4hh+",");
+        w.println("      \"any_psmt4hl\": "+ev.anyPsmt4hl+",");
+        w.println("      \"any_psmt8h\": "+ev.anyPsmt8h+",");
+        w.println("      \"any_psmt4hh_upload\": "+ev.anyPsmt4hhUpload+",");
+        w.println("      \"any_psmt4hl_upload\": "+ev.anyPsmt4hlUpload+",");
+        w.println("      \"any_psmt8h_upload\": "+ev.anyPsmt8hUpload+",");
+        w.println("      \"bitbltbuf_dpsms_union\": "+intSetToJsonArray(ev.bitbltbufDpsmsUnion)+",");
+        w.println("      \"any_prim_garbage\": "+ev.anyPrimGarbage+",");
+        w.println("      \"any_readfifo2\": "+ev.anyReadfifo2+",");
+        w.println("      \"any_reglist\": "+ev.anyReglist+",");
+        w.println("      \"any_image2\": "+ev.anyImage2+",");
+        w.println("      \"any_signal_finish_label\": "+ev.anySignalFinishLabel+",");
+        w.println("      \"imr_intersection\": "+(ev.imrIntersection<0 ? "null"
+                                                  : "\"0x"+String.format("%016X", ev.imrIntersection)+"\"")+",");
+        w.println("      \"imr_all_masked_gs_irqs\": "+ev.imrAllMaskedGsIrqs+",");
+        w.println("      \"total_path3_count\": "+ev.totalPath3Count+",");
+        w.println("      \"total_path3_bytes\": "+ev.totalPath3Bytes+",");
+        w.println("      \"psm_tex0_union\": "+intSetToJsonArray(ev.psmTex0Union)+",");
+        w.println("      \"psm_frame_union\": "+intSetToJsonArray(ev.psmFrameUnion)+",");
+        w.println("      \"psm_zbuf_union\": "+intSetToJsonArray(ev.psmZbufUnion)+",");
+        w.println("      \"a_d_regs_union\": "+stringSetToJsonArray(ev.adRegsUnion)+",");
+        w.println("      \"tex0_tbps_union\": "+longSetToJsonArray(ev.tex0TbpsUnion)+",");
+        w.println("      \"vram_upload_tbps_union\": "+longSetToJsonArray(ev.vramTbpsUnion)+",");
+        w.println("      \"prim_distinct_union\": "+longSetToJsonArray(ev.primUnion));
+        w.println("    },");
+        w.println("    \"psm_tex0_witnesses\": {");
+        {
+            boolean f = true;
+            for (Map.Entry<Integer,Set<String>> e : ev.psmTex0Witnesses.entrySet()) {
+                if (!f) w.println(","); f = false;
+                w.print("      \""+e.getKey()+"\": "+stringSetToJsonArray(e.getValue()));
+            }
+        }
+        w.println("\n    },");
+        w.println("    \"checkpoints\": [");
+        for (int ci = 0; ci < ev.checkpoints.size(); ci++) {
+            GsCheckpoint c = ev.checkpoints.get(ci);
+            w.print("      {");
+            w.print("\"name\": "+jsonString(c.name)+", ");
+            w.print("\"serial\": "+jsonString(c.serial)+", ");
+            w.print("\"crc\": "+jsonString(c.crc)+", ");
+            w.print("\"source_file\": "+jsonString(c.sourceFile)+", ");
+            w.print("\"vsyncs\": "+c.vsyncs+", ");
+            w.print("\"path1_count\": "+c.path1Count+", ");
+            w.print("\"path2_count\": "+c.path2Count+", ");
+            w.print("\"path3_count\": "+c.path3Count+", ");
+            w.print("\"path3_bytes\": "+c.path3Bytes+", ");
+            w.print("\"giftag_count\": "+c.gifTagCount+", ");
+            w.print("\"malformed_tags\": "+c.malformedTags+", ");
+            w.print("\"packed\": "+c.packedCount+", ");
+            w.print("\"reglist\": "+c.reglistCount+", ");
+            w.print("\"image\": "+c.imageCount+", ");
+            w.print("\"image2\": "+c.image2Count+", ");
+            w.print("\"readfifo2_active\": "+c.readfifo2Active+", ");
+            w.print("\"psmt4hh\": "+c.psmt4hhUsed+", ");
+            w.print("\"psmt4hl\": "+c.psmt4hlUsed+", ");
+            w.print("\"psmt8h\": "+c.psmt8hUsed+", ");
+            w.print("\"psmt4hh_upload\": "+c.psmt4hhUpload+", ");
+            w.print("\"psmt4hl_upload\": "+c.psmt4hlUpload+", ");
+            w.print("\"psmt8h_upload\": "+c.psmt8hUpload+", ");
+            w.print("\"bitbltbuf_dpsms\": "+intSetToJsonArray(c.bitbltbufDpsms)+", ");
+            w.print("\"prim_garbage\": "+c.primGarbage+", ");
+            w.print("\"psm_tex0\": "+intSetToJsonArray(c.psmTex0)+", ");
+            w.print("\"psm_frame\": "+intSetToJsonArray(c.psmFrame)+", ");
+            w.print("\"psm_zbuf\": "+intSetToJsonArray(c.psmZbuf)+", ");
+            w.print("\"a_d_regs\": "+stringSetToJsonArray(c.adRegs)+", ");
+            w.print("\"tex0_tbps\": "+longSetToJsonArray(c.tex0Tbps)+", ");
+            w.print("\"vram_upload_tbps\": "+longSetToJsonArray(c.vramTbps)+", ");
+            w.print("\"prim_distinct\": "+longSetToJsonArray(c.primValues)+", ");
+            w.print("\"imr\": "+(c.imr<0 ? "null" : "\"0x"+String.format("%016X", c.imr)+"\"")+", ");
+            w.print("\"pmode\": "+(c.pmode<0 ? "null" : "\"0x"+String.format("%016X", c.pmode)+"\"")+", ");
+            w.print("\"frame_final\": {\"fbp\": "+c.frameFbp+", \"fbw\": "+c.frameFbw+", \"psm\": "+c.framePsm+"}, ");
+            w.print("\"zbuf_final\": {\"zbp\": "+c.zbufZbp+", \"psm\": "+c.zbufPsm+", \"zmsk\": "+c.zbufZmsk+"}, ");
+            w.print("\"dispfb1_fbp\": "+c.dispfb1Fbp+", \"dispfb2_fbp\": "+c.dispfb2Fbp);
+            w.print("}");
+            if (ci < ev.checkpoints.size()-1) w.println(","); else w.println();
+        }
+        w.println("    ]");
+        w.println("  },");
     }
 }
 
