@@ -26,17 +26,17 @@ v6 additions (match TriageEnricher.java schema_version=6):
     vif_opcode_constants, dma_tag_ids, pcsx2_baseline status.
 
 v3 changes (matching TriageEnricher.java v3 schema_version=3):
-  ג€¢ New phase MD:  phase_gifpk.md      ג€” sceGifPk*/sceVif1Pk* packet builders
-  ג€¢ New phase MD:  phase_iop_rpc.md    ג€” IOP_RPC_DISPATCH functions
-  ג€¢ New phase MD:  phase_archive_io.md ג€” ARCHIVE_IO functions
-  ג€¢ New section:   game_override_addresses shown in summary
-  ג€¢ New tag columns in all tables: CONV_VIOLATION, INIT_LARGE, DMA_TTE,
+  New phase MD:  phase_gifpk.md       sceGifPk*/sceVif1Pk* packet builders
+  New phase MD:  phase_iop_rpc.md     IOP_RPC_DISPATCH functions
+  New phase MD:  phase_archive_io.md  ARCHIVE_IO functions
+  New section:   game_override_addresses shown in summary
+  New tag columns in all tables: CONV_VIOLATION, INIT_LARGE, DMA_TTE,
                                    IOP_RPC, ARCHIVE_IO, PAD_POLL
-  ג€¢ Phase 6 (MMIO) now has DMA_CHAIN_TTE_RISK sub-section
-  ג€¢ Phase 4b now has PAD_POLL_LOOP sub-section
-  ג€¢ F13 stub:  sceDmaSync non-blocking pattern included in phase instructions
-  ג€¢ Summary MD:  shows game_override_imported count + known_iop_sids table
-  ג€¢ classify_phases: v3 tags route correctly before fallback categories
+  Phase 6 (MMIO) now has DMA_CHAIN_TTE_RISK sub-section
+  Phase 4b now has PAD_POLL_LOOP sub-section
+  F13 stub:  sceDmaSync non-blocking pattern included in phase instructions
+  Summary MD:  shows game_override_imported count + known_iop_sids table
+  classify_phases: v3 tags route correctly before fallback categories
 
 CLI usage (unchanged):
   python triage_analyzer.py triage_map.json stats
