@@ -1,4 +1,4 @@
-// PS2Recomp Triage Enricher v7 - Ghidra Script (Step 2 of Pipeline)
+// PS2Recomp Triage Enricher v8 - Ghidra Script (Step 2 of Pipeline)
 // ==================================================================
 // Run AFTER ExportPS2Functions.java on the same Ghidra project.
 //
