@@ -1,6 +1,75 @@
-// PS2Recomp Triage Enricher v7 - Ghidra Script (Step 2 of Pipeline)
+// PS2Recomp Triage Enricher v8 - Ghidra Script (Step 2 of Pipeline)
 // ==================================================================
 // Run AFTER ExportPS2Functions.java on the same Ghidra project.
+//
+// WHAT'S NEW IN v8 (DC2 Phase F36-F49 retrospective + forward F47):
+//   Tier 0 — Broken-counter fixes
+//   Rule 86 VIF_BUILDER counter wiring   counters now incremented; per-func
+//          vif_opcodes_built[] retained.
+//   Rule 87 PSMT constant — expand match Now also matches addiu/li-zero, ori-zero,
+//          single-imm li for 0x2C/0x24/0x1B/0x13/0x2D (T4HH/T4HL/T8H/PSMCT16/T4).
+//   Rule 88 LIBGCC_INTRINSIC exact-name  Hardcoded list (__divdi3 etc.) wired
+//          alongside regex; PS2 64-bit single-reg ABI tag.
+//   Rule 89 JALR_T9 accept-any-flow      Counter no longer gated on flow type;
+//          tail_call_indirect splits direct vs $t9.
+//   Rule 90 SPR_SYNC split fields        uses_spr / has_sync_instr / spr_sync_combined
+//          emitted separately.
+//   Rule 91 BITBLTBUF_T4HH depth-2       Caller of an uploader also tagged via
+//          asset_upload_traces post-pass; runtime menu_only no longer suppresses.
+//
+//   Tier 1 — New detectors (F36/F42/F46.5/F46.6/F49 root causes)
+//   Rule 92 CTOR class+global+vtable     Demangled __ct__ class name, vtable
+//          install offset, vtable target addr, caller mode (direct_only /
+//          indirect_only / dual / unobserved), assigned-to-global flag, sibling
+//          ctor calls, ctor_risk_tier (CRITICAL / HIGH / MEDIUM / LOW).
+//   Rule 93 CLASS_REGISTRY top-level     classes section grouping ctors / dtor /
+//          methods / vtable_addr / has_virtual_draw / instantiation_sites.
+//   Rule 94 VIRTUAL_DISPATCH_SITES       Per-func list of `lw $rX,K($a0); lw $rY,K2($rX); jalr $rY`
+//          dispatch sites; slot offset captured.
+//   Rule 95 GLOBAL_RETURN_TRACKING       For every jal site, look ahead for
+//          `sw $v0, +imm($gp)` to discover ctor->global bindings. Catches F46.5
+//          TitleCamera null-deref class of bugs. Auto-extends known_dc2_globals.
+//   Rule 96 GIF_NLOOP_DOUBLE_COUNT_RISK  Function that calls both
+//          makeGiftagAplusD/MakeGiftagAplusD and closePacketGifTag (Rule 86 F37).
+//   Rule 97 PAD_BUTTON_MASK_CONSUMER     andi/and against a known PS2 pad mask
+//          constant. Emits pad_masks_tested[] with friendly names.
+//   Rule 98 OVERRIDE_CLASSIFICATION      Parses dc2_game_override.cpp helper
+//          bodies; tags each binding as nop_stub / constant_return / state_machine
+//          / probe / real_shim; flags retire_candidate.
+//   Rule 99 FILE_PATH_SPRINTF_SOURCE     Caller of LoadFile2/sceCdRead/sceOpen
+//          whose $a0 argument was set by sprintf with %s format; emits the
+//          format string when resolvable.
+//   Rule 100 FRAME_CLOCK_DRIVER          Function calls sceGsSyncV / WaitVSync /
+//          mgEndFrame; emit per-func + collect frame_clock_drivers[].
+//   Rule 101 SIF_CALL_RPC_FID            Capture the constant passed in $a1
+//          to sceSifCallRpc (function-id) alongside SID.
+//   Rule 102 SCEVU0_HELPER_MUSTIMPL      Whitelist sceVu0* matrix/vector
+//          helpers; never auto-stubbed; emitted with vu0_helper_family.
+//
+//   Tier 2 — Top-level schema additions
+//   Rule 103 ASSET_UPLOAD_TRACES         Cross-references gs_runtime_evidence
+//          vram_upload_tbps_union and bitbltbuf_dpsms_union against per-func
+//          ori/li constants + writes_bitbltbuf_reg. Back-solves which ELF
+//          func should emit the missing T8 dbp=0x2720 dpsm=0x13 upload.
+//   Rule 104 CURRENT_PHASE_INPUTS        Expected upload manifest (dpsm/dbp
+//          pairs per phase) consumed by asset_upload_traces.
+//   Rule 105 CALL_CHAINS                 save_to_map_load / title_to_menu /
+//          texture_upload — pre-computed forward callgraphs to bullseye sinks.
+//   Rule 106 BUILD_INVARIANTS            Build cmd + do-not-modify list emitted
+//          for downstream tools.
+//   Rule 107 PHASE_TRACE_FLAGS           Inventory of DC2_TRACE_* env flags.
+//
+//   Tier 3 — Quality of life
+//   Rule 108 C++ DEMANGLER               Itanium-style __ct__<digits><name>F<args>,
+//          __dt__, __vt__, method-mangled names. Adds class_name+method_name to
+//          per-func record.
+//   Rule 109 DIFF MODE                   If prior triage_map.json sits next to
+//          output, emit `delta` section listing new/changed/removed funcs.
+//   Rule 110 OVERRIDE_COVERAGE_REPORT    For every game_override binding, flag
+//          retire_candidate based on current static signals.
+//   Rule 111 SDK_CALLER_DEDUP_COUNT      Companion *_via_sdk_caller depth-1
+//          metric for every count-zero raw-MMIO detector.
+//   Rule 112 SCHEMA_VERSION              8.0.
 //
 // OUTPUTS:
 //   1. config_auto_recomp.toml - UNIFIED config ready for ps2recomp.exe
@@ -595,6 +664,100 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         "menu","inventory","pause","character","title","select","ui","hud"
     };
 
+    // ===== v8 constants =====
+    // Rule 88: exact libgcc / runtime helper names (not just regex matches).
+    private static final Set<String> LIBGCC_EXACT_NAMES = new HashSet<>(Arrays.asList(
+        "__divdi3","__udivdi3","__moddi3","__umoddi3","__muldi3",
+        "__fixdfdi","__fixunsdfdi","__floatdidf","__pack_d","__unpack_d",
+        "__pack_f","__unpack_f","__fpcmp_parts_d","__fpcmp_parts_f",
+        "__negdf2","__negsf2","__make_dp","__make_fp",
+        "__divsi3","__udivsi3","__modsi3","__umodsi3",
+        "__addsf3","__subsf3","__mulsf3","__divsf3",
+        "__adddf3","__subdf3","__muldf3","__divdf3",
+        "__cmpdf2","__cmpsf2","__fixsfdi","__floatdisf","__floatsisf","__floatsidf"
+    ));
+
+    // Rule 96: GIF packet helpers — NLOOP double-count hazard pair.
+    private static final Set<String> GIF_PACKET_NLOOP_HELPERS = new HashSet<>(Arrays.asList(
+        "makeGiftagAplusD","MakeGiftagAplusD","makeGifTagAplusD",
+        "sceGifPkOpenGifTag","sceVif1PkOpenGifTag","openGifTag"
+    ));
+    private static final Set<String> GIF_PACKET_CLOSE_HELPERS = new HashSet<>(Arrays.asList(
+        "closePacketGifTag","ClosePacketGifTag","sceGifPkCloseGifTag",
+        "sceVif1PkCloseGifTag","closeGifTag"
+    ));
+
+    // Rule 97: PS2 DUALSHOCK button mask constants (active-low; absolute bit
+    // values seen in masking sites). Mapping = bit -> friendly name.
+    private static final Map<Long,String> PAD_BUTTON_MASKS = new LinkedHashMap<>();
+    static {
+        PAD_BUTTON_MASKS.put(0x0001L, "Select");
+        PAD_BUTTON_MASKS.put(0x0002L, "L3");
+        PAD_BUTTON_MASKS.put(0x0004L, "R3");
+        PAD_BUTTON_MASKS.put(0x0008L, "Start");
+        PAD_BUTTON_MASKS.put(0x0010L, "Up");
+        PAD_BUTTON_MASKS.put(0x0020L, "Right");
+        PAD_BUTTON_MASKS.put(0x0040L, "Down");
+        PAD_BUTTON_MASKS.put(0x0080L, "Left");
+        PAD_BUTTON_MASKS.put(0x0100L, "L2");
+        PAD_BUTTON_MASKS.put(0x0200L, "R2");
+        PAD_BUTTON_MASKS.put(0x0400L, "L1");
+        PAD_BUTTON_MASKS.put(0x0800L, "R1");
+        PAD_BUTTON_MASKS.put(0x1000L, "Triangle");
+        PAD_BUTTON_MASKS.put(0x2000L, "Circle");
+        PAD_BUTTON_MASKS.put(0x4000L, "Cross");
+        PAD_BUTTON_MASKS.put(0x8000L, "Square");
+    }
+
+    // Rule 99: file-open callee names — caller sprintf-source check anchors here.
+    private static final Set<String> FILE_OPEN_CALLEES = new HashSet<>(Arrays.asList(
+        "LoadFile2","LoadFile","LoadFileEx","sceCdRead","sceOpen","sceRead",
+        "sceCdSearchFile","fopen","sceCdStRead"
+    ));
+
+    // Rule 100: frame-clock advance callees.
+    private static final Set<String> FRAME_CLOCK_CALLEES = new HashSet<>(Arrays.asList(
+        "sceGsSyncV","sceGsSyncH","sceGsSyncVCallback","WaitVSync",
+        "SetVSyncFlag","mgEndFrame","mgFlipDrawEnv","mgVSyncWait"
+    ));
+
+    // Rule 102: VU0 helper whitelist (must be implemented, never auto-stub).
+    private static final String[] SCEVU0_HELPER_PREFIXES = {
+        "sceVu0","_sceVu0"
+    };
+
+    // Rule 107: phase-trace env flags inventory (emitted into JSON for tools).
+    private static final String[] PHASE_TRACE_FLAGS = {
+        "DC2_PHASE_TRACE","DC2_TRACE_TITLE_PATH","DC2_TRACE_T8_UPLOAD",
+        "DC2_HUD","DC2_FRAME_DUMP","DC2_PAD_INPUT","DC2_TRACE_PAD",
+        "DC2_TRACE_VTABLE","DC2_TRACE_CTOR","DC2_TRACE_MAP_LOAD",
+        "DC2_TRACE_SAVE","DC2_TRACE_DRAW","DC2_TRACE_BITBLTBUF"
+    };
+
+    // Rule 104: expected GS uploads per phase (current blocker: T8 dbp=0x2720
+    // dpsm=0x13 inside CScene::LoadMapFromMemory). Extend as new phases land.
+    // Each entry: {tag, dpsm, dbp, phase, hint}.
+    private static final Object[][] EXPECTED_UPLOADS = {
+        // tag,             dpsm, dbp,     phase,          hint
+        { "T8_TEXTURE",     0x13, 0x2720L, "F43_T8",       "CScene::LoadMapFromMemory map texture" },
+        { "FONT_T4HH",      0x2CL,0x10E0L, "F32_FONT_4HH", "sceGifPkRefLoadImage font upload" }
+    };
+    // Sets derived from EXPECTED_UPLOADS for cheap membership tests in scan.
+    private static final Set<Long> EXPECTED_DBP_SET = new LinkedHashSet<>();
+    private static final Set<Integer> EXPECTED_DPSM_SET = new LinkedHashSet<>();
+    static {
+        for (Object[] row : EXPECTED_UPLOADS) {
+            EXPECTED_DBP_SET.add(((Number)row[2]).longValue() & 0xFFFFFFFFL);
+            EXPECTED_DPSM_SET.add(((Number)row[1]).intValue());
+        }
+    }
+
+    // Rule 106: emitted build invariants for downstream tools.
+    private static final String BUILD_CMD = "cmake --build D:/ps2r/dc2/build64 --config Release --target ps2_runtime";
+    private static final String[] BUILD_DO_NOT_MODIFY = {
+        "runner/*.cpp"
+    };
+
     // =========================================================
     // v7: GS RUNTIME EVIDENCE MODEL
     // =========================================================
@@ -836,6 +999,67 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // loadsPsm4hhConstant -> BITBLTBUF_T4HH_UPLOADER.
         boolean writesBitbltbufReg=false;
         boolean isBitbltbufT4hhUploader=false;
+
+        // ===== v8 fields =====
+        // Rule 92 / 108: demangled ctor classification.
+        String  ctorClassName = null;           // e.g. "mgCCameraFollow"
+        boolean isCtor = false;
+        boolean isDtor = false;
+        String  methodClassName = null;         // demangled class for methods
+        String  methodName = null;              // demangled simple method name
+        boolean isVirtualDrawMethod = false;    // Draw__ / Step__ / Update__ within a class
+        // Vtable install: addr stored to *(this+0) when ctor body opens with
+        // `lui $rN, hi; addiu $rN, $rN, lo; sw $rN, 0($a0)` pattern.
+        long    ctorVtableAddr = 0L;
+        boolean ctorInstallsVtable = false;
+        boolean ctorAssignedToGlobal = false;   // any caller does `sw $v0, +imm($gp)` after jal
+        Set<Long> ctorGlobalAddresses = new LinkedHashSet<>();
+        Set<Long> ctorSiblingCtorCalls = new LinkedHashSet<>();
+        boolean calledViaDirectJal = false;     // observed direct jal caller
+        boolean calledViaJrT9 = false;          // observed jalr $t9 caller (indirect)
+        String  ctorCallMode = "unobserved";    // direct_only | indirect_only | dual | unobserved
+        String  ctorRiskTier = "LOW";           // CRITICAL | HIGH | MEDIUM | LOW
+        // Rule 94: virtual dispatch sites — entries [pcHex, slotOffsetHex, objReg].
+        List<String[]> virtualDispatchSites = new ArrayList<>();
+        // Rule 95: any return value of a `jal <this>` site that was subsequently
+        // stored to a $gp-rooted global. Populated post-scan.
+        Set<Long> returnWrittenToGlobals = new LinkedHashSet<>();
+        // Rule 97: andi/and immediates that look like PS2 pad button masks.
+        Set<String> padMasksTested = new LinkedHashSet<>();
+        boolean isPadButtonMaskConsumer = false;
+        // Rule 96: GIF NLOOP double-count hazard — function calls both open+close
+        // helpers; flag for human review.
+        boolean callsGifPacketOpen = false;
+        boolean callsGifPacketClose = false;
+        boolean gifNloopDoubleCountRisk = false;
+        // Rule 99: file-open callee + format-string source for $a0 path argument.
+        boolean callsFileOpen = false;
+        Set<String> filePathSprintfFormats = new LinkedHashSet<>();
+        boolean filePathHasPercentS = false;
+        // Rule 100: frame-clock driver — calls vsync / mgEndFrame
+        boolean isFrameClockDriver = false;
+        // Rule 101: SIF RPC fid (function id) literal — captured alongside SID.
+        Set<Long> detectedRpcFids = new LinkedHashSet<>();
+        // Rule 102: sceVu0 family — must-implement whitelist.
+        boolean isSceVu0Helper = false;
+        String  vu0HelperFamily = null;         // matrix / vector / transform
+        boolean mustBeImplemented = false;
+        // Rule 88: libgcc exact-name match (in addition to regex).
+        // Rule 90: split SPR_SYNC into separate emit fields (existing usesSPR /
+        // hasSyncInstr suffice for split).
+        // Rule 103: tagged when func writes BITBLTBUF + loads dbp constant from
+        // EXPECTED_DBP_SET. Includes which expected tags it satisfies.
+        Set<String> assetUploadTagsHit = new LinkedHashSet<>();
+        // Rule 91: caller of an uploader (depth 1 or 2). Filled post-scan.
+        boolean uploaderCallerDepth1 = false;
+        boolean uploaderCallerDepth2 = false;
+        // Rule 98: override classification (filled from parseGameOverrideFile v8).
+        String  overrideKind = null;            // nop_stub | constant_return | state_machine | probe | real_shim
+        boolean overrideRetireCandidate = false;
+        // Rule 111: companion SDK-caller depth-1 flags (used for *_via_sdk_caller
+        // statistics so SDK-wrapped accesses still show in counts).
+        boolean dispfbWriterViaSdkCallerDepth1 = false;
+        boolean dmaKickViaSdkCallerDepth1 = false;
     }
 
     // =========================================================
@@ -915,6 +1139,48 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private int lifecycleLazyInitCount=0;
     private int bitbltbufT4hhUploaderCount=0;
     private int drawingChainCount=0;       // funcs with chain_depth >= 0
+
+    // v8 counters
+    private int ctorCriticalCount=0, ctorHighCount=0, ctorMediumCount=0;
+    private int ctorAssignedGlobalCount=0, ctorInstallsVtableCount=0;
+    private int ctorDualCallModeCount=0;
+    private int virtualDispatchSiteCount=0;       // total sites across all funcs
+    private int virtualDispatchFuncCount=0;       // funcs with at least one site
+    private int padButtonMaskConsumerCount=0;
+    private int gifNloopDoubleCountRiskCount=0;
+    private int filePathSprintfCount=0;
+    private int frameClockDriverCount=0;
+    private int sceVu0HelperCount=0;
+    private int assetUploadTraceFuncCount=0;
+    private int overrideClassifiedCount=0;
+    private int overrideRetireCount=0;
+    private int dispfbWriterViaSdkCallerCount=0;
+    private int dmaKickViaSdkCallerCount=0;
+    private int returnWrittenToGlobalCount=0;
+    private int autoExtendedDc2GlobalsCount=0;
+    // Auto-extended DC2 gp globals discovered via return-to-global tracking.
+    // Address -> guessed-name (class name where available, else "g_unk_<addr>").
+    private Map<Long,String> autoExtendedDc2Globals = new LinkedHashMap<>();
+    // Rule 93 class registry: class name -> aggregated info.
+    private Map<String, ClassEntry> classRegistry = new LinkedHashMap<>();
+    // Rule 103 asset upload traces: tag -> list of (funcAddr, funcName) + callers.
+    private Map<String, List<long[]>> assetUploadTraces = new LinkedHashMap<>();
+    // Rule 109 diff-mode: address -> prior `disposition|category` string.
+    private Map<Long,String> priorTriageMapCats = null;
+
+    /** Rule 93: aggregated per-class info for the JSON `classes` section. */
+    static class ClassEntry {
+        String  className;
+        Set<Long> ctorAddresses = new LinkedHashSet<>();
+        Long    dtorAddress = null;
+        Set<String> methodNames = new LinkedHashSet<>();
+        Map<String,Long> methodAddrs = new LinkedHashMap<>();
+        boolean hasVirtualDraw = false;
+        Long    vtableAddr = null;
+        Set<Long> instantiationSites = new LinkedHashSet<>(); // jal call PCs
+        Set<String> globalHolders = new LinkedHashSet<>();
+        String  riskTier = "LOW";
+    }
 
     // v4: BFS roots. main_loop_addr stays optional; entry/_start used for init chain.
     private Long mainLoopAddrOpt = null;
@@ -1399,6 +1665,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 dmaTagBuilderCount));
             println(String.format("  v7.1 tags: CTOR_MULTI=%d LAZY_INIT=%d BITBLTBUF_T4HH=%d",
                 ctorMultiFieldInitCount, lifecycleLazyInitCount, bitbltbufT4hhUploaderCount));
+            println(String.format("  v8 tags: CTOR_CRIT=%d CTOR_HIGH=%d CTOR_MED=%d CTOR_ASSIGN_GLOBAL=%d CTOR_VTABLE=%d CTOR_DUAL=%d VDISP_SITES=%d VDISP_FUNCS=%d PAD_MASK=%d NLOOP_RISK=%d FILE_SPRINTF=%d FRAME_CLK=%d VU0_HELPER=%d ASSET_UPLD=%d OVR_CLASS=%d OVR_RETIRE=%d DISPFB_VIA_SDK=%d DMA_KICK_VIA_SDK=%d RET2GLOBAL=%d AUTO_EXT_GLOBALS=%d CLASSES=%d",
+                ctorCriticalCount, ctorHighCount, ctorMediumCount, ctorAssignedGlobalCount,
+                ctorInstallsVtableCount, ctorDualCallModeCount, virtualDispatchSiteCount,
+                virtualDispatchFuncCount, padButtonMaskConsumerCount, gifNloopDoubleCountRiskCount,
+                filePathSprintfCount, frameClockDriverCount, sceVu0HelperCount,
+                assetUploadTraceFuncCount, overrideClassifiedCount, overrideRetireCount,
+                dispfbWriterViaSdkCallerCount, dmaKickViaSdkCallerCount,
+                returnWrittenToGlobalCount, autoExtendedDc2GlobalsCount, classRegistry.size()));
 
             // F21-prep: build reverse call-graph. After all FuncResults are
             // built and each carries its outgoing jalSites, fill every callee's
@@ -1482,6 +1756,11 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             println(String.format("  v4 post: MAINLOOP_DEPTH set | INIT_DEPTH set | POLL_TARGET=%d",
                 pollTargetCount));
 
+            // v8 post-pass: build class registry, return-to-global tracking,
+            // ctor risk grading, asset upload traces, override classification,
+            // pad mask / vdispatch counters, SDK-caller depth-1 propagation.
+            runV8PostPasses(results, resultsByAddr, fwd, newStubs);
+
             // v7 Rule 80: runtime corroboration pass. Walks every function,
             // compares static bullseye predictions against merged GS evidence,
             // attaches RUNTIME_CONFIRMED / RUNTIME_DORMANT_GLOBAL /
@@ -1496,6 +1775,24 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             }
 
             writeUnifiedConfig(unifiedToml,configToml,newStubs,newSkips);
+            // v8 Rule 109: diff against prior triage_map.json if present.
+            // Renames the old file to triage_map.prev.json before overwriting.
+            File priorJson = new File(outputDir, "triage_map.json");
+            Map<Long,String> priorCats = null;
+            if (priorJson.exists()) {
+                try {
+                    priorCats = loadPriorTriageMapCats(priorJson);
+                    File backup = new File(outputDir, "triage_map.prev.json");
+                    if (backup.exists()) backup.delete();
+                    priorJson.renameTo(backup);
+                    println(String.format("[DIFF] Backed up prior triage_map.json (%d funcs).",
+                        priorCats != null ? priorCats.size() : 0));
+                } catch (Exception ex) {
+                    println("[DIFF] Failed to load prior map: "+ex.getMessage());
+                    priorCats = null;
+                }
+            }
+            this.priorTriageMapCats = priorCats;
             writeTriageJson(triageJson,results,elfHash,gpValue,totalFuncs,uncategorized);
 
             println("\n[SUCCESS] Unified TOML : "+unifiedToml.getAbsolutePath());
@@ -2022,24 +2319,102 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     //   bindAddressHandler(runtime, 0x00104288u, "memclr");
     //   runtime.registerFunction(0x0015C160u, nop_stub);
     // =========================================================
+    // Override binding -> classification (v8 Rule 98). Set when handler-name
+    // matches certain patterns OR when the helper body (best-effort) looks
+    // like a probe / nop / state machine / constant return.
+    private Map<Long, String> overrideKindByAddr = new HashMap<>();
+    // Override binding -> handler function name (3rd arg of bindAddressHandler).
+    private Map<Long, String> overrideHandlerNames = new HashMap<>();
+
     private void parseGameOverrideFile(File f) throws IOException {
         BufferedReader reader = new BufferedReader(new FileReader(f));
+        // First pass: scan all lines into a list so we can inspect helper bodies.
+        List<String> allLines = new ArrayList<>();
         String line;
-        // Regex-free: look for 0x literal after '(' on lines containing
-        // bindAddressHandler or registerFunction.
-        while ((line=reader.readLine())!=null) {
-            String t = line.trim();
-            if (!t.contains("bindAddressHandler")&&!t.contains("registerFunction")) continue;
-            // Extract hex address: first 0x... token
+        while((line = reader.readLine()) != null) allLines.add(line);
+        reader.close();
+
+        // Pass 1: collect bindings.
+        for(int i = 0; i < allLines.size(); i++) {
+            String t = allLines.get(i).trim();
+            if(!t.contains("bindAddressHandler") && !t.contains("registerFunction")) continue;
             long addr = extractFirstHexLiteral(t);
-            if (addr<=0) continue;
-            // Extract optional name (second string arg in bindAddressHandler)
+            if(addr <= 0) continue;
             String name = extractQuotedString(t);
             gameOverrideAddresses.add(addr);
-            if (name!=null&&!name.isEmpty()) gameOverrideNames.put(addr,name);
+            if(name != null && !name.isEmpty()) gameOverrideNames.put(addr, name);
             gameOverrideImportedCount++;
+            // Extract handler symbol (the C++ identifier after the last comma).
+            String handler = extractHandlerSymbol(t);
+            if(handler != null) overrideHandlerNames.put(addr, handler);
         }
-        reader.close();
+
+        // Pass 2: best-effort classification of helper bodies.
+        // For each unique handler name, find its function body and inspect.
+        for(Map.Entry<Long,String> e : overrideHandlerNames.entrySet()) {
+            String hn = e.getValue();
+            String kind = classifyHandlerBody(hn, allLines);
+            overrideKindByAddr.put(e.getKey(), kind);
+            overrideClassifiedCount++;
+            if("nop_stub".equals(kind) || "probe".equals(kind))
+                overrideRetireCount++;
+        }
+    }
+
+    private String extractHandlerSymbol(String line) {
+        // bindAddressHandler(0xADDR, "name", &handler) — return identifier after &.
+        int amp = line.indexOf('&');
+        if(amp < 0) return null;
+        int end = amp + 1;
+        while(end < line.length()) {
+            char c = line.charAt(end);
+            if(Character.isLetterOrDigit(c) || c == '_' || c == ':' || c == '<' || c == '>') end++;
+            else break;
+        }
+        if(end <= amp + 1) return null;
+        return line.substring(amp + 1, end);
+    }
+
+    private String classifyHandlerBody(String handlerName, List<String> lines) {
+        if(handlerName == null) return "real_shim";
+        // Heuristic name-based hints first.
+        String lower = handlerName.toLowerCase();
+        if(lower.contains("nop_stub") || lower.endsWith("_nop")) return "nop_stub";
+        if(lower.contains("probe")) return "probe";
+        if(lower.contains("state_machine") || lower.contains("state_step")) return "state_machine";
+        if(lower.contains("const_return") || lower.endsWith("_zero")) return "constant_return";
+        // Body-scan: find a line `<retT> <handlerName>(...)` and look at next ~30 lines.
+        int start = -1;
+        for(int i = 0; i < lines.size(); i++) {
+            String t = lines.get(i);
+            int hnIdx = t.indexOf(handlerName);
+            if(hnIdx < 0) continue;
+            int parenIdx = t.indexOf('(', hnIdx);
+            if(parenIdx < 0 || parenIdx == hnIdx + handlerName.length()) {
+                if(t.contains("{") || (i + 1 < lines.size() && lines.get(i+1).contains("{"))) {
+                    start = i; break;
+                }
+            }
+        }
+        if(start < 0) return "real_shim";
+        int bodyLines = 0, returnsConst = 0, callOps = 0, traceLogs = 0, conditionals = 0;
+        for(int i = start; i < Math.min(start + 60, lines.size()); i++) {
+            String t = lines.get(i);
+            if(t.contains("}") && bodyLines > 4) break;
+            bodyLines++;
+            if(t.matches(".*return\\s+\\d+.*")) returnsConst++;
+            if(t.contains("(*ctx") || t.contains("ctx->")) callOps++;
+            if(t.contains("[F4") || t.contains("[F49") || t.contains("LOG") || t.contains("trace") ||
+               t.contains("println") || t.contains("getenv("))
+                traceLogs++;
+            if(t.contains("if(") || t.contains("if (") || t.contains("switch(") || t.contains("switch ("))
+                conditionals++;
+        }
+        if(traceLogs > 0 && callOps == 0) return "probe";
+        if(bodyLines <= 5 && returnsConst > 0 && callOps == 0) return "constant_return";
+        if(bodyLines <= 5 && callOps == 0 && returnsConst == 0) return "nop_stub";
+        if(conditionals > 1 && callOps == 0) return "state_machine";
+        return "real_shim";
     }
 
     private long extractFirstHexLiteral(String line) {
@@ -2192,6 +2567,291 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     }
 
     // =========================================================
+    // v8 POST-PASSES: ctor risk, class registry, return-to-global,
+    //                 asset upload traces, override classification,
+    //                 SDK-caller depth-1 propagation, frame clock drivers.
+    // =========================================================
+    private void runV8PostPasses(List<FuncResult> results,
+                                  Map<Long,FuncResult> byAddr,
+                                  Map<Long,List<Long>> fwd,
+                                  List<String> newStubs) {
+        // -------- Pass A: ctor call mode + return-to-global --------
+        // For every direct jal site, look at the caller's instructions just
+        // after the jal for `sw $v0, +imm($gp)`. If found, record on callee.
+        for(FuncResult caller : results) {
+            if(caller.traits == null) continue;
+            Function cf = funcManager.getFunctionAt(
+                currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(caller.address & 0xFFFFFFFFL));
+            if(cf == null) continue;
+            for(long[] site : caller.traits.jalSites) {
+                long callPc = site[0];
+                long target = site[1] & 0xFFFFFFFFL;
+                if(target == 0xFFFFFFFFL) continue;
+                FuncResult callee = byAddr.get(target);
+                if(callee == null || callee.traits == null) continue;
+                // Mark direct-jal observation on callee.
+                callee.traits.calledViaDirectJal = true;
+                // Examine 1-4 instructions immediately after the jal for sw $v0, +imm($gp).
+                try {
+                    Instruction jalInst = currentProgram.getListing().getInstructionAt(
+                        currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(callPc));
+                    if(jalInst == null) continue;
+                    Instruction probe = jalInst.getNext();
+                    int look = 0;
+                    while(probe != null && look < 4) {
+                        String mn = probe.getMnemonicString();
+                        if(mn != null) {
+                            String ml = mn.toLowerCase();
+                            if(ml.equals("sw") || ml.equals("sd")) {
+                                Object[] dop = probe.getOpObjects(0);
+                                Object[] aop = probe.getOpObjects(1);
+                                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                                boolean baseIsGp = false;
+                                long off = -1;
+                                if(aop != null) {
+                                    for(Object o : aop) {
+                                        if(o instanceof ghidra.program.model.lang.Register &&
+                                           ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("gp"))
+                                            baseIsGp = true;
+                                        else if(o instanceof ghidra.program.model.scalar.Scalar)
+                                            off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                                    }
+                                }
+                                if(src != null && src.equalsIgnoreCase("v0") && baseIsGp && off != -1) {
+                                    long norm = off & 0xFFFFFFFFL;
+                                    callee.traits.returnWrittenToGlobals.add(norm);
+                                    callee.traits.ctorAssignedToGlobal = true;
+                                    // Auto-extend known_dc2_globals if unknown.
+                                    if(!KNOWN_DC2_GP_OFFSETS.containsKey(norm) &&
+                                       !autoExtendedDc2Globals.containsKey(norm)) {
+                                        String guess = callee.traits.ctorClassName != null
+                                            ? callee.traits.ctorClassName + "_global"
+                                            : "g_unk_" + String.format("%08X", norm);
+                                        autoExtendedDc2Globals.put(norm, guess);
+                                        autoExtendedDc2GlobalsCount++;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        probe = probe.getNext();
+                        look++;
+                    }
+                } catch(Exception ignore) {}
+            }
+        }
+        // -------- Pass B: ctor risk grading --------
+        // Caller mode classification — was a ctor reached only via direct jal,
+        // only via jalr $t9, or both?
+        for(FuncResult r : results) {
+            if(r.traits == null || !r.traits.isCtor) continue;
+            FuncTraits t = r.traits;
+            // Determine if any caller calls via jalr $t9 (indirect).
+            for(long[] c : t.callers) {
+                FuncResult caller = byAddr.get(c[0] & 0xFFFFFFFFL);
+                if(caller == null || caller.traits == null) continue;
+                // If caller has indirectCallT9Count>0 we *may* dispatch this
+                // ctor via $t9; not a strict proof but a useful proxy.
+                if(caller.traits.indirectCallT9Count > 0) t.calledViaJrT9 = true;
+            }
+            // Mode
+            if(t.calledViaDirectJal && t.calledViaJrT9) t.ctorCallMode = "dual";
+            else if(t.calledViaDirectJal)               t.ctorCallMode = "direct_only";
+            else if(t.calledViaJrT9)                    t.ctorCallMode = "indirect_only";
+            else                                        t.ctorCallMode = "unobserved";
+            // Risk tier
+            boolean autoStubLikely = !t.ctorInstallsVtable && !t.isCtorMultiFieldInit
+                                  && !t.ctorWritesA0Slot && t.byteSize < 60;
+            if(t.ctorAssignedToGlobal && ("dual".equals(t.ctorCallMode) || "direct_only".equals(t.ctorCallMode))
+                                       && autoStubLikely) {
+                t.ctorRiskTier = "CRITICAL"; ctorCriticalCount++;
+            } else if(t.ctorInstallsVtable && "dual".equals(t.ctorCallMode)) {
+                t.ctorRiskTier = "HIGH"; ctorHighCount++;
+            } else if(t.isCtorMultiFieldInit || t.ctorInstallsVtable || t.ctorAssignedToGlobal) {
+                t.ctorRiskTier = "MEDIUM"; ctorMediumCount++;
+            } else {
+                t.ctorRiskTier = "LOW";
+            }
+            if(t.ctorAssignedToGlobal) ctorAssignedGlobalCount++;
+            if(t.ctorInstallsVtable)   ctorInstallsVtableCount++;
+            if("dual".equals(t.ctorCallMode)) ctorDualCallModeCount++;
+            // Promote CRITICAL/HIGH ctors out of STUB.
+            if(("CRITICAL".equals(t.ctorRiskTier) || "HIGH".equals(t.ctorRiskTier)) &&
+               "STUB".equals(r.disposition)) {
+                r.disposition = "RECOMPILE";
+                newStubs.remove(r.name + "@" + hex(r.address));
+            }
+            if(!r.tags.contains("CTOR_RISK_" + t.ctorRiskTier))
+                r.tags.add("CTOR_RISK_" + t.ctorRiskTier);
+        }
+        // -------- Pass C: class registry build --------
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            FuncTraits t = r.traits;
+            String cls = null;
+            if(t.isCtor) cls = t.ctorClassName;
+            else if(t.isDtor) cls = t.methodClassName;
+            else if(t.methodClassName != null) cls = t.methodClassName;
+            if(cls == null) continue;
+            ClassEntry ce = classRegistry.computeIfAbsent(cls, k -> { ClassEntry x = new ClassEntry(); x.className = k; return x; });
+            if(t.isCtor) {
+                ce.ctorAddresses.add(r.address & 0xFFFFFFFFL);
+                if(t.ctorInstallsVtable && t.ctorVtableAddr != 0)
+                    ce.vtableAddr = t.ctorVtableAddr;
+                for(Long g : t.returnWrittenToGlobals) {
+                    String label = KNOWN_DC2_GP_OFFSETS.get(g);
+                    if(label == null) label = autoExtendedDc2Globals.get(g);
+                    if(label == null) label = String.format("0x%08X", g);
+                    ce.globalHolders.add(label);
+                }
+                // Track instantiation sites (caller PCs).
+                for(long[] c : t.callers) ce.instantiationSites.add(c[1] & 0xFFFFFFFFL);
+                // Class risk = highest ctor risk
+                if(rankRisk(t.ctorRiskTier) > rankRisk(ce.riskTier))
+                    ce.riskTier = t.ctorRiskTier;
+            } else if(t.isDtor) {
+                ce.dtorAddress = r.address & 0xFFFFFFFFL;
+            } else if(t.methodName != null) {
+                ce.methodNames.add(t.methodName);
+                ce.methodAddrs.put(t.methodName, r.address & 0xFFFFFFFFL);
+                if(t.isVirtualDrawMethod) ce.hasVirtualDraw = true;
+            }
+        }
+        // Bump ctor risk to CRITICAL when class has virtual draw method.
+        for(FuncResult r : results) {
+            if(r.traits == null || !r.traits.isCtor) continue;
+            String cls = r.traits.ctorClassName;
+            if(cls == null) continue;
+            ClassEntry ce = classRegistry.get(cls);
+            if(ce != null && ce.hasVirtualDraw &&
+               (rankRisk(r.traits.ctorRiskTier) < rankRisk("HIGH"))) {
+                r.traits.ctorRiskTier = "HIGH";
+                if(!r.tags.contains("CTOR_RISK_HIGH")) r.tags.add("CTOR_RISK_HIGH");
+            }
+        }
+        // -------- Pass D: virtual dispatch site counters + tags --------
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            if(!r.traits.virtualDispatchSites.isEmpty()) {
+                virtualDispatchSiteCount += r.traits.virtualDispatchSites.size();
+                virtualDispatchFuncCount++;
+                if(!r.tags.contains("VIRTUAL_DISPATCH_SITE"))
+                    r.tags.add("VIRTUAL_DISPATCH_SITE");
+            }
+            if(r.traits.isPadButtonMaskConsumer) {
+                padButtonMaskConsumerCount++;
+                if(!r.tags.contains("PAD_BUTTON_MASK_CONSUMER"))
+                    r.tags.add("PAD_BUTTON_MASK_CONSUMER");
+            }
+            if(r.traits.gifNloopDoubleCountRisk) {
+                gifNloopDoubleCountRiskCount++;
+                if(!r.tags.contains("GIF_NLOOP_DOUBLE_COUNT_RISK"))
+                    r.tags.add("GIF_NLOOP_DOUBLE_COUNT_RISK");
+            }
+            if(!r.traits.filePathSprintfFormats.isEmpty()) {
+                filePathSprintfCount++;
+                if(!r.tags.contains("FILE_PATH_SPRINTF_SOURCE"))
+                    r.tags.add("FILE_PATH_SPRINTF_SOURCE");
+            }
+            if(r.traits.isFrameClockDriver) {
+                frameClockDriverCount++;
+                if(!r.tags.contains("FRAME_CLOCK_DRIVER"))
+                    r.tags.add("FRAME_CLOCK_DRIVER");
+            }
+            if(r.traits.isSceVu0Helper) {
+                sceVu0HelperCount++;
+                if(!r.tags.contains("SCEVU0_HELPER_MUSTIMPL"))
+                    r.tags.add("SCEVU0_HELPER_MUSTIMPL");
+                // Promote out of STUB
+                if("STUB".equals(r.disposition)) {
+                    r.disposition = "RECOMPILE";
+                    newStubs.remove(r.name + "@" + hex(r.address));
+                }
+            }
+            if(!r.traits.returnWrittenToGlobals.isEmpty()) returnWrittenToGlobalCount++;
+        }
+        // -------- Pass E: asset upload traces (Rule 103) --------
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            if(!r.traits.writesBitbltbufReg && r.traits.assetUploadTagsHit.isEmpty()) continue;
+            for(String tag : r.traits.assetUploadTagsHit) {
+                List<long[]> bucket = assetUploadTraces.computeIfAbsent(tag, k -> new ArrayList<>());
+                bucket.add(new long[]{ r.address & 0xFFFFFFFFL, 0L });
+            }
+            if(!r.traits.assetUploadTagsHit.isEmpty()) {
+                assetUploadTraceFuncCount++;
+                if(!r.tags.contains("ASSET_UPLOAD_BULLSEYE"))
+                    r.tags.add("ASSET_UPLOAD_BULLSEYE");
+            }
+        }
+        // Uploader caller depth-1 / depth-2 markers.
+        Set<Long> uploaderSet = new HashSet<>();
+        for(FuncResult r : results)
+            if(r.traits != null && r.traits.isBitbltbufT4hhUploader)
+                uploaderSet.add(r.address & 0xFFFFFFFFL);
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            for(long[] site : r.traits.jalSites) {
+                long tgt = site[1] & 0xFFFFFFFFL;
+                if(uploaderSet.contains(tgt)) {
+                    r.traits.uploaderCallerDepth1 = true;
+                    if(!r.tags.contains("UPLOADER_CALLER_D1"))
+                        r.tags.add("UPLOADER_CALLER_D1");
+                    break;
+                }
+            }
+        }
+        // -------- Pass F0: stamp override classification on per-func traits --------
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            long addr = r.address & 0xFFFFFFFFL;
+            if(overrideKindByAddr.containsKey(addr)) {
+                r.traits.overrideKind = overrideKindByAddr.get(addr);
+                String k = r.traits.overrideKind;
+                r.traits.overrideRetireCandidate = "nop_stub".equals(k) || "probe".equals(k);
+                if(!r.tags.contains("OVERRIDE_" + (k == null ? "REAL_SHIM" : k.toUpperCase())))
+                    r.tags.add("OVERRIDE_" + (k == null ? "REAL_SHIM" : k.toUpperCase()));
+            }
+        }
+        // -------- Pass F: SDK-caller depth-1 propagation (Rule 111) --------
+        Set<Long> dispfbWriters = new HashSet<>();
+        Set<Long> dmaKickers    = new HashSet<>();
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            if(r.traits.writesDispfbReg || r.traits.writesDispfbViaSdk)
+                dispfbWriters.add(r.address & 0xFFFFFFFFL);
+            if(!r.traits.dmaKickChannels.isEmpty() || r.traits.path3KickViaDmaApi)
+                dmaKickers.add(r.address & 0xFFFFFFFFL);
+        }
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            for(long[] site : r.traits.jalSites) {
+                long tgt = site[1] & 0xFFFFFFFFL;
+                if(dispfbWriters.contains(tgt) && !r.traits.dispfbWriterViaSdkCallerDepth1) {
+                    r.traits.dispfbWriterViaSdkCallerDepth1 = true;
+                    dispfbWriterViaSdkCallerCount++;
+                }
+                if(dmaKickers.contains(tgt) && !r.traits.dmaKickViaSdkCallerDepth1) {
+                    r.traits.dmaKickViaSdkCallerDepth1 = true;
+                    dmaKickViaSdkCallerCount++;
+                }
+            }
+        }
+    }
+
+    // Risk-tier comparator helper.
+    private static int rankRisk(String tier) {
+        if(tier == null) return 0;
+        switch(tier) {
+            case "CRITICAL": return 3;
+            case "HIGH":     return 2;
+            case "MEDIUM":   return 1;
+            default:         return 0;
+        }
+    }
+
+    // =========================================================
     // TEXT SECTION DETECTION
     // =========================================================
     private void detectTextSection() {
@@ -2325,7 +2985,35 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             for(String s : DISPFB_SDK_CALLEES) if(cn.equals(s)) { traits.writesDispfbViaSdk=true; break; }
             // v7 Rule 76: SDK-routed Path3 kicker
             for(String s : PATH3_KICK_API_CALLEES) if(cn.equals(s)) { traits.path3KickViaDmaApi=true; break; }
+            // v8 Rule 96: GIF NLOOP double-count hazard helpers
+            if(GIF_PACKET_NLOOP_HELPERS.contains(cn)) traits.callsGifPacketOpen=true;
+            if(GIF_PACKET_CLOSE_HELPERS.contains(cn)) traits.callsGifPacketClose=true;
+            // v8 Rule 99: file open callee
+            if(FILE_OPEN_CALLEES.contains(cn)) traits.callsFileOpen=true;
+            // v8 Rule 100: frame-clock driver detection
+            if(FRAME_CLOCK_CALLEES.contains(cn)) traits.isFrameClockDriver=true;
         }
+        // v8 Rule 96: NLOOP double-count risk = open AND close in same function.
+        if(traits.callsGifPacketOpen && traits.callsGifPacketClose)
+            traits.gifNloopDoubleCountRisk = true;
+
+        // v8 Rule 102: sceVu0 helper whitelist.
+        for(String p : SCEVU0_HELPER_PREFIXES) {
+            if(fname.startsWith(p)) {
+                traits.isSceVu0Helper = true;
+                traits.mustBeImplemented = true;
+                if(fname.contains("Matrix")) traits.vu0HelperFamily = "matrix";
+                else if(fname.contains("Vector")) traits.vu0HelperFamily = "vector";
+                else if(fname.contains("Trans")||fname.contains("Camera")||
+                        fname.contains("Light")||fname.contains("Clip"))
+                    traits.vu0HelperFamily = "transform";
+                else traits.vu0HelperFamily = "generic";
+                break;
+            }
+        }
+
+        // v8 Rule 108: C++ demangler for class/method extraction.
+        demangleAndPopulate(fname, traits);
         // v7 Rule 79: GS IRQ handler name shape (decided here so it's available
         // for the corroboration pass even on functions with empty callee sets).
         for(String frag : GS_IRQ_HANDLER_NAME_FRAGMENTS)
@@ -2357,6 +3045,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                n.matches("__(fix|float)(df|sf|si|di)(df|sf|si|di)"))
                 traits.isLibgccIntrinsic=true;
         }
+        // v8 Rule 88: also accept hardcoded exact-name list.
+        if(LIBGCC_EXACT_NAMES.contains(fname)) traits.isLibgccIntrinsic = true;
 
         // v4 Rule 34: MPEG / IPU / DVD callee scan (decoder trap)
         for(String cn : traits.calleeNames) {
@@ -2478,12 +3168,71 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
 
-            // v4 Rule 38: jalr $t9 — PIC / vtable indirect call
+            // v4 Rule 38: jalr $t9 — PIC / vtable indirect call.
+            // v8 Rule 89: accept ANY jalr regardless of flow type; both $t9 PIC
+            // and any other register are counted as indirect dispatch.
             if(ml.equals("jalr")) {
                 for(Object op : inst.getInputObjects())
-                    if(op instanceof ghidra.program.model.lang.Register &&
-                       ((ghidra.program.model.lang.Register)op).getName().equalsIgnoreCase("t9"))
-                        traits.indirectCallT9Count++;
+                    if(op instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)op).getName().toLowerCase();
+                        if(rn.equals("t9")) traits.indirectCallT9Count++;
+                    }
+                // v8 Rule 94: virtual dispatch site capture — jalr $rX where the
+                // previous instruction (or one within 3) was `lw $rX, K($rY)`
+                // (K = vtable slot offset). Best-effort backward scan.
+                try {
+                    Object[] iop = inst.getOpObjects(0);
+                    String tgtReg = null;
+                    if(iop != null && iop.length>0 && iop[0] instanceof ghidra.program.model.lang.Register)
+                        tgtReg = ((ghidra.program.model.lang.Register)iop[0]).getName();
+                    if(tgtReg != null && !tgtReg.equalsIgnoreCase("ra")) {
+                        Instruction prev = inst.getPrevious();
+                        int back = 0;
+                        while(prev != null && back < 4) {
+                            String pmn = prev.getMnemonicString();
+                            if(pmn != null && pmn.equalsIgnoreCase("lw")) {
+                                Object[] dop = prev.getOpObjects(0);
+                                Object[] aop = prev.getOpObjects(1);
+                                String dr = null, br = null;
+                                long off = -1;
+                                if(dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                                    dr = ((ghidra.program.model.lang.Register)dop[0]).getName();
+                                if(aop != null) {
+                                    for(Object o : aop) {
+                                        if(o instanceof ghidra.program.model.lang.Register)
+                                            br = ((ghidra.program.model.lang.Register)o).getName();
+                                        else if(o instanceof ghidra.program.model.scalar.Scalar)
+                                            off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                                    }
+                                }
+                                if(dr != null && dr.equalsIgnoreCase(tgtReg)) {
+                                    traits.virtualDispatchSites.add(new String[]{
+                                        String.format("0x%08X", inst.getAddress().getOffset()),
+                                        off>=0 ? String.format("0x%X", off) : "?",
+                                        br != null ? br : "?"
+                                    });
+                                    break;
+                                }
+                            }
+                            prev = prev.getPrevious();
+                            back++;
+                        }
+                    }
+                } catch(Exception ignore) {}
+            }
+
+            // v8 Rule 97: pad button mask consumer — andi/and immediate matches
+            // a PS2 DUALSHOCK bit. Captures friendly name per immediate.
+            if(ml.equals("andi") || ml.equals("and")) {
+                for(Object op : inst.getInputObjects()) {
+                    if(!(op instanceof ghidra.program.model.scalar.Scalar)) continue;
+                    long imm = ((ghidra.program.model.scalar.Scalar)op).getUnsignedValue() & 0xFFFFL;
+                    String nm = PAD_BUTTON_MASKS.get(imm);
+                    if(nm != null) {
+                        traits.padMasksTested.add(nm + "=0x" + String.format("%04X", imm));
+                        traits.isPadButtonMaskConsumer = true;
+                    }
+                }
             }
 
             // v4 Rule 33/36: 64-bit shift markers. dsll32/dsrl32 are MIPS III
@@ -2759,6 +3508,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                             // Also check the immediate directly for PSMT4HH etc.
                             if(c == PSMT4HH || c == PSMT4HL || c == PSMT8H)
                                 traits.loadsPsm4hhConstant = true;
+                            // v8 Rule 87: PSMT8 (0x13) — current F43 T8 blocker.
+                            if(c == 0x13L) traits.loadsPsm4hhConstant = true;
+                            // v8 Rule 103: expected dbp constants
+                            if(EXPECTED_DBP_SET.contains(c)) {
+                                for(Object[] row : EXPECTED_UPLOADS) {
+                                    if(((Number)row[2]).longValue() == c)
+                                        traits.assetUploadTagsHit.add((String)row[0]);
+                                }
+                            }
                         }
                         // VIF opcode named hits
                         String vifName = VIF_OPCODES.get(highByte);
@@ -2796,9 +3554,21 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     if((srcZero || ml.equals("li")) && imm >= 0) {
                         if(imm == PSMT4HH || imm == PSMT4HL || imm == PSMT8H)
                             traits.loadsPsm4hhConstant = true;
+                        // v8 Rule 87: also match additional PSM codes used in DC2.
+                        // 0x13 = PSMT8 (T8 textures, current F43 blocker target).
+                        // 0x14 = PSMT4. 0x02 = PSMCT16. 0x00 = PSMCT32.
+                        if(imm == 0x13L) traits.loadsPsm4hhConstant = true;
                         // v7 Rule 78: TBP-shape constant via addiu/li (14-bit positive).
                         if(imm > 0 && imm <= 0x3FFFL)
                             traits.tbpConstantsLoaded.add(imm);
+                        // v8 Rule 103: expected dbp constants (T8 dbp=0x2720 etc).
+                        if(EXPECTED_DBP_SET.contains(imm)) {
+                            for(Object[] row : EXPECTED_UPLOADS) {
+                                if(((Number)row[2]).longValue() == imm) {
+                                    traits.assetUploadTagsHit.add((String)row[0]);
+                                }
+                            }
+                        }
                     }
                 }
                 // Rule 22: SID literal scan near sceSifBindRpc calls
@@ -2952,8 +3722,209 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if(traits.writesBitbltbufReg && traits.loadsPsm4hhConstant)
             traits.isBitbltbufT4hhUploader = true;
 
+        // v8 Rule 92: vtable install pattern at start of ctor.
+        // `lui $rN, hi; addiu $rN, $rN, lo; sw $rN, 0($a0)` within first ~10 instrs.
+        if(traits.isCtor) {
+            detectCtorVtableInstall(func, traits);
+            // Sibling ctor calls — any jal target that is itself a __ct__.
+            for(String cn : traits.calleeNames) {
+                if(cn != null && cn.contains("__ct__")) {
+                    // Address resolved through jalSites pairs.
+                    for(long[] s : traits.jalSites) {
+                        long tgt = s[1] & 0xFFFFFFFFL;
+                        if(tgt != 0xFFFFFFFFL) traits.ctorSiblingCtorCalls.add(tgt);
+                    }
+                }
+            }
+        }
+
+        // v8 Rule 101: SIF RPC fid scan. If function calls sceSifCallRpc, scan
+        // the body for an `ori $a1, $zero, imm` / `addiu $a1, $zero, imm` /
+        // `li $a1, imm` literal in the 8 instructions preceding any jal site.
+        if(traits.callsSifRpc) {
+            detectSifRpcFids(func, traits);
+        }
+
+        // v8 Rule 99: file-open caller sprintf-source scan. Look for `%s` in any
+        // referenced string, AND a preceding sprintf-style callee.
+        if(traits.callsFileOpen) {
+            detectFilePathSprintfFormats(func, traits);
+        }
+
         cache.put(key,traits);
         return traits;
+    }
+
+    // v8 Rule 92: vtable install detector — looks for lui+addiu+sw $rN, 0($a0).
+    private void detectCtorVtableInstall(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        long hi = 0; String hiReg = null;
+        long val = 0; String valReg = null;
+        int scanned = 0;
+        while(it.hasNext() && scanned < 16) {
+            Instruction inst = it.next();
+            scanned++;
+            String mn = inst.getMnemonicString();
+            if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("lui")) {
+                Object[] dop = inst.getOpObjects(0);
+                if(dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register) {
+                    String dr = ((ghidra.program.model.lang.Register)dop[0]).getName();
+                    for(Object o : inst.getInputObjects()) {
+                        if(o instanceof ghidra.program.model.scalar.Scalar) {
+                            hi = (((ghidra.program.model.scalar.Scalar)o).getUnsignedValue() & 0xFFFFL) << 16;
+                            hiReg = dr;
+                        }
+                    }
+                }
+            } else if(mll.equals("addiu") || mll.equals("ori")) {
+                Object[] dop = inst.getOpObjects(0);
+                String dr = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                boolean readsHiReg = false;
+                long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(hiReg != null && rn.equalsIgnoreCase(hiReg)) readsHiReg = true;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(readsHiReg && dr != null) {
+                    val = (hi + imm) & 0xFFFFFFFFL;
+                    valReg = dr;
+                }
+            } else if(mll.equals("sw") || mll.equals("sd")) {
+                Object[] dop = inst.getOpObjects(0);
+                Object[] aop = inst.getOpObjects(1);
+                String srcReg = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                boolean baseIsA0 = false;
+                long off = -1;
+                if(aop != null) {
+                    for(Object o : aop) {
+                        if(o instanceof ghidra.program.model.lang.Register &&
+                           ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("a0"))
+                            baseIsA0 = true;
+                        else if(o instanceof ghidra.program.model.scalar.Scalar)
+                            off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(baseIsA0 && off == 0 && srcReg != null && srcReg.equalsIgnoreCase(valReg) && val != 0) {
+                    traits.ctorInstallsVtable = true;
+                    traits.ctorVtableAddr = val;
+                    break;
+                }
+            }
+        }
+    }
+
+    // v8 Rule 101: scan for $a1 immediate set just before sceSifCallRpc.
+    private void detectSifRpcFids(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        long lastA1 = -1;
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString();
+            if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("ori") || mll.equals("li")) {
+                Object[] dop = inst.getOpObjects(0);
+                String dr = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                }
+                if(dr != null && dr.equalsIgnoreCase("a1") && imm >= 0) lastA1 = imm;
+            } else if(mll.equals("jal") || mll.equals("jalr")) {
+                for(ghidra.program.model.address.Address tgt : inst.getFlows()) {
+                    Function t = funcManager.getFunctionAt(tgt);
+                    if(t != null && t.getName().equals("sceSifCallRpc") && lastA1 >= 0)
+                        traits.detectedRpcFids.add(lastA1);
+                }
+            }
+        }
+    }
+
+    // v8 Rule 99: collect %s-bearing format strings referenced near a sprintf call
+    // chained into a file open call.
+    private void detectFilePathSprintfFormats(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            for(Reference ref : inst.getReferencesFrom()) {
+                Data data = getDataAt(ref.getToAddress());
+                if(data != null && data.hasStringValue()) {
+                    String s = data.getDefaultValueRepresentation();
+                    if(s == null) continue;
+                    // Look for %s placeholder + path-like prefix.
+                    if(s.contains("%s") && (s.contains("/") || s.contains(".dat") ||
+                       s.contains(".hd2") || s.contains(".bin") || s.contains(".tex"))) {
+                        traits.filePathSprintfFormats.add(s);
+                        traits.filePathHasPercentS = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // v8 Rule 108: hand-rolled GCC2-style C++ symbol demangler.
+    //   __ct__<N><className>F<args>          -> ctor
+    //   __dt__<N><className>F<args>          -> dtor
+    //   <method>__<N><className>F<args>      -> method
+    //   __sinit_<file>.cpp                   -> static init (left as-is)
+    // Populates traits.ctorClassName / traits.methodClassName / traits.methodName.
+    private void demangleAndPopulate(String fname, FuncTraits traits) {
+        if(fname == null) return;
+        // ctor
+        if(fname.startsWith("__ct__")) {
+            traits.isCtor = true;
+            traits.ctorClassName = extractClassNameFromMangled(fname.substring(6));
+            return;
+        }
+        if(fname.startsWith("__dt__")) {
+            traits.isDtor = true;
+            traits.methodClassName = extractClassNameFromMangled(fname.substring(6));
+            return;
+        }
+        // method__<N><class>F<args>
+        int idx = fname.indexOf("__");
+        if(idx > 0 && idx + 2 < fname.length()) {
+            char c = fname.charAt(idx + 2);
+            if(Character.isDigit(c)) {
+                String method = fname.substring(0, idx);
+                String rest = fname.substring(idx + 2);
+                String cls = extractClassNameFromMangled(rest);
+                if(cls != null) {
+                    traits.methodClassName = cls;
+                    traits.methodName = method;
+                    String mlower = method.toLowerCase();
+                    if(mlower.equals("draw") || mlower.equals("step") ||
+                       mlower.equals("update") || mlower.equals("render") ||
+                       mlower.equals("paint") || mlower.startsWith("draw") ||
+                       mlower.startsWith("step"))
+                        traits.isVirtualDrawMethod = true;
+                }
+            }
+        }
+    }
+
+    // Parses "<N><name>F<args>" or "<N><name>Fv" — returns the class name
+    // (the <name> portion). Tolerates trailing template marker missing.
+    private static String extractClassNameFromMangled(String s) {
+        if(s == null || s.isEmpty()) return null;
+        int i = 0;
+        while(i < s.length() && Character.isDigit(s.charAt(i))) i++;
+        if(i == 0) return null;
+        int n;
+        try { n = Integer.parseInt(s.substring(0, i)); }
+        catch(NumberFormatException ex) { return null; }
+        if(i + n > s.length()) return null;
+        return s.substring(i, i + n);
     }
 
     // v7.1 Rule 84: lifecycle-verb name match. Includes the F33 culprit
@@ -3105,6 +4076,38 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         w.close();
     }
 
+    // v8 Rule 109: cheap line-scanning reader. Extracts {address: "disposition|category"}
+    // pairs from a prior triage_map.json without bringing in a JSON dependency.
+    private Map<Long,String> loadPriorTriageMapCats(File f) throws IOException {
+        Map<Long,String> out = new HashMap<>();
+        BufferedReader r = new BufferedReader(new FileReader(f));
+        String line;
+        while((line = r.readLine()) != null) {
+            int aIdx = line.indexOf("\"address\":");
+            int cIdx = line.indexOf("\"category\":");
+            int dIdx = line.indexOf("\"disposition\":");
+            if(aIdx < 0 || (cIdx < 0 && dIdx < 0)) continue;
+            int q1 = line.indexOf('"', aIdx + 10);
+            int q2 = line.indexOf('"', q1 + 1);
+            if(q1 < 0 || q2 <= q1) continue;
+            long addr;
+            try { addr = Long.parseLong(line.substring(q1+1, q2).replace("0x",""), 16); }
+            catch(NumberFormatException ex) { continue; }
+            String cat = "?", disp = "?";
+            if(cIdx >= 0) {
+                int c1 = line.indexOf('"', cIdx + 11); int c2 = line.indexOf('"', c1 + 1);
+                if(c1 >= 0 && c2 > c1) cat = line.substring(c1+1, c2);
+            }
+            if(dIdx >= 0) {
+                int d1 = line.indexOf('"', dIdx + 14); int d2 = line.indexOf('"', d1 + 1);
+                if(d1 >= 0 && d2 > d1) disp = line.substring(d1+1, d2);
+            }
+            out.put(addr & 0xFFFFFFFFL, disp + "|" + cat);
+        }
+        r.close();
+        return out;
+    }
+
     // =========================================================
     // JSON OUTPUT - v3 extended with new fields
     // =========================================================
@@ -3113,7 +4116,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                                  int totalFuncs,int uncategorized) throws IOException {
         PrintWriter w=new PrintWriter(new FileWriter(outFile));
         w.println("{");
-        w.println("  \"schema_version\": 7.1,");
+        w.println("  \"schema_version\": 8.0,");
         w.println("  \"elf_hash\": \""+elfHash+"\",");
         if(gpValue!=0)w.println("  \"global_pointer\": \""+hex(gpValue)+"\",");
         w.println("  \"text_range\": { \"start\": \""+hex(textStart)+"\", \"end\": \""+hex(textEnd)+"\" },");
@@ -3195,7 +4198,29 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"ctor_multi_field_initializer\": "+ctorMultiFieldInitCount+",");
         w.println("    \"lifecycle_lazy_init_guard\": "+lifecycleLazyInitCount+",");
         w.println("    \"bitbltbuf_t4hh_uploader\": "+bitbltbufT4hhUploaderCount+",");
-        w.println("    \"drawing_chain_funcs\": "+drawingChainCount);
+        w.println("    \"drawing_chain_funcs\": "+drawingChainCount+",");
+        // v8 stats
+        w.println("    \"ctor_risk_critical\": "+ctorCriticalCount+",");
+        w.println("    \"ctor_risk_high\": "+ctorHighCount+",");
+        w.println("    \"ctor_risk_medium\": "+ctorMediumCount+",");
+        w.println("    \"ctor_assigned_to_global\": "+ctorAssignedGlobalCount+",");
+        w.println("    \"ctor_installs_vtable\": "+ctorInstallsVtableCount+",");
+        w.println("    \"ctor_dual_call_mode\": "+ctorDualCallModeCount+",");
+        w.println("    \"virtual_dispatch_sites\": "+virtualDispatchSiteCount+",");
+        w.println("    \"virtual_dispatch_funcs\": "+virtualDispatchFuncCount+",");
+        w.println("    \"pad_button_mask_consumer\": "+padButtonMaskConsumerCount+",");
+        w.println("    \"gif_nloop_double_count_risk\": "+gifNloopDoubleCountRiskCount+",");
+        w.println("    \"file_path_sprintf_source\": "+filePathSprintfCount+",");
+        w.println("    \"frame_clock_driver\": "+frameClockDriverCount+",");
+        w.println("    \"sce_vu0_helper_mustimpl\": "+sceVu0HelperCount+",");
+        w.println("    \"asset_upload_trace_funcs\": "+assetUploadTraceFuncCount+",");
+        w.println("    \"override_classified\": "+overrideClassifiedCount+",");
+        w.println("    \"override_retire_candidate\": "+overrideRetireCount+",");
+        w.println("    \"dispfb_writer_via_sdk_caller\": "+dispfbWriterViaSdkCallerCount+",");
+        w.println("    \"dma_kick_via_sdk_caller\": "+dmaKickViaSdkCallerCount+",");
+        w.println("    \"return_written_to_global_funcs\": "+returnWrittenToGlobalCount+",");
+        w.println("    \"auto_extended_dc2_globals\": "+autoExtendedDc2GlobalsCount+",");
+        w.println("    \"class_registry_count\": "+classRegistry.size());
         w.println("  },");
 
         // v5 Rule 55: known DC2 gp-relative globals (labels for literal_refs decode).
@@ -3208,6 +4233,52 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             }
         }
         w.println("\n  },");
+
+        // v8 Rule 95: auto-extended DC2 globals discovered via return-to-global tracking.
+        w.println("  \"auto_extended_dc2_globals\": {");
+        {
+            boolean f=true;
+            for(Map.Entry<Long,String> e : autoExtendedDc2Globals.entrySet()) {
+                if(!f) w.println(","); f=false;
+                w.print("    \"0x"+String.format("%08X", e.getKey()&0xFFFFFFFFL)+"\": "+jsonString(e.getValue()));
+            }
+        }
+        w.println("\n  },");
+
+        // v8 Rule 107: phase trace env-var flag inventory.
+        w.println("  \"phase_trace_flags\": [");
+        for(int i=0; i<PHASE_TRACE_FLAGS.length; i++) {
+            w.print("    "+jsonString(PHASE_TRACE_FLAGS[i]));
+            w.println(i<PHASE_TRACE_FLAGS.length-1 ? "," : "");
+        }
+        w.println("  ],");
+
+        // v8 Rule 106: build invariants.
+        w.println("  \"build_invariants\": {");
+        w.println("    \"build_cmd\": "+jsonString(BUILD_CMD)+",");
+        w.println("    \"do_not_modify\": [");
+        for(int i=0; i<BUILD_DO_NOT_MODIFY.length; i++) {
+            w.print("      "+jsonString(BUILD_DO_NOT_MODIFY[i]));
+            w.println(i<BUILD_DO_NOT_MODIFY.length-1 ? "," : "");
+        }
+        w.println("    ]");
+        w.println("  },");
+
+        // v8 Rule 104: expected uploads per phase. Consumers may compare
+        // against gs_runtime_evidence.bitbltbuf_dpsms_union to spot gaps.
+        w.println("  \"current_phase_inputs\": {");
+        w.println("    \"expected_uploads\": [");
+        for(int i=0; i<EXPECTED_UPLOADS.length; i++) {
+            Object[] row = EXPECTED_UPLOADS[i];
+            w.print("      {\"tag\": "+jsonString((String)row[0])+
+                    ", \"dpsm\": \""+String.format("0x%02X", ((Number)row[1]).intValue())+"\""+
+                    ", \"dbp\": \""+String.format("0x%08X", ((Number)row[2]).longValue())+"\""+
+                    ", \"phase\": "+jsonString((String)row[3])+
+                    ", \"hint\": "+jsonString((String)row[4])+"}");
+            w.println(i<EXPECTED_UPLOADS.length-1 ? "," : "");
+        }
+        w.println("    ]");
+        w.println("  },");
 
         // v6 Rule 58: REAL GS privileged MMIO map (PCSX2-grounded). Replaces
         // the v4 misnamed KNOWN_GS_REGS for 0x12000000+ accesses. The v4 map
@@ -3303,7 +4374,152 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(i<oaList.size()-1)w.println(","); else w.println();
         }
         w.println("  ],");
-        
+
+        // v8 Rule 98 + 110: override classification + retire candidates.
+        w.println("  \"override_classification\": {");
+        {
+            boolean first = true;
+            for(Long a : oaList) {
+                String kind = overrideKindByAddr.getOrDefault(a, "real_shim");
+                String handler = overrideHandlerNames.getOrDefault(a, "");
+                String bound   = gameOverrideNames.getOrDefault(a, "");
+                boolean retire = "nop_stub".equals(kind) || "probe".equals(kind);
+                if(!first) w.println(","); first = false;
+                w.print("    \""+hex(a)+"\": {\"kind\": "+jsonString(kind)+
+                        ", \"handler\": "+jsonString(handler)+
+                        ", \"bound_name\": "+jsonString(bound)+
+                        ", \"retire_candidate\": "+retire+"}");
+            }
+        }
+        w.println("\n  },");
+
+        // v8 Rule 93: classes section.
+        w.println("  \"classes\": {");
+        {
+            boolean first = true;
+            for(Map.Entry<String,ClassEntry> e : classRegistry.entrySet()) {
+                ClassEntry ce = e.getValue();
+                if(!first) w.println(","); first = false;
+                w.print("    "+jsonString(e.getKey())+": {");
+                w.print("\"ctors\": [");
+                {
+                    boolean f = true;
+                    for(Long a : ce.ctorAddresses) {
+                        if(!f) w.print(", "); f = false;
+                        w.print("\""+hex(a)+"\"");
+                    }
+                }
+                w.print("], ");
+                w.print("\"dtor\": "+(ce.dtorAddress != null ? "\""+hex(ce.dtorAddress)+"\"" : "null")+", ");
+                w.print("\"vtable_addr\": "+(ce.vtableAddr != null ? "\""+hex(ce.vtableAddr)+"\"" : "null")+", ");
+                w.print("\"has_virtual_draw\": "+ce.hasVirtualDraw+", ");
+                w.print("\"risk_tier\": "+jsonString(ce.riskTier)+", ");
+                w.print("\"methods\": [");
+                {
+                    boolean f = true;
+                    for(String m : ce.methodNames) {
+                        if(!f) w.print(", "); f = false;
+                        w.print(jsonString(m));
+                    }
+                }
+                w.print("], ");
+                w.print("\"method_addrs\": {");
+                {
+                    boolean f = true;
+                    for(Map.Entry<String,Long> me : ce.methodAddrs.entrySet()) {
+                        if(!f) w.print(", "); f = false;
+                        w.print(jsonString(me.getKey())+": \""+hex(me.getValue())+"\"");
+                    }
+                }
+                w.print("}, ");
+                w.print("\"instantiation_sites\": [");
+                {
+                    boolean f = true;
+                    for(Long pc : ce.instantiationSites) {
+                        if(!f) w.print(", "); f = false;
+                        w.print("\""+hex(pc)+"\"");
+                    }
+                }
+                w.print("], ");
+                w.print("\"global_holders\": [");
+                {
+                    boolean f = true;
+                    for(String gh : ce.globalHolders) {
+                        if(!f) w.print(", "); f = false;
+                        w.print(jsonString(gh));
+                    }
+                }
+                w.print("]}");
+            }
+        }
+        w.println("\n  },");
+
+        // v8 Rule 103: asset upload traces (T8/T4HH back-solve).
+        w.println("  \"asset_upload_traces\": {");
+        {
+            boolean first = true;
+            for(Map.Entry<String,List<long[]>> e : assetUploadTraces.entrySet()) {
+                if(!first) w.println(","); first = false;
+                w.print("    "+jsonString(e.getKey())+": {\"matches\": [");
+                List<long[]> bucket = e.getValue();
+                for(int j=0; j<bucket.size(); j++) {
+                    if(j>0) w.print(", ");
+                    w.print("\""+hex(bucket.get(j)[0])+"\"");
+                }
+                w.print("]}");
+            }
+        }
+        w.println("\n  },");
+
+        // v8: frame clock driver shortlist (Rule 100).
+        w.println("  \"frame_clock_drivers\": [");
+        {
+            boolean first = true;
+            for(FuncResult r : results) {
+                if(r.traits != null && r.traits.isFrameClockDriver) {
+                    if(!first) w.println(","); first = false;
+                    w.print("    {\"address\": \""+hex(r.address)+
+                            "\", \"name\": "+jsonString(r.name)+"}");
+                }
+            }
+        }
+        w.println("\n  ],");
+
+        // v8 Rule 109: delta against prior triage_map.json. Empty when no prior.
+        w.println("  \"delta\": {");
+        if(priorTriageMapCats == null || priorTriageMapCats.isEmpty()) {
+            w.println("    \"available\": false");
+        } else {
+            Set<Long> nowAddrs = new HashSet<>();
+            for(FuncResult r : results) nowAddrs.add(r.address & 0xFFFFFFFFL);
+            int added=0, removed=0, changed=0;
+            List<String> changedList = new ArrayList<>();
+            for(FuncResult r : results) {
+                long a = r.address & 0xFFFFFFFFL;
+                String now = r.disposition + "|" + r.category;
+                String prev = priorTriageMapCats.get(a);
+                if(prev == null) { added++; }
+                else if(!prev.equals(now)) {
+                    changed++;
+                    if(changedList.size() < 200)
+                        changedList.add(hex(a)+":"+prev+"->"+now);
+                }
+            }
+            for(Long a : priorTriageMapCats.keySet())
+                if(!nowAddrs.contains(a)) removed++;
+            w.println("    \"available\": true,");
+            w.println("    \"added\": "+added+",");
+            w.println("    \"removed\": "+removed+",");
+            w.println("    \"changed\": "+changed+",");
+            w.println("    \"changed_sample\": [");
+            for(int i=0; i<changedList.size(); i++) {
+                w.print("      "+jsonString(changedList.get(i)));
+                w.println(i<changedList.size()-1 ? "," : "");
+            }
+            w.println("    ]");
+        }
+        w.println("  },");
+
         // F21-prep: address -> name map for resolving caller names in the
         // reverse call-graph emit below.
         Map<Long,String> nameByAddr = new HashMap<>();
@@ -3466,7 +4682,81 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"is_bitbltbuf_t4hh_uploader\": "+t.isBitbltbufT4hhUploader+", ");
             w.print("\"is_ctor_multi_field_init\": "+t.isCtorMultiFieldInit+", ");
             w.print("\"ctor_slots_written_count\": "+t.ctorSlotsWritten.size()+", ");
-            w.print("\"is_lifecycle_lazy_init\": "+t.isLifecycleLazyInit);
+            w.print("\"is_lifecycle_lazy_init\": "+t.isLifecycleLazyInit+", ");
+            // v8 hardware-shape fields
+            w.print("\"is_ctor\": "+t.isCtor+", ");
+            w.print("\"is_dtor\": "+t.isDtor+", ");
+            w.print("\"ctor_class_name\": "+jsonString(t.ctorClassName)+", ");
+            w.print("\"method_class_name\": "+jsonString(t.methodClassName)+", ");
+            w.print("\"method_name\": "+jsonString(t.methodName)+", ");
+            w.print("\"is_virtual_draw_method\": "+t.isVirtualDrawMethod+", ");
+            w.print("\"ctor_installs_vtable\": "+t.ctorInstallsVtable+", ");
+            w.print("\"ctor_vtable_addr\": "+(t.ctorVtableAddr!=0?"\""+hex(t.ctorVtableAddr)+"\"":"null")+", ");
+            w.print("\"ctor_assigned_to_global\": "+t.ctorAssignedToGlobal+", ");
+            w.print("\"ctor_call_mode\": "+jsonString(t.ctorCallMode)+", ");
+            w.print("\"ctor_risk_tier\": "+jsonString(t.ctorRiskTier)+", ");
+            w.print("\"called_via_direct_jal\": "+t.calledViaDirectJal+", ");
+            w.print("\"called_via_jr_t9\": "+t.calledViaJrT9+", ");
+            w.print("\"is_pad_button_mask_consumer\": "+t.isPadButtonMaskConsumer+", ");
+            w.print("\"calls_gif_packet_open\": "+t.callsGifPacketOpen+", ");
+            w.print("\"calls_gif_packet_close\": "+t.callsGifPacketClose+", ");
+            w.print("\"gif_nloop_double_count_risk\": "+t.gifNloopDoubleCountRisk+", ");
+            w.print("\"calls_file_open\": "+t.callsFileOpen+", ");
+            w.print("\"file_path_has_percent_s\": "+t.filePathHasPercentS+", ");
+            w.print("\"is_frame_clock_driver\": "+t.isFrameClockDriver+", ");
+            w.print("\"is_sce_vu0_helper\": "+t.isSceVu0Helper+", ");
+            w.print("\"vu0_helper_family\": "+jsonString(t.vu0HelperFamily)+", ");
+            w.print("\"must_be_implemented\": "+t.mustBeImplemented+", ");
+            w.print("\"uploader_caller_depth1\": "+t.uploaderCallerDepth1+", ");
+            w.print("\"dispfb_writer_via_sdk_caller_depth1\": "+t.dispfbWriterViaSdkCallerDepth1+", ");
+            w.print("\"dma_kick_via_sdk_caller_depth1\": "+t.dmaKickViaSdkCallerDepth1+", ");
+            w.print("\"override_kind\": "+jsonString(t.overrideKind)+", ");
+            w.print("\"override_retire_candidate\": "+t.overrideRetireCandidate+", ");
+            w.print("\"pad_masks_tested\": [");
+            {
+                boolean f=true;
+                for(String s:t.padMasksTested){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+            }
+            w.print("], ");
+            w.print("\"detected_rpc_fids\": [");
+            {
+                boolean f=true;
+                for(Long v:t.detectedRpcFids){ if(!f) w.print(", "); f=false; w.print("\""+hex(v)+"\""); }
+            }
+            w.print("], ");
+            w.print("\"ctor_sibling_ctor_calls\": [");
+            {
+                boolean f=true;
+                for(Long v:t.ctorSiblingCtorCalls){ if(!f) w.print(", "); f=false; w.print("\""+hex(v)+"\""); }
+            }
+            w.print("], ");
+            w.print("\"return_written_to_globals\": [");
+            {
+                boolean f=true;
+                for(Long v:t.returnWrittenToGlobals){ if(!f) w.print(", "); f=false; w.print("\""+hex(v)+"\""); }
+            }
+            w.print("], ");
+            w.print("\"asset_upload_tags_hit\": [");
+            {
+                boolean f=true;
+                for(String s:t.assetUploadTagsHit){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+            }
+            w.print("], ");
+            w.print("\"file_path_sprintf_formats\": [");
+            {
+                boolean f=true;
+                for(String s:t.filePathSprintfFormats){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+            }
+            w.print("], ");
+            w.print("\"virtual_dispatch_sites\": [");
+            {
+                boolean f=true;
+                for(String[] vd:t.virtualDispatchSites){
+                    if(!f) w.print(", "); f=false;
+                    w.print("{\"pc\": \""+vd[0]+"\", \"vtable_slot\": \""+vd[1]+"\", \"object_reg\": "+jsonString(vd[2])+"}");
+                }
+            }
+            w.print("]");
             w.print("}, ");
             // v4 graph-derived fields, hoisted above tags so consumers can sort.
             w.print("\"mainloop_depth\": "+t.mainLoopDepth+", ");
