@@ -1,6 +1,88 @@
-// PS2Recomp Triage Enricher v8 - Ghidra Script (Step 2 of Pipeline)
+// PS2Recomp Triage Enricher v9 (DC2 Edition) - Ghidra Script (Step 2 of Pipeline)
 // ==================================================================
 // Run AFTER ExportPS2Functions.java on the same Ghidra project.
+//
+// WHAT'S NEW IN v9 (DC2-targeted; folds in General v11/v12 detectors +
+// DC2 PROJECT_STATE.md F21-F46.6 knowledge):
+//   Rule 113 GIF_TAG_INLINE_BUILDER         4-stride store cluster (0/8/0x10/0x18)
+//          to a common base, with stored constants whose upper byte encodes a
+//          GIFtag REGS/FLG field. Catches mgEndFrame / drawing-prim packet
+//          builders that the v8 raw-MMIO detectors miss.
+//   Rule 114 BITBLTBUF_MACRO_SEQUENCE       Function stores const 0x50/0x51/0x52/0x53
+//          (BITBLTBUF / TRXPOS / TRXREG / TRXDIR) — a complete upload macro
+//          regardless of dpsm. Auto-sets writesBitbltbufReg.
+//   Rule 115 DMA_CHCR_START_KICK            Loads const 0x101 (STR | TIE) AND
+//          writes to a known DMA channel CHCR (Path3 starter detection).
+//   Rule 116 DMA_SOURCE_CHAIN_TAG_BUILDER   Stores composite const with high
+//          nibble 0x10/0x30/0x40/0x50/0x60/0x70 at offset 0 of any base —
+//          CNT/REF/REFS/CALL/RET/END source-chain DMA tags.
+//   Rule 117 VIF_TAG_STORED_IMMEDIATE       Any store of const-tracked reg
+//          whose upper byte matches VIF_OPCODES — captures MPG/MSCAL/UNPACK
+//          built ahead of DMA kick (Rule 67 detected lui only).
+//   Rule 118 DMA_TAG_STORED_IMMEDIATE       Same for high-nibble DMA tag ids.
+//   Rule 119 COMPOSITE_MMIO_RECOVERY        Tracks lui+ori|addiu|or composite
+//          values per reg and matches against every EE peripheral range. Fixes
+//          MMIO miss when Ghidra doesn't ref-flag the synthesised addr (the
+//          F26 vu_micromem=0 / F31 vif1 chunk class of false negatives).
+//   Rule 120 SYSCALL_TRAMPOLINE             addiu $v1,$zero,N; syscall; jr ra
+//          stub — names the function from EE_SYSCALL_NAMES (db-syscalls.md).
+//   Rule 121 BACKWARD_BRANCH_SYNC_WAIT      Small body, backward branch, polls
+//          a load/syscall in body — F24 / F27 / F28 host-wait blocker class.
+//          Tagged DC2_HOST_WAIT_CANDIDATE when also in mainLoopShield.
+//   Rule 122 INFINITE_SPIN_LOOP             1-2 BB function whose only branch
+//          targets its entry. Same family as F24's never-returning dispatch
+//          path; quietly retired by the F23c libgcc unblock.
+//   Rule 123 INFINITE_FAIL_LOOP             Backward branch into a `break`/
+//          `syscall` / `nop`-only block — assertion / panic loops.
+//   Rule 124 IRX_LOADER                     >=2 calls to sceSifLoadModule, or
+//          1 call + IRX path string ref. IOP-side init function.
+//   Rule 125 IOP_REBOOT_HANDLER             Calls sceSifRebootIop.
+//   Rule 126 RENDER_FRAME_ENTRY             Name match against the DC2 render
+//          frame entry list (mgEndFrame*, mgEndDraw*, mgBeginFrame*,
+//          BeginDrawing*, EndDrawing*).
+//   Rule 127 STRUCT_INITIALIZER             Non-ctor func that writes >=4
+//          distinct +K($a0) slots. Catches mgInit-style initializers the
+//          ctor demangler misses.
+//   Rule 128 FUNCTION_POINTER_TABLES        Scans non-.text initialized
+//          blocks for runs of >=3 valid function entry pointers (tag-tolerant
+//          for boxed pointers). Discovers vtables Ghidra didn't auto-create.
+//          Tags entries DISPATCH_TABLE_TARGET and table-reading funcs
+//          TABLE_DISPATCH_CALL. Anonymous classes named Class_0xADDR / slot N.
+//   Rule 129 MODULE_CLUSTERS                Connected components on jal
+//          edges. Each function gets module_id; module addr lists emitted at
+//          top level. Useful for grouping mg*/mgC*/CScene/CMap/CMenu code.
+//   Rule 130 NAME_PREFIX_MODULES            Prefixes of length 2-6 occurring
+//          >=5 times — surfaces engineer-visible subsystems independent of
+//          callgraph.
+//   Rule 131 DC2_KNOWN_FUNCTION_ADDRESSES   Hardcoded address -> {name,phase,
+//          role,criticality} map from PROJECT_STATE.md so the report tool
+//          can lay out priority lists without re-deriving them.
+//   Rule 132 DC2_KNOWN_TBP_LABELS           VRAM heatmap labels per memory
+//          invariants doc (T8_map=0x2720, font_4HH=0x10E0, CLUT_T4HH=0x3FDC,
+//          mgDBuff_fbp=0x68, HUD_font_cache=16284..16316).
+//   Rule 133 DC2_RUNTIME_INVARIANTS         Top-level section listing every
+//          invariant confirmed across all 9 GS dumps (Path1/2 dead, REGLIST/
+//          IMAGE2 never used, IMR=0x7F00, PMODE=0x7F23, FRAME PSM=0, ZBUF
+//          PSM=1, HUD pages 16324..16348). Lets the report tool gray-out
+//          functions whose only output is into a confirmed-dead pipe.
+//   Rule 134 DC2_CALL_CHAINS                Pre-computed forward callgraphs
+//          for the 5 critical chains: save_to_map_load / title_to_menu /
+//          texture_upload / frame_loop / render_chain.
+//   Rule 135 DC2_PAD_INPUT_SCRIPTS          Working DC2_PAD_INPUT scripts
+//          from F40/F42/F46 fix logs — embedded so the runtime side can
+//          re-use them as headless input templates.
+//   Rule 136 SCORE_FOCUS_SYNTH              Fallback for focus_set when zero
+//          bullseyes fire — picks top-32 by static score.
+//   Rule 137 TRIAGE_ADVISORY_TOML           New TOML appendix [triage_advisory]
+//          with nop / patch / force_recompile categorised lists, each line
+//          carrying a 4-tag prioritised comment.
+//   Rule 138 STUB_TOML_TAG_COMMENTS         Every spliced stub/skip entry
+//          gets ` # TAG1,TAG2,TAG3` so ps2recomp.exe operators can triage
+//          at a glance.
+//   Rule 139 DISCOVERED_IOP_SIDS_SECTION    Aggregated map of every detected
+//          SID with its caller list — captures ezMIDI / save data / loader
+//          RPCs the hardcoded KNOWN_IOP_SIDS table misses.
+//   Schema version bumped to 9.0.
 //
 // WHAT'S NEW IN v8 (DC2 Phase F36-F49 retrospective + forward F47):
 //   Tier 0 — Broken-counter fixes
@@ -596,10 +678,336 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         KNOWN_DC2_GP_OFFSETS.put(0xFFFF8ADCL, "LoopNo");
         KNOWN_DC2_GP_OFFSETS.put(0xFFFF8AE0L, "NextLoopNo");
         KNOWN_DC2_GP_OFFSETS.put(0xFFFF94F4L, "CGamePad_ptr");     // F21 chain
+        // v9 additions from PROJECT_STATE.md session log (F40-F46.6)
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF9948L, "TitleCamera");      // F46.5 null-deref slot (0x00377838 abs)
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF994CL, "TitleCamera2");     // F46.5 secondary camera slot
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8AE4L, "FrameCount");       // mgEndFrame counter
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF94F8L, "CGamePad_Port1");   // Pad slot mirror
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8820L, "mgDrawEnvCurrent"); // Companion to mgDBuffID
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8824L, "mgDrawEnvNext");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8778L, "mgVif1PacketEnd");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8780L, "mgVif1PacketCurrent");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8AE8L, "MapPhase");         // post-title progression
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF99B0L, "MenuPhase");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF99B4L, "MenuItem");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B00L, "mapMap_ptr");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B04L, "mapStack_ptr");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B08L, "mapAddMode");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B0CL, "mapNowMapId");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B10L, "mapNowMapType");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B14L, "mapCameraMainIdx");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B18L, "mapCameraSubIdx");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B1CL, "mapFuncPointIdx");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B20L, "mapPtsFunc");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B28L, "CScene_ptr");       // F43 LoadMapFromMemory target
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B2CL, "CSave_ptr");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B30L, "CMemoryCardMgr_ptr");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B40L, "mgCTextureManager_ptr"); // F43 ReloadTexture
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B44L, "mgCDrawManager_ptr");
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B50L, "EzMidi_rpcClient");  // F12/F27 sceSifCallRpc client
+        KNOWN_DC2_GP_OFFSETS.put(0xFFFF8B54L, "EzMidi_lastResult");
         // Same offsets in signed-16 form (Ghidra sometimes emits negative scalar)
         KNOWN_DC2_GP_OFFSETS.put(-0x77E8L & 0xFFFFFFFFL, "mgDBuffID");
         KNOWN_DC2_GP_OFFSETS.put(-0x788CL & 0xFFFFFFFFL, "mgVif1Packet");
         KNOWN_DC2_GP_OFFSETS.put(-0x6684L & 0xFFFFFFFFL, "TitleInfo");
+        KNOWN_DC2_GP_OFFSETS.put(-0x66B8L & 0xFFFFFFFFL, "TitleCamera");      // F46.5 alias
+        KNOWN_DC2_GP_OFFSETS.put(-0x66B4L & 0xFFFFFFFFL, "TitleCamera2");
+        KNOWN_DC2_GP_OFFSETS.put(-0x6650L & 0xFFFFFFFFL, "MenuPhase");
+        KNOWN_DC2_GP_OFFSETS.put(-0x751CL & 0xFFFFFFFFL, "FrameCount");
+        KNOWN_DC2_GP_OFFSETS.put(-0x7520L & 0xFFFFFFFFL, "NextLoopNo");
+        KNOWN_DC2_GP_OFFSETS.put(-0x7524L & 0xFFFFFFFFL, "LoopNo");
+        KNOWN_DC2_GP_OFFSETS.put(-0x7518L & 0xFFFFFFFFL, "MapPhase");
+        KNOWN_DC2_GP_OFFSETS.put(-0x7500L & 0xFFFFFFFFL, "mapMap_ptr");
+        KNOWN_DC2_GP_OFFSETS.put(-0x74D8L & 0xFFFFFFFFL, "CScene_ptr");
+        KNOWN_DC2_GP_OFFSETS.put(-0x74C0L & 0xFFFFFFFFL, "mgCTextureManager_ptr");
+        KNOWN_DC2_GP_OFFSETS.put(-0x74B0L & 0xFFFFFFFFL, "EzMidi_rpcClient");
+    }
+
+    // v9 Rule 131: DC2 known function addresses from PROJECT_STATE.md fix logs.
+    // Each entry: address -> {name, phase, role, criticality}.
+    // criticality: BLOCKER (active phase blocker), HIGH (frequently referenced
+    // in fix logs), MEDIUM (component fixed in a closed phase), LOW (utility).
+    private static final Object[][] KNOWN_DC2_FUNCTION_ADDRESSES = {
+        // {addr,         name,                                              phase,        role,                criticality}
+        { 0x00100008L, "entry_0x100008",                                     "boot",       "main_inlined_main_loop",  "BLOCKER" },
+        { 0x00190CB0L, "MainLoop_0x190cb0",                                  "F28",        "main_loop_never_returns", "BLOCKER" },
+        { 0x001425B0L, "mgEndFrame",                                         "F40",        "frame_clock_driver",      "HIGH"    },
+        { 0x002A1220L, "TitleModeKey__Fv",                                   "F41",        "title_input_consumer",    "HIGH"    },
+        { 0x002A2280L, "TitleMapDraw__Fv",                                   "F46.5",      "title_render_chain",      "HIGH"    },
+        { 0x00131A90L, "__ct__18mgCCameraFollowFv",                          "F42",        "ctor_critical",           "HIGH"    },
+        { 0x0012E850L, "ReloadTexture__17mgCTextureManagerFiP13sceVif1Packet","F43",       "texture_upload_entry",    "BLOCKER" },
+        { 0x0012E600L, "mgLoadImage__FPUiiiiP1iiiii",                        "F43",        "texture_upload_path",     "BLOCKER" },
+        { 0x00145400L, "mgLoadTextureZ__FiP8TM2_head",                       "F37/F39",    "t4hh_font_z_alias_loader","HIGH"    },
+        { 0x00284768L, "LoadMapFromMemory__6CSceneFP14CMapPathParamsP9mgCMemory","F43",    "map_load_entry",          "BLOCKER" },
+        { 0x00284902L, "LoadMapFromMemory_alt",                              "F43",        "map_load_entry_alt",      "BLOCKER" },
+        { 0x00164480L, "LoadMapFile__4CMapFPciP9mgCMemoryi",                 "F39",        "cfg_script_interpreter",  "MEDIUM"  },
+        { 0x001600D0L, "CreateMap__4CMapFP11CMdsListSetP9mgCMemory",         "F39",        "map_create_root",         "MEDIUM"  },
+        { 0x00149370L, "LoadFile2__FPcPvPii",                                "F25/F39",    "file_open_with_empty_stem","HIGH"   },
+        { 0x00149688L, "LoadFile2_caller_ra",                                "F25",        "fioOpen_emit_site",       "LOW"     },
+        { 0x00234540L, "MenuCamInit",                                        "F22",        "menu_camera_init",        "MEDIUM"  },
+        { 0x001343A0L, "__ct__11mgCDrawPrimFv",                              "F33",        "ctor_critical",           "MEDIUM"  },
+        { 0x00138850L, "__ct__10mgCDrawEnvFv",                               "F33",        "ctor_critical",           "MEDIUM"  },
+        { 0x0012C480L, "__ct__9mgCTextureFv",                                "F33",        "ctor_critical",           "MEDIUM"  },
+        { 0x0013D260L, "__ct__14mgCTextureAnimeFv",                          "F36",        "ctor_critical",           "MEDIUM"  },
+        { 0x0012C6D0L, "__ct__14mgCTextureBlockFv",                          "F36",        "ctor_critical",           "MEDIUM"  },
+        { 0x0012C7E0L, "__ct__16mgCTextureManagerFv",                        "F36",        "ctor_critical",           "MEDIUM"  },
+        { 0x0017D1F0L, "__ct__10mgC3DSpriteFv",                              "F36",        "ctor_critical",           "MEDIUM"  },
+        { 0x00135180L, "__ct__13mgCDrawManagerFv",                           "F36",        "ctor_critical",           "MEDIUM"  },
+        { 0x00136490L, "__ct__7mgCFrameFv",                                  "F36",        "ctor_critical",           "MEDIUM"  },
+        { 0x00135B60L, "__ct__11mgCFrameAttrFv",                             "F36",        "ctor_critical",           "MEDIUM"  },
+        { 0x002F19A0L, "FinishForMC__18CMemoryCardManagerFv",                "F38",        "mc_transition_gate",      "MEDIUM"  },
+        { 0x0014A3D0L, "pad_button_read_stub",                               "F40",        "pad_input_consumer",      "MEDIUM"  },
+        { 0x0014A490L, "read_pad",                                           "F40",        "pad_input_consumer",      "MEDIUM"  },
+        { 0x00033130L, "MenuCheckPushButton",                                "F41",        "title_confirm_decoder",   "HIGH"    },
+        { 0x00033230L, "ConvertCheckPushButton",                             "F41",        "pad_bit_translator",      "HIGH"    },
+        { 0x00377838L, "g_TitleCamera_global_abs",                           "F46.5",      "global_pointer_target",   "HIGH"    },
+        { 0x00033137L, "BadJump_0x33313237",                                 "F40-F46",    "pre_existing_bad_pc",     "BLOCKER" },
+        { 0x002A22FCL, "BadJump_0x2a22fc",                                   "F40-F46",    "pre_existing_bad_pc",     "BLOCKER" },
+    };
+
+    // v9 Rule 132: DC2 VRAM TBP labels per dc2_runtime_invariants memory + F37/F43/F44 fix logs.
+    // dbp -> human label so report tools can decode tex0_tbps_union /
+    // vram_upload_tbps_union without re-deriving the mapping.
+    private static final Map<Long,String> KNOWN_DC2_TBP_LABELS = new LinkedHashMap<>();
+    static {
+        KNOWN_DC2_TBP_LABELS.put(0x68L,    "mgDBuff_FBP_back");      // F30/F33 host-presentation source
+        KNOWN_DC2_TBP_LABELS.put(0x42L,    "Path3_upload_target_0");
+        KNOWN_DC2_TBP_LABELS.put(0x3C2L,   "Path3_upload_target_1");
+        KNOWN_DC2_TBP_LABELS.put(0x7C2L,   "Path3_upload_target_2");
+        KNOWN_DC2_TBP_LABELS.put(0x10E0L,  "Font_4HH_alias");        // F32/F37 PSMT4HH upload
+        KNOWN_DC2_TBP_LABELS.put(0x2720L,  "Map_T8_texture");        // F43 unreached upload (active blocker)
+        KNOWN_DC2_TBP_LABELS.put(0x3FDCL,  "CLUT_T4HH");             // F37 companion to font 4HH
+        KNOWN_DC2_TBP_LABELS.put(0x280L,   "Misc_PSMCT32_upload");
+        KNOWN_DC2_TBP_LABELS.put(0x3FD4L,  "Pre_CLUT_PSMCT32");
+        // HUD/font cache - stable 24-page block across all 9 captured GS dumps
+        for (long p = 16284L; p <= 16348L; p += 4L)
+            KNOWN_DC2_TBP_LABELS.put(p, "HUD_font_cache_page_" + p);
+    }
+
+    // v9 Rule 133: confirmed-across-9-GS-dumps runtime invariants (DC2 only).
+    // The report tool can deprioritise any function whose only hardware reach
+    // is one of these confirmed-dead pipes.
+    private static final String[][] DC2_RUNTIME_INVARIANTS = {
+        { "PATH1_DEAD",            "PATH1 transfer count == 0 in all 9 GS dumps. VU1 microcode never kicked." },
+        { "PATH2_DEAD",            "PATH2 transfer count == 0 in all 9 GS dumps. VIF1 DIRECT never used in steady state." },
+        { "REGLIST_DEAD",          "GIF REGLIST flg count == 0 in all 9 GS dumps. REGLIST decode paths unreachable." },
+        { "IMAGE2_DEAD",           "GIF IMAGE2 flg count == 0 in all 9 GS dumps." },
+        { "READFIFO2_DEAD",        "ReadFIFO2 call count == 0 in all 9 GS dumps. GS readback handlers safe to stub." },
+        { "PRIM_GARBAGE_DEAD",     "PRIM distinct values <= 0x1D6, malformed_tags == 0 across all 9 GS dumps." },
+        { "IMR_FULLY_MASKED",      "IMR == 0x7F00 in every checkpoint. All GS IRQs masked - safe to stub Signal/Finish/Label handlers." },
+        { "PMODE_STABLE",          "PMODE == 0x7F23 always. Interlaced field flip via DISPFB.dby toggle, not classic double-buffer." },
+        { "FRAME_PSM_PSMCT32",     "FRAME PSM == 0 (PSMCT32) always." },
+        { "ZBUF_PSM_PSMZ24",       "ZBUF PSM == 1 (PSMZ24) always." },
+        { "CONTEXT_2_DEAD",        "Only context_1 A+D regs ever GIF-written. Context-2 setup is via priv MMIO or stale state." },
+        { "HUD_FONT_PAGES_STABLE", "VRAM pages 16284..16316 uploaded in every scene - HUD/font cache stable 24-page block." },
+        { "PSMT4HH_UI_ONLY",       "PSMT4HH only in UI scenes (Character_Select, First_Gameplay, Inventory, Pause_Menu)." },
+        { "PSMCT24_CUTSCENE_ONLY", "PSMCT24 only in First_Cutscene + First_Gameplay (24-bit textures)." },
+        { "PSMT4_PAUSE_INV_ONLY",  "PSMT4 (PSM 20) only in Inventory + Pause_Menu (regular 4bpp CLUT, not Z-alias)." },
+        { "EZMIDI_RPC_BURST_ONLY", "ezMidi rpcNum=0x20 fires ~77 times in first 5s then 5 in next 25s - finite boot burst, not idle loop." },
+        { "PATH3_PRIMARY_PIPE",    "Path3 is the only active GIF pipe. Every kick must originate from CHCR write or sceDmaSend SDK wrapper." },
+        { "GAME_DISPATCHER_ONE_FN","Game-thread dispatcher fires entry_0x100008 exactly once and never returns. CPU-bound inside inlined MainLoop." },
+    };
+
+    // v9 Rule 134: pre-computed forward callgraphs to bullseye sinks. Each
+    // chain: {tag, [stations]} where stations are name fragments. Report tool
+    // can mark every intermediate function with the chain it participates in.
+    private static final Object[][] DC2_CALL_CHAINS = {
+        // tag,                      stations (in order, name fragments)
+        { "save_to_map_load", new String[]{
+            "TitleModeKey","MenuCheckPushButton","ConvertCheckPushButton",
+            "MenuMain","MenuNewGame","CSave","CMemoryCardManager",
+            "CreateMap","LoadMapFile","LoadFile2","LoadMapFromMemory",
+            "ReloadTexture","mgLoadImage","sceGifPkRefLoadImage"
+        }},
+        { "title_to_menu", new String[]{
+            "TitleInit","TitleModeKey","MenuCheckPushButton","ConvertCheckPushButton",
+            "TitlePhase","TitleMapDraw","mgCCameraFollow","sceVu0CameraMatrix"
+        }},
+        { "texture_upload", new String[]{
+            "ReloadTexture","mgLoadImage","sceGifPkRefLoadImage",
+            "makeGiftagAplusD","closePacketGifTag","sceGifSendChain","sceDmaSend"
+        }},
+        { "frame_loop", new String[]{
+            "entry","main","MainLoop","sceGsSyncV","WaitForNextVSyncTick",
+            "UpDate","RunScript","mgEndFrame","sceGsSwapDBuff","mgFlipDrawEnv"
+        }},
+        { "render_chain", new String[]{
+            "TitleModeDraw","TitleMapDraw","PrimQuad","SetSpriteEnv",
+            "Begin__11mgCDrawPrim","Texture__11mgCDrawPrim","Color__11mgCDrawPrim",
+            "End__11mgCDrawPrim","mgEndFrame"
+        }},
+        { "ipu_mpeg_fmv", new String[]{
+            "sceMpeg","sceIpu","dmaRefImage","sceMpegInit","sceIpuSetThreshold"
+        }},
+        { "iop_ezmidi_rpc", new String[]{
+            "sceSifBindRpc","sceSifCallRpc","handleEzMidiRpc","sceSifInitRpc"
+        }},
+    };
+
+    // v9 Rule 135: working DC2_PAD_INPUT scripts from F40/F42/F46 fix logs.
+    // Format: {tag, script, frame_anchor, observed_effect}.
+    private static final String[][] DC2_PAD_INPUT_SCRIPTS = {
+        { "F40_baseline_smoke",       "1:Start",                                                   "mgEndFrame=1",   "single inject at boot frame; baseline only" },
+        { "F41_R1_title_confirm",     "30..39:R1",                                                 "mgEndFrame=30",  "R1 -> MenuCheckPushButton ret=0x10 -> TitlePhase 0->1; 3x PPM brightness" },
+        { "F42_menu_progression",     "200:R1;320:R1;440:R1;560:R1;680:R1;800:R1",                 "mgEndFrame=200", "drives TitleModeKey->MenuMain->MenuNewGame; [F39:lf2] count=41; map/map1.cfg + def.sky hits" },
+        { "F46_canonical_sweep",      "30..39:R1;120..129/160..169/190..199/220..229/260..269:Cross", "mgEndFrame=30","canonical menu sequence; [F40:inject]=10 frames 30-39 only" },
+        { "F46_calibration_probe",    "1..120:R1",                                                 "mgEndFrame=1",   "verifies injector fires; only frame 1 reachable in 30s window" },
+    };
+
+    // v9 Rule 124 / 125: IRX loader detection callees.
+    private static final Set<String> IRX_LOAD_CALLEES = new HashSet<>(Arrays.asList(
+        "sceSifLoadModule","sceSifLoadStartModule","sceSifLoadFileEx",
+        "SifLoadModule","SifLoadStartModule"
+    ));
+    private static final Set<String> IOP_REBOOT_CALLEES = new HashSet<>(Arrays.asList(
+        "sceSifRebootIop","SifRebootIop","sceSifInitIopHeap"
+    ));
+
+    // v9 Rule 126: DC2 render frame entry name fragments.
+    private static final String[] RENDER_FRAME_ENTRY_FRAGMENTS = {
+        "mgEndFrame","mgBeginFrame","mgEndDraw","mgBeginDraw",
+        "mgFlipDrawEnv","mgVSyncWait","mgSwapDBuff","mgEndDrawReload"
+    };
+
+    // v9 Rule 119 / extended MMIO ranges (E1-E3 from General v11).
+    private static final long SBUS_MSFLG          = 0x1000F220L;
+    private static final long SBUS_SMFLG          = 0x1000F230L;
+    private static final long RCNT_RANGE_START    = 0x10000000L;
+    private static final long RCNT_RANGE_END      = 0x10001FFFL;
+    private static final long VIF0_CTRL_START     = 0x10003800L;
+    private static final long VIF0_CTRL_END       = 0x10003BFFL;
+    private static final long VIF1_CTRL_START     = 0x10003C00L;
+    private static final long VIF1_CTRL_END       = 0x10003FFFL;
+    private static final long DMAC_GLOBAL_START   = 0x1000E000L;
+    private static final long DMAC_GLOBAL_END     = 0x1000E0FFL;
+    private static final long INTC_STAT_ADDR      = 0x1000F000L;
+    private static final long INTC_MASK_ADDR      = 0x1000F010L;
+    private static final long SIO_RANGE_START     = 0x1000F100L;
+    private static final long SIO_RANGE_END       = 0x1000F1FFL;
+    private static final long DMAC_EXT_START      = 0x1000F500L;
+    private static final long DMAC_EXT_END        = 0x1000F5FFL;
+    private static final long DMA_CHCR_START_CONST = 0x101L; // STR | TIE
+
+    // v9 Rule 120: EE syscall imm -> canonical name (db-syscalls.md / ps2tek).
+    private static final Map<Long,String> EE_SYSCALL_NAMES = new HashMap<>();
+    static {
+        EE_SYSCALL_NAMES.put(0x01L, "ResetEE");
+        EE_SYSCALL_NAMES.put(0x02L, "SetGsCrt");
+        EE_SYSCALL_NAMES.put(0x04L, "Exit");
+        EE_SYSCALL_NAMES.put(0x06L, "LoadExecPS2");
+        EE_SYSCALL_NAMES.put(0x07L, "ExecPS2");
+        EE_SYSCALL_NAMES.put(0x10L, "AddIntcHandler");
+        EE_SYSCALL_NAMES.put(0x11L, "RemoveIntcHandler");
+        EE_SYSCALL_NAMES.put(0x12L, "AddDmacHandler");
+        EE_SYSCALL_NAMES.put(0x13L, "RemoveDmacHandler");
+        EE_SYSCALL_NAMES.put(0x14L, "_EnableIntc");
+        EE_SYSCALL_NAMES.put(0x15L, "_DisableIntc");
+        EE_SYSCALL_NAMES.put(0x16L, "_EnableDmac");
+        EE_SYSCALL_NAMES.put(0x17L, "_DisableDmac");
+        EE_SYSCALL_NAMES.put(0x18L, "SetAlarm");
+        EE_SYSCALL_NAMES.put(0x19L, "ReleaseAlarm");
+        EE_SYSCALL_NAMES.put(0x20L, "CreateThread");
+        EE_SYSCALL_NAMES.put(0x21L, "DeleteThread");
+        EE_SYSCALL_NAMES.put(0x22L, "StartThread");
+        EE_SYSCALL_NAMES.put(0x23L, "ExitThread");
+        EE_SYSCALL_NAMES.put(0x24L, "ExitDeleteThread");
+        EE_SYSCALL_NAMES.put(0x25L, "TerminateThread");
+        EE_SYSCALL_NAMES.put(0x29L, "ChangeThreadPriority");
+        EE_SYSCALL_NAMES.put(0x2BL, "RotateThreadReadyQueue");
+        EE_SYSCALL_NAMES.put(0x2DL, "ReleaseWaitThread");
+        EE_SYSCALL_NAMES.put(0x2FL, "GetThreadId");
+        EE_SYSCALL_NAMES.put(0x30L, "ReferThreadStatus");
+        EE_SYSCALL_NAMES.put(0x32L, "SleepThread");
+        EE_SYSCALL_NAMES.put(0x33L, "WakeupThread");
+        EE_SYSCALL_NAMES.put(0x34L, "iWakeupThread");
+        EE_SYSCALL_NAMES.put(0x35L, "CancelWakeupThread");
+        EE_SYSCALL_NAMES.put(0x37L, "SuspendThread");
+        EE_SYSCALL_NAMES.put(0x38L, "iSuspendThread");
+        EE_SYSCALL_NAMES.put(0x39L, "ResumeThread");
+        EE_SYSCALL_NAMES.put(0x3CL, "InitMainThread");
+        EE_SYSCALL_NAMES.put(0x3DL, "InitHeap");
+        EE_SYSCALL_NAMES.put(0x3EL, "EndOfHeap");
+        EE_SYSCALL_NAMES.put(0x40L, "CreateSema");
+        EE_SYSCALL_NAMES.put(0x41L, "DeleteSema");
+        EE_SYSCALL_NAMES.put(0x42L, "SignalSema");
+        EE_SYSCALL_NAMES.put(0x43L, "iSignalSema");
+        EE_SYSCALL_NAMES.put(0x44L, "WaitSema");
+        EE_SYSCALL_NAMES.put(0x45L, "PollSema");
+        EE_SYSCALL_NAMES.put(0x46L, "iPollSema");
+        EE_SYSCALL_NAMES.put(0x47L, "ReferSemaStatus");
+        EE_SYSCALL_NAMES.put(0x48L, "iReferSemaStatus");
+        EE_SYSCALL_NAMES.put(0x64L, "FlushCache");
+        EE_SYSCALL_NAMES.put(0x66L, "GsGetIMR");
+        EE_SYSCALL_NAMES.put(0x67L, "GsPutIMR");
+        EE_SYSCALL_NAMES.put(0x68L, "SetVSyncFlag");
+        EE_SYSCALL_NAMES.put(0x70L, "GsGetIMR");
+        EE_SYSCALL_NAMES.put(0x71L, "GsPutIMR");
+        EE_SYSCALL_NAMES.put(0x73L, "SetSyscall");
+        EE_SYSCALL_NAMES.put(0x76L, "SifDmaStat");
+        EE_SYSCALL_NAMES.put(0x77L, "SifSetDma");
+        EE_SYSCALL_NAMES.put(0x78L, "SifSetDChain");
+        EE_SYSCALL_NAMES.put(0x79L, "SifSetReg");
+        EE_SYSCALL_NAMES.put(0x7AL, "SifGetReg");
+        EE_SYSCALL_NAMES.put(0x7BL, "ExecOSD");
+        EE_SYSCALL_NAMES.put(0x7CL, "Deci2Call");
+        EE_SYSCALL_NAMES.put(0x7DL, "PSMode");
+        EE_SYSCALL_NAMES.put(0x7EL, "MachineType");
+        EE_SYSCALL_NAMES.put(0x7FL, "GetMemorySize");
+    }
+
+    // v9 Rule 137: tag priority for TOML comment generation (higher = printed first).
+    private static final Map<String,Integer> TAG_PRIORITY = new HashMap<>();
+    static {
+        // Tier-0 blocker tags
+        TAG_PRIORITY.put("TOP_PRIORITY_FIX", 1000);
+        TAG_PRIORITY.put("BITBLTBUF_T4HH_UPLOADER", 950);
+        TAG_PRIORITY.put("CTOR_RISK_CRITICAL", 940);
+        TAG_PRIORITY.put("DRAWING_CHAIN_NEAR_ROOT", 930);
+        TAG_PRIORITY.put("CTOR_MULTI_FIELD_INITIALIZER", 920);
+        TAG_PRIORITY.put("LIFECYCLE_LAZY_INIT_GUARD", 910);
+        TAG_PRIORITY.put("ASSET_UPLOAD_BULLSEYE", 900);
+        TAG_PRIORITY.put("RENDER_FRAME_ENTRY", 890);
+        TAG_PRIORITY.put("PATH3_INITIATOR", 880);
+        TAG_PRIORITY.put("PATH3_KICK_VIA_DMA_API", 870);
+        TAG_PRIORITY.put("IS_SCE_GIF_PK_REF_LOAD_IMAGE", 860);
+        TAG_PRIORITY.put("DMA_CHCR_START_KICK", 850);
+        TAG_PRIORITY.put("GIF_NLOOP_DOUBLE_COUNT_RISK", 840);
+        TAG_PRIORITY.put("DC2_HOST_WAIT_CANDIDATE", 830);
+        TAG_PRIORITY.put("VTABLE_SETTER", 820);
+        TAG_PRIORITY.put("CTOR_RISK_HIGH", 810);
+        TAG_PRIORITY.put("LIBGCC_INTRINSIC", 800);
+        TAG_PRIORITY.put("MICROCODE_UPLOADER", 790);
+        TAG_PRIORITY.put("FRAME_CLOCK_DRIVER", 780);
+        TAG_PRIORITY.put("BACKWARD_BRANCH_SYNC_WAIT", 770);
+        TAG_PRIORITY.put("INFINITE_FAIL_LOOP", 760);
+        TAG_PRIORITY.put("INFINITE_SPIN_LOOP", 750);
+        TAG_PRIORITY.put("Z_BUFFER_ALIAS_RISK", 740);
+        TAG_PRIORITY.put("GIF_PATH3_HAZARD", 730);
+        TAG_PRIORITY.put("BITBLTBUF_MACRO_SEQUENCE", 720);
+        TAG_PRIORITY.put("GIF_TAG_INLINE_BUILDER", 710);
+        TAG_PRIORITY.put("DMA_SOURCE_CHAIN_TAG_BUILDER", 700);
+        TAG_PRIORITY.put("VIF_MPG_OPCODE_BUILDER", 690);
+        TAG_PRIORITY.put("VIF_MSCAL_OPCODE_BUILDER", 685);
+        TAG_PRIORITY.put("VIF_DIRECT_OPCODE_BUILDER", 680);
+        TAG_PRIORITY.put("VIF_UNPACK_OPCODE_BUILDER", 670);
+        TAG_PRIORITY.put("DMA_TAG_BUILDER", 660);
+        TAG_PRIORITY.put("PSMT4HH_REFERENCE", 650);
+        TAG_PRIORITY.put("DISPFB_WRITER", 640);
+        TAG_PRIORITY.put("DISPFB_SDK_WRITER", 635);
+        TAG_PRIORITY.put("INDIRECT_CALL_T9", 600);
+        TAG_PRIORITY.put("TAIL_CALL_INDIRECT", 580);
+        TAG_PRIORITY.put("MPEG_DECODER_TRAP", 560);
+        TAG_PRIORITY.put("IOP_RPC_DISPATCH", 540);
+        TAG_PRIORITY.put("IRX_LOADER", 520);
+        TAG_PRIORITY.put("ARCHIVE_IO", 500);
+        TAG_PRIORITY.put("MC_TRANSITION_GATE", 480);
+        TAG_PRIORITY.put("PAD_BUTTON_MASK_CONSUMER", 460);
+        TAG_PRIORITY.put("PAD_POLL_LOOP", 440);
+        TAG_PRIORITY.put("THREAD_SYNC_POINT", 420);
+        TAG_PRIORITY.put("SBUS_IOP_COMM_TOUCHER", 400);
+        TAG_PRIORITY.put("MESWIN_LOADER", 380);
+        TAG_PRIORITY.put("DMA_KICK_PATTERN", 360);
+        TAG_PRIORITY.put("DMA_QWC_TADR_WRITER", 340);
     }
 
     // Rule 23: Archive I/O string patterns (Phase F6)
@@ -739,8 +1147,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // Each entry: {tag, dpsm, dbp, phase, hint}.
     private static final Object[][] EXPECTED_UPLOADS = {
         // tag,             dpsm, dbp,     phase,          hint
-        { "T8_TEXTURE",     0x13, 0x2720L, "F43_T8",       "CScene::LoadMapFromMemory map texture" },
-        { "FONT_T4HH",      0x2CL,0x10E0L, "F32_FONT_4HH", "sceGifPkRefLoadImage font upload" }
+        { "T8_TEXTURE",     0x13, 0x2720L, "F43_T8",       "CScene::LoadMapFromMemory map texture - ACTIVE BLOCKER" },
+        { "FONT_T4HH",      0x2CL,0x10E0L, "F32_FONT_4HH", "sceGifPkRefLoadImage font upload - F37 fixed NLOOP" },
+        { "CLUT_T4HH",      0x00, 0x3FDCL, "F37_CLUT",     "PSMCT32 CLUT companion to font 4HH" },
+        // Per dc2_runtime_invariants: PSMT4 is regular 4bpp (not Z-alias) in Inventory + Pause only
+        { "INV_PAUSE_T4",   0x14, 0x10E0L, "F46_INV",      "Inventory/Pause PSMT4 CLUT-indexed texture" },
+        // PSMCT24 only in First_Cutscene + First_Gameplay
+        { "CUTSCENE_24BPP", 0x01, 0x2720L, "F47_CUT",      "PSMCT24 cutscene texture upload (post-map-load)" },
+        // HUD/font cache - stable 24-page block in every scene
+        { "HUD_FONT_CACHE", 0x13, 0x3F9CL, "F47_HUD",      "HUD font cache base page 16284 (T8)" },
     };
     // Sets derived from EXPECTED_UPLOADS for cheap membership tests in scan.
     private static final Set<Long> EXPECTED_DBP_SET = new LinkedHashSet<>();
@@ -1060,6 +1475,71 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // statistics so SDK-wrapped accesses still show in counts).
         boolean dispfbWriterViaSdkCallerDepth1 = false;
         boolean dmaKickViaSdkCallerDepth1 = false;
+
+        // ===== v9 fields (DC2 retrospective + General v11/v12 ports) =====
+        // Rule 113
+        boolean gifTagInlineBuilder = false;
+        Set<Long>   gifTagRegsFields = new LinkedHashSet<>();
+        Set<Long>   gifTagNloops     = new LinkedHashSet<>();
+        Set<String> gifTagFlags      = new LinkedHashSet<>();
+        // Rule 114
+        boolean bitbltbufMacroSequence = false;
+        // Rule 115
+        boolean loadsChcrStartConst = false;
+        boolean dmaChcrStartKick    = false;
+        // Rule 116
+        boolean dmaSourceChainTagBuilder = false;
+        Set<String> dmaSourceChainTagIds = new LinkedHashSet<>();
+        // Rule 117 / 118
+        Set<String> storedVifOpcodes  = new LinkedHashSet<>();
+        Set<String> storedDmaTagIds   = new LinkedHashSet<>();
+        // Rule 119
+        Set<String> compositeMmioRangesHit = new LinkedHashSet<>();
+        boolean accessesRcnt        = false;
+        boolean accessesVifCtrl     = false;
+        boolean accessesDmacGlobal  = false;
+        boolean writesIntcMask      = false;
+        boolean readsIntcStat       = false;
+        boolean accessesSio         = false;
+        boolean writesDmacEnable    = false;
+        boolean touchesSbusFlags    = false;
+        // Rule 120
+        String  inferredName        = null;
+        long    inferredSyscallImm  = -1L;
+        // Rule 121
+        boolean isSyncWaitLoop      = false;
+        boolean dc2HostWaitCandidate = false;
+        // Rule 122 / 123
+        boolean isInfiniteSpinLoop  = false;
+        boolean containsInfiniteFailLoop = false;
+        // Rule 124 / 125
+        int     sifLoadModuleCallCount = 0;
+        boolean isIrxLoader         = false;
+        boolean isIopRebootHandler  = false;
+        Set<String> irxModulePaths  = new LinkedHashSet<>();
+        // Rule 126
+        boolean isRenderFrameEntry  = false;
+        // Rule 127
+        boolean isStructInitializer = false;
+        // Rule 128
+        String  inferredClassName   = null;
+        int     inferredVtableSlot  = -1;
+        Set<String> tableDispatchSites = new LinkedHashSet<>();
+        // Rule 129
+        int     moduleId            = -1;
+        // Rule 131
+        String  dc2KnownRole        = null;
+        String  dc2KnownPhase       = null;
+        String  dc2KnownCriticality = null;
+        // Rule 134: tags marking participation in pre-computed DC2 call chains
+        Set<String> dc2CallChainsTagged = new LinkedHashSet<>();
+        // Rule 139: SIDs / FIDs discovered via composite lui+ori before sceSifCallRpc
+        Set<Long> discoveredRpcSids  = new LinkedHashSet<>();
+        Set<Long> discoveredRpcFids2 = new LinkedHashSet<>();
+        // const loads captured for table-dispatch resolution (Rule 128)
+        List<long[]> constLoads = new ArrayList<>();
+        // R20: patch candidate PCs (BACKWARD_BRANCH_SYNC_WAIT / INFINITE_FAIL_LOOP)
+        List<Long> patchCandidatePcs = new ArrayList<>();
     }
 
     // =========================================================
@@ -1161,6 +1641,33 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // Auto-extended DC2 gp globals discovered via return-to-global tracking.
     // Address -> guessed-name (class name where available, else "g_unk_<addr>").
     private Map<Long,String> autoExtendedDc2Globals = new LinkedHashMap<>();
+
+    // v9 counters
+    private int gifTagInlineBuilderCount = 0;
+    private int bitbltbufMacroSeqCount   = 0;
+    private int dmaChcrStartKickCount    = 0;
+    private int dmaSourceChainBuilderCount = 0;
+    private int compositeMmioRecoveryCount = 0;
+    private int syscallTrampolineCount    = 0;
+    private int backwardSyncWaitCount     = 0;
+    private int infiniteSpinLoopCount     = 0;
+    private int infiniteFailLoopCount     = 0;
+    private int irxLoaderCount            = 0;
+    private int iopRebootHandlerCount     = 0;
+    private int renderFrameEntryCount     = 0;
+    private int structInitializerCount    = 0;
+    private int dispatchTableTargetCount  = 0;
+    private int tableDispatchCallCount    = 0;
+    private int dc2HostWaitCandidateCount = 0;
+    private int dc2KnownAddressMatched    = 0;
+    private int discoveredRpcSidCount     = 0;
+    // Top-level discoveries
+    private Map<Long, List<long[]>> functionPointerTables = new LinkedHashMap<>();
+    private Map<Integer, Set<Long>> moduleClusters       = new LinkedHashMap<>();
+    private Map<String, List<Long>> namePrefixModules    = new LinkedHashMap<>();
+    // address -> set of caller addresses (for discovered_iop_sids)
+    private Map<Long, Set<Long>> discoveredSidToCallers  = new LinkedHashMap<>();
+    private Map<Long, Set<Long>> discoveredFidToCallers  = new LinkedHashMap<>();
     // Rule 93 class registry: class name -> aggregated info.
     private Map<String, ClassEntry> classRegistry = new LinkedHashMap<>();
     // Rule 103 asset upload traces: tag -> list of (funcAddr, funcName) + callers.
@@ -1614,9 +2121,78 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 if (!traits.dmaTagIdsBuilt.isEmpty())
                     {tags.add("DMA_TAG_BUILDER");dmaTagBuilderCount++;}
 
-                // Rule 56 (v5, extended by v6): derived top-priority bullseye.
-                // v6 adds: WRITES_IPU_CMD, GIF_PATH3_REG_TOUCHER, PSMT4HH_REFERENCE,
-                // VIF_MPG_OPCODE_BUILDER (microcode upload bullseye).
+                // ===== v9 tags =====
+                if (traits.gifTagInlineBuilder) {
+                    tags.add("GIF_TAG_INLINE_BUILDER"); gifTagInlineBuilderCount++;
+                }
+                if (traits.bitbltbufMacroSequence) {
+                    if(!tags.contains("BITBLTBUF_MACRO_SEQUENCE"))
+                        tags.add("BITBLTBUF_MACRO_SEQUENCE");
+                    bitbltbufMacroSeqCount++;
+                }
+                if (traits.dmaChcrStartKick) {
+                    tags.add("DMA_CHCR_START_KICK"); dmaChcrStartKickCount++;
+                }
+                if (traits.dmaSourceChainTagBuilder) {
+                    tags.add("DMA_SOURCE_CHAIN_TAG_BUILDER"); dmaSourceChainBuilderCount++;
+                }
+                if (!traits.storedVifOpcodes.isEmpty()) {
+                    tags.add("VIF_TAG_STORED_IMMEDIATE");
+                    if (traits.storedVifOpcodes.contains("MPG") &&
+                        !tags.contains("VIF_MPG_OPCODE_BUILDER"))
+                        tags.add("VIF_MPG_OPCODE_BUILDER");
+                    if ((traits.storedVifOpcodes.contains("MSCAL") ||
+                         traits.storedVifOpcodes.contains("MSCALF") ||
+                         traits.storedVifOpcodes.contains("MSCNT")) &&
+                        !tags.contains("VIF_MSCAL_OPCODE_BUILDER"))
+                        tags.add("VIF_MSCAL_OPCODE_BUILDER");
+                }
+                if (!traits.storedDmaTagIds.isEmpty())
+                    tags.add("DMA_TAG_STORED_IMMEDIATE");
+                if (!traits.compositeMmioRangesHit.isEmpty()) {
+                    tags.add("COMPOSITE_MMIO_RECOVERED");
+                    compositeMmioRecoveryCount++;
+                }
+                if (traits.inferredSyscallImm > 0) {
+                    tags.add("SYSCALL_TRAMPOLINE"); syscallTrampolineCount++;
+                }
+                if (traits.isSyncWaitLoop) {
+                    tags.add("BACKWARD_BRANCH_SYNC_WAIT"); backwardSyncWaitCount++;
+                    // F24/F27 host-wait class marker for the report tool.
+                    if (mainLoopShield.contains(offset)) {
+                        tags.add("DC2_HOST_WAIT_CANDIDATE");
+                        traits.dc2HostWaitCandidate = true;
+                        dc2HostWaitCandidateCount++;
+                    }
+                }
+                if (traits.isInfiniteSpinLoop) {
+                    tags.add("INFINITE_SPIN_LOOP"); infiniteSpinLoopCount++;
+                }
+                if (traits.containsInfiniteFailLoop) {
+                    tags.add("INFINITE_FAIL_LOOP"); infiniteFailLoopCount++;
+                }
+                if (traits.isIrxLoader) {
+                    tags.add("IRX_LOADER"); irxLoaderCount++;
+                }
+                if (traits.isIopRebootHandler) {
+                    tags.add("IOP_REBOOT_HANDLER"); iopRebootHandlerCount++;
+                }
+                if (traits.isRenderFrameEntry) {
+                    tags.add("RENDER_FRAME_ENTRY"); renderFrameEntryCount++;
+                }
+                if (traits.isStructInitializer) {
+                    tags.add("STRUCT_INITIALIZER"); structInitializerCount++;
+                }
+                if (traits.dc2KnownRole != null) {
+                    tags.add("DC2_KNOWN_ROLE_" + traits.dc2KnownRole.toUpperCase());
+                    if ("BLOCKER".equals(traits.dc2KnownCriticality))
+                        tags.add("DC2_BLOCKER_REF");
+                }
+                if (!traits.discoveredRpcSids.isEmpty()) {
+                    tags.add("DISCOVERED_IOP_SID"); discoveredRpcSidCount++;
+                }
+
+                // Rule 56 (v5, extended by v6, v9): derived top-priority bullseye.
                 if (traits.isSceGifPkRefLoadImage || traits.path3Initiator ||
                     traits.path3KickViaDmaApi || traits.writesDispfbViaSdk ||
                     traits.isBitbltbufT4hhUploader ||
@@ -1624,7 +2200,10 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     traits.writesGsPrimReg || traits.touchesGifCtrl ||
                     traits.callsMpegFamily || traits.writesIpuCmd ||
                     traits.touchesGifP3Reg || traits.loadsPsm4hhConstant ||
-                    traits.vifOpcodesBuilt.contains("MPG")) {
+                    traits.vifOpcodesBuilt.contains("MPG") ||
+                    traits.bitbltbufMacroSequence || traits.dmaChcrStartKick ||
+                    traits.dmaSourceChainTagBuilder || traits.isRenderFrameEntry ||
+                    "BLOCKER".equals(traits.dc2KnownCriticality)) {
                     traits.isTopPriorityFix = true;
                     if(!tags.contains("TOP_PRIORITY_FIX")) {
                         tags.add("TOP_PRIORITY_FIX");
@@ -1774,7 +2353,26 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 println("  v7 post: GS evidence empty — corroboration skipped.");
             }
 
-            writeUnifiedConfig(unifiedToml,configToml,newStubs,newSkips);
+            // ===== v9 post-passes =====
+            // Rule 128 function pointer tables (must run BEFORE module clusters
+            // so any discovered vtables seed the inferredClassName).
+            scanFunctionPointerTables(results, resultsByAddr);
+            // Rule 129 module clustering on jal edges
+            assignModuleIds(results);
+            // Rule 130 name-prefix module index
+            buildNamePrefixModules(results);
+            // Rule 134 tag DC2 call chain participants
+            tagDc2CallChains(results);
+            println(String.format("  v9 post: GIF_INLINE=%d BITBLTBUF_MACRO=%d CHCR_KICK=%d DMA_SRC_CHAIN=%d MMIO_RECOVERED=%d SYSCALL_TR=%d SYNC_WAIT=%d INF_SPIN=%d INF_FAIL=%d IRX=%d REBOOT=%d RENDER_ENTRY=%d STRUCT_INIT=%d DISPATCH_TGT=%d TABLE_CALL=%d HOST_WAIT=%d DC2_KNOWN=%d DISC_SIDS=%d FPT_TABLES=%d MODULES=%d PREFIXES=%d",
+                gifTagInlineBuilderCount, bitbltbufMacroSeqCount, dmaChcrStartKickCount,
+                dmaSourceChainBuilderCount, compositeMmioRecoveryCount, syscallTrampolineCount,
+                backwardSyncWaitCount, infiniteSpinLoopCount, infiniteFailLoopCount,
+                irxLoaderCount, iopRebootHandlerCount, renderFrameEntryCount,
+                structInitializerCount, dispatchTableTargetCount, tableDispatchCallCount,
+                dc2HostWaitCandidateCount, dc2KnownAddressMatched, discoveredRpcSidCount,
+                functionPointerTables.size(), moduleClusters.size(), namePrefixModules.size()));
+
+            writeUnifiedConfig(unifiedToml,configToml,newStubs,newSkips,results,resultsByAddr);
             // v8 Rule 109: diff against prior triage_map.json if present.
             // Renames the old file to triage_map.prev.json before overwriting.
             File priorJson = new File(outputDir, "triage_map.json");
@@ -3751,6 +4349,40 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             detectFilePathSprintfFormats(func, traits);
         }
 
+        // ===== v9 detector pipeline =====
+        // Rule 113 GIFtag inline builder + R117/R118 stored opcode capture
+        detectGifTagInlineBuilder(func, traits);
+        // Rule 114 BITBLTBUF macro sequence — sharper than raw GS reg writes
+        detectBitbltbufSequence(func, traits);
+        // Rule 115 DMA CHCR start kick — Path3 starter
+        detectDmaChcrStartKick(func, traits);
+        // Rule 116 DMA source-chain tag builder
+        detectDmaSourceChainTagBuilder(func, traits);
+        // Rule 119 composite MMIO recovery — catches hidden lui+ori MMIO writes
+        detectCompositeMmioConsts(func, traits);
+        // Rule 120 syscall trampoline — names anonymous syscall stubs
+        if(traits.hasSyscall && traits.byteSize <= 64)
+            detectSyscallTrampoline(func, traits);
+        // Rule 121 sync-wait loop class
+        detectSyncWaitLoop(func, traits);
+        // Rule 122/123 infinite spin / fail loop
+        if(traits.byteSize <= 600)
+            detectInfiniteLoops(func, traits);
+        // Rule 124/125 IRX loader + IOP reboot handler
+        detectIrxLoaderShape(func, traits);
+        // Rule 126 render frame entry name match
+        detectRenderFrameEntry(fname, traits);
+        // Rule 127 non-ctor struct initializer
+        detectStructInitializer(func, traits);
+        // Rule 131 stamp DC2 hardcoded role
+        stampDc2KnownRole(func.getEntryPoint().getOffset() & 0xFFFFFFFFL, traits);
+        // Rule 139 discovered SIDs / FIDs
+        if(traits.callsSifRpc) detectDiscoveredSidsFids(func, traits);
+
+        // Update BITBLTBUF_T4HH_UPLOADER after v9 BITBLTBUF macro detection.
+        if(traits.bitbltbufMacroSequence && traits.loadsPsm4hhConstant)
+            traits.isBitbltbufT4hhUploader = true;
+
         cache.put(key,traits);
         return traits;
     }
@@ -3989,6 +4621,896 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     }
 
     // =========================================================
+    // v9 DETECTORS (ported from General v11/v12)
+    // =========================================================
+
+    // v9 Rule 113: GIFtag inline builder. 4-stride store cluster (0/8/0x10/0x18)
+    // to same base + per-reg lui+ori composite tracking for embedded GIFtag
+    // REGS/FLG/NLOOP encoding. Also feeds Rule 117/118 stored-immediate captures.
+    private void detectGifTagInlineBuilder(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String, Set<Long>> baseOffsets = new HashMap<>();
+        Map<String, Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
+            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                String src = null; long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(!rn.equalsIgnoreCase(dr)) src = rn;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(dr != null && src != null && regConsts.containsKey(src))
+                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
+            } else if(mll.equals("li")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            } else if(mll.equals("sw") || mll.equals("sd") || mll.equals("sq")) {
+                Object[] dop = inst.getOpObjects(0);
+                Object[] aop = inst.getOpObjects(1);
+                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                String base = null; long off = -1;
+                if(aop != null) for(Object o : aop) {
+                    if(o instanceof ghidra.program.model.lang.Register)
+                        base = ((ghidra.program.model.lang.Register)o).getName();
+                    else if(o instanceof ghidra.program.model.scalar.Scalar)
+                        off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                }
+                // R117/R118 stored VIF/DMA tag immediates.
+                if(src != null && regConsts.containsKey(src) && off >= 0 && (off % 4) == 0) {
+                    long sval = regConsts.get(src) & 0xFFFFFFFFL;
+                    long hb = (sval >> 24) & 0xFFL;
+                    String vn = VIF_OPCODES.get(hb);
+                    if(vn != null) traits.storedVifOpcodes.add(vn);
+                    if(hb >= 0x60L && hb <= 0x7FL) traits.storedVifOpcodes.add("UNPACK");
+                    if(hb >= 0x10L) {
+                        long tp = hb & 0xF0L;
+                        String dn = DMA_TAG_IDS.get(tp);
+                        if(dn != null) traits.storedDmaTagIds.add(dn);
+                    }
+                    // Const-load capture for table-dispatch resolution.
+                    if(traits.constLoads.size() < 24)
+                        traits.constLoads.add(new long[]{ inst.getAddress().getOffset() & 0xFFFFFFFFL, sval });
+                }
+                if(base == null || off < 0 || off > 0x40) continue;
+                Set<Long> offsets = baseOffsets.computeIfAbsent(base, k -> new LinkedHashSet<>());
+                offsets.add(off);
+                if(src != null && regConsts.containsKey(src)) {
+                    long val = regConsts.get(src);
+                    long highByte = (val >> 24) & 0xFFL;
+                    long nloop = val & 0x7FFFL;
+                    if((highByte & 0x0FL) == 0x0EL || (val & 0xFFFFL) == 0x000EL) {
+                        traits.gifTagRegsFields.add(0x0EL);
+                        if(nloop > 0) traits.gifTagNloops.add(nloop);
+                    }
+                    long flg = (val >> 26) & 0x3L;
+                    if(flg == 0 && (val & 0xFFFF0000L) != 0) traits.gifTagFlags.add("PACKED");
+                    if(flg == 1) traits.gifTagFlags.add("REGLIST");
+                    if(flg == 2) traits.gifTagFlags.add("IMAGE");
+                }
+            }
+        }
+        for(Set<Long> offsets : baseOffsets.values()) {
+            boolean h0=false, h8=false, h10=false, h18=false;
+            for(Long o : offsets) {
+                if(o == 0L)    h0=true;
+                if(o == 8L)    h8=true;
+                if(o == 0x10L) h10=true;
+                if(o == 0x18L) h18=true;
+            }
+            int cnt = (h0?1:0)+(h8?1:0)+(h10?1:0)+(h18?1:0);
+            if(cnt >= 3) { traits.gifTagInlineBuilder = true; break; }
+        }
+    }
+
+    // v9 Rule 114: BITBLTBUF macro sequence. Const-tracked store of 0x50/0x51/
+    // 0x52/0x53 (BITBLTBUF/TRXPOS/TRXREG/TRXDIR A+D ids) in same function.
+    private void detectBitbltbufSequence(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        boolean s50=false,s51=false,s52=false,s53=false;
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            } else if(mll.equals("sw") || mll.equals("sd") || mll.equals("sq")) {
+                Object[] dop = inst.getOpObjects(0);
+                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                if(src != null && regConsts.containsKey(src)) {
+                    long v = regConsts.get(src);
+                    if(v == 0x50L) s50 = true;
+                    if(v == 0x51L) s51 = true;
+                    if(v == 0x52L) s52 = true;
+                    if(v == 0x53L) s53 = true;
+                }
+            }
+        }
+        if(s50 && s51 && s52 && s53) {
+            traits.bitbltbufMacroSequence = true;
+            traits.writesBitbltbufReg = true;
+        }
+    }
+
+    // v9 Rule 115: DMA_CHCR_START_KICK. Loads const 0x101 (STR | TIE) AND
+    // touches a known DMA channel CHCR address.
+    private void detectDmaChcrStartKick(Function func, FuncTraits traits) {
+        boolean loaded101 = false;
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm == DMA_CHCR_START_CONST) {
+                    regConsts.put(dr, imm); loaded101 = true;
+                }
+            }
+        }
+        traits.loadsChcrStartConst = loaded101;
+        if(loaded101 && !traits.dmaKickChannels.isEmpty())
+            traits.dmaChcrStartKick = true;
+    }
+
+    // v9 Rule 116: DMA source-chain tag builder. Stores const with high nibble
+    // matching CNT/REF/REFS/CALL/RET/END at offset 0 of any base.
+    private void detectDmaSourceChainTagBuilder(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
+            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                String src = null; long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(!rn.equalsIgnoreCase(dr)) src = rn;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(dr != null && src != null && regConsts.containsKey(src))
+                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
+            } else if(mll.equals("li")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            } else if(mll.equals("sw") || mll.equals("sd")) {
+                Object[] dop = inst.getOpObjects(0);
+                Object[] aop = inst.getOpObjects(1);
+                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                long off = -1;
+                if(aop != null) for(Object o : aop)
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                if(src != null && regConsts.containsKey(src) && off >= 0 && off <= 0x10) {
+                    long v = regConsts.get(src) & 0xFFFFFFFFL;
+                    long highByte = (v >> 24) & 0xFFL;
+                    String name = null;
+                    if(highByte == 0x70L)      name = "END";
+                    else if(highByte == 0x10L) name = "CNT";
+                    else if(highByte == 0x30L) name = "REF";
+                    else if(highByte == 0x40L) name = "REFS";
+                    else if(highByte == 0x50L) name = "CALL";
+                    else if(highByte == 0x60L) name = "RET";
+                    else if(highByte == 0x20L) name = "NEXT";
+                    if(name != null) {
+                        traits.dmaSourceChainTagBuilder = true;
+                        traits.dmaSourceChainTagIds.add(name);
+                    }
+                }
+            }
+        }
+    }
+
+    // v9 Rule 119: composite MMIO recovery. lui+ori|addiu|or per reg tracking,
+    // matched against every documented EE peripheral range. Sets the corresponding
+    // FuncTraits flag so existing tag/counter logic fires.
+    private void detectCompositeMmioConsts(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
+            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                String src = null; long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(!rn.equalsIgnoreCase(dr)) src = rn;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(dr != null && src != null && regConsts.containsKey(src))
+                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
+            } else if(mll.equals("li")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            }
+            for(Long vB : regConsts.values()) {
+                long v = vB & 0xFFFFFFFFL;
+                if(v == 0) continue;
+                matchMmioRange(v, traits);
+            }
+        }
+    }
+
+    /** Classify 32-bit composite address into a peripheral range and stamp the
+     *  matching FuncTraits flag. Idempotent via compositeMmioRangesHit. */
+    private void matchMmioRange(long addr, FuncTraits traits) {
+        long norm = addr & 0x1FFFFFFFL;
+        if((norm >= VU0_MICRO_START && norm <= VU0_MICRO_END) ||
+           (norm >= VU1_MICRO_START && norm <= VU1_MICRO_END)) {
+            if(traits.compositeMmioRangesHit.add("VU_MICROMEM"))
+                traits.accessesVuMicromem = true;
+        }
+        if((norm >= VU0_DATA_START && norm <= VU0_DATA_END) ||
+           (norm >= VU1_DATA_START && norm <= VU1_DATA_END)) {
+            if(traits.compositeMmioRangesHit.add("VU_DATAMEM"))
+                traits.accessesVuDatamem = true;
+        }
+        if(norm >= IPU_MMIO_START && norm < IPU_MMIO_END) {
+            traits.compositeMmioRangesHit.add("IPU_MMIO");
+            traits.accessesIpuMmio = true;
+            if(norm == IPU_CMD) traits.writesIpuCmd = true;
+        }
+        if(norm == GIF_P3CNT || norm == GIF_P3TAG) {
+            traits.compositeMmioRangesHit.add("GIF_P3_CTRL");
+            traits.touchesGifP3Reg = true;
+        }
+        if((norm >= GIF_CTRL_BASE && norm <= GIF_CTRL_END) ||
+           (norm >= GIF_CHCR_BASE && norm <= GIF_CHCR_END)) {
+            traits.compositeMmioRangesHit.add("GIF_CTRL");
+            traits.touchesGifCtrl = true;
+        }
+        if(norm >= GIF_FIFO_START && norm <= GIF_FIFO_END) {
+            traits.compositeMmioRangesHit.add("GIF_FIFO");
+            traits.writesGifFifo = true;
+        }
+        if(norm >= VIF1_FIFO_START && norm <= VIF1_FIFO_END) {
+            traits.compositeMmioRangesHit.add("VIF1_FIFO");
+            traits.writesVif1Fifo = true;
+        }
+        if(norm >= VIF0_FIFO_START && norm <= VIF0_FIFO_END) {
+            traits.compositeMmioRangesHit.add("VIF0_FIFO");
+            traits.writesVif0Fifo = true;
+        }
+        if(norm >= IPU_FIFO_START && norm <= IPU_FIFO_END) {
+            traits.compositeMmioRangesHit.add("IPU_FIFO");
+        }
+        if(norm >= VIF1_CHANNEL_BASE && norm <= VIF1_CHANNEL_END) {
+            traits.compositeMmioRangesHit.add("VIF1_CHANNEL");
+            traits.accessesVif1MMIO = true;
+        }
+        for(int chIdx=0; chIdx<DMA_CHANNEL_BASES.length; chIdx++) {
+            long base = DMA_CHANNEL_BASES[chIdx];
+            if(norm < base || norm > base + 0x3F) continue;
+            long slot = norm - base;
+            if(slot == 0x00)
+                traits.dmaKickChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+            else if(slot == 0x20 || slot == 0x30)
+                traits.dmaQwcTadrChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+            if(norm >= GIF_CHCR_BASE && norm <= GIF_CHCR_END)
+                traits.path3Initiator = true;
+            traits.compositeMmioRangesHit.add("DMA_CHAN_" + DMA_CHANNEL_NAMES[chIdx]);
+            break;
+        }
+        if(norm >= GS_PRIV_START && norm <= GS_PRIV_END) {
+            long off = norm - GS_PRIV_START;
+            String nm = KNOWN_GS_PRIV_REGS.get(off);
+            if(nm != null) {
+                traits.gsPrivRegHits.add(nm);
+                traits.compositeMmioRangesHit.add("GS_PRIV_" + nm);
+                if(off == 0x70L || off == 0x90L) traits.writesDispfbReg = true;
+            }
+        }
+        if(norm == SBUS_MSCOM || norm == SBUS_SMCOM) {
+            traits.compositeMmioRangesHit.add("SBUS_COM");
+            traits.touchesSbus = true;
+        }
+        if(norm == SBUS_MSFLG || norm == SBUS_SMFLG) {
+            traits.compositeMmioRangesHit.add("SBUS_FLAG");
+            traits.touchesSbusFlags = true;
+        }
+        if(norm >= RCNT_RANGE_START && norm <= RCNT_RANGE_END) {
+            traits.compositeMmioRangesHit.add("RCNT");
+            traits.accessesRcnt = true;
+        }
+        if((norm >= VIF0_CTRL_START && norm <= VIF0_CTRL_END) ||
+           (norm >= VIF1_CTRL_START && norm <= VIF1_CTRL_END)) {
+            traits.compositeMmioRangesHit.add("VIF_CTRL");
+            traits.accessesVifCtrl = true;
+        }
+        if(norm >= DMAC_GLOBAL_START && norm <= DMAC_GLOBAL_END) {
+            traits.compositeMmioRangesHit.add("DMAC_GLOBAL");
+            traits.accessesDmacGlobal = true;
+        }
+        if(norm == INTC_MASK_ADDR) {
+            traits.compositeMmioRangesHit.add("INTC_MASK");
+            traits.writesIntcMask = true;
+        }
+        if(norm == INTC_STAT_ADDR) {
+            traits.compositeMmioRangesHit.add("INTC_STAT");
+            traits.readsIntcStat = true;
+        }
+        if(norm >= SIO_RANGE_START && norm <= SIO_RANGE_END) {
+            traits.compositeMmioRangesHit.add("SIO");
+            traits.accessesSio = true;
+        }
+        if(norm >= DMAC_EXT_START && norm <= DMAC_EXT_END) {
+            traits.compositeMmioRangesHit.add("DMAC_EXT");
+            traits.writesDmacEnable = true;
+        }
+        if((norm >= MMIO_START && norm <= MMIO_END) ||
+           (norm >= MMIO_GS_START && norm <= MMIO_GS_END))
+            traits.accessesMMIO = true;
+        if(norm >= SPR_START && norm <= SPR_END)
+            traits.usesSPR = true;
+    }
+
+    // v9 Rule 120: syscall trampoline shape (addiu $v1,$zero,N; syscall; jr ra).
+    private void detectSyscallTrampoline(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        long syscallImm = -1L;
+        Map<String,Long> regConsts = new HashMap<>();
+        int count = 0;
+        while(it.hasNext() && count < 6) {
+            Instruction inst = it.next(); count++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr.toLowerCase(), imm);
+            } else if(mll.equals("syscall")) {
+                Long v1 = regConsts.get("v1");
+                if(v1 != null) syscallImm = v1 & 0xFFL;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        long s = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                        if(s > 0 && s <= 0xFFL) syscallImm = s;
+                    }
+                break;
+            }
+        }
+        if(syscallImm > 0) {
+            String nm = EE_SYSCALL_NAMES.get(syscallImm);
+            traits.inferredSyscallImm = syscallImm;
+            if(nm != null) traits.inferredName = nm;
+        }
+    }
+
+    // v9 Rule 122/123: 1-2 BB function whose only branch targets entry (spin).
+    // Plus: backward branch into break/syscall/nop-only block (fail loop).
+    private void detectInfiniteLoops(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        long entryPc = func.getEntryPoint().getOffset();
+        int branchCount = 0;
+        boolean selfBranchSeen = false;
+        boolean failBranchSeen = false;
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(!(mll.startsWith("b") || mll.equals("j") || mll.equals("jal"))) continue;
+            if(mll.startsWith("bal")) continue;
+            ghidra.program.model.address.Address[] flows = inst.getFlows();
+            if(flows == null || flows.length == 0) continue;
+            branchCount++;
+            for(ghidra.program.model.address.Address fa : flows) {
+                long ft = fa.getOffset();
+                if(ft == entryPc || ft == inst.getAddress().getOffset()) selfBranchSeen = true;
+                if(ft < inst.getAddress().getOffset() && (ft >= entryPc) &&
+                   func.getBody().contains(fa)) {
+                    // Backward branch within body. Capture as patch candidate.
+                    if(traits.patchCandidatePcs.size() < 32)
+                        traits.patchCandidatePcs.add(inst.getAddress().getOffset() & 0xFFFFFFFFL);
+                    // Examine the target's first 4 insns for break/syscall/nop-only.
+                    try {
+                        Instruction probe = currentProgram.getListing().getInstructionAt(fa);
+                        int look = 0;
+                        boolean onlyTrivial = true;
+                        while(probe != null && look < 4) {
+                            String pm = probe.getMnemonicString();
+                            if(pm == null) break;
+                            String pml = pm.toLowerCase();
+                            if(!(pml.equals("nop") || pml.equals("break") || pml.equals("syscall") ||
+                                 pml.startsWith("b") || pml.equals("j"))) {
+                                onlyTrivial = false; break;
+                            }
+                            probe = probe.getNext(); look++;
+                        }
+                        if(onlyTrivial) failBranchSeen = true;
+                    } catch(Exception ignore) {}
+                }
+            }
+        }
+        if(branchCount <= 2 && selfBranchSeen) traits.isInfiniteSpinLoop = true;
+        if(failBranchSeen) traits.containsInfiniteFailLoop = true;
+    }
+
+    // v9 Rule 121: backward-branch sync-wait. Small body, has backward branch,
+    // load or syscall in body — F24 / F27 / F28 host-wait blocker class.
+    private void detectSyncWaitLoop(Function func, FuncTraits traits) {
+        if(traits.byteSize > 400) return;
+        if(!traits.hasBackwardBranch) return;
+        if(!(traits.loadOps > 0 || traits.hasSyscall || traits.callsPadPollCallee
+             || traits.callsSifRpc)) return;
+        traits.isSyncWaitLoop = true;
+    }
+
+    // v9 Rule 124 / 125: IRX loader + IOP reboot handler from callee names.
+    private void detectIrxLoaderShape(Function func, FuncTraits traits) {
+        int loadCount = 0;
+        for(Function c : func.getCalledFunctions(monitor)) {
+            String cn = c.getName();
+            if(cn == null) continue;
+            if(IRX_LOAD_CALLEES.contains(cn)) loadCount++;
+            if(IOP_REBOOT_CALLEES.contains(cn)) traits.isIopRebootHandler = true;
+        }
+        traits.sifLoadModuleCallCount = loadCount;
+        if(loadCount >= 2) traits.isIrxLoader = true;
+        // Single call + IRX path string ref: tag too.
+        if(loadCount == 1 && refsAnyIrxString(func)) traits.isIrxLoader = true;
+    }
+
+    private boolean refsAnyIrxString(Function func) {
+        for(Reference ref : refManager.getReferencesFrom(func.getEntryPoint())) {
+            if(!ref.getReferenceType().isData()) continue;
+            try {
+                Data d = currentProgram.getListing().getDataAt(ref.getToAddress());
+                if(d == null) continue;
+                String s = d.getDefaultValueRepresentation();
+                if(s == null) continue;
+                String low = s.toLowerCase();
+                if(low.contains(".irx") || low.contains("rom0:")) return true;
+            } catch(Exception ignore) {}
+        }
+        return false;
+    }
+
+    // v9 Rule 126: render frame entry name fragment match.
+    private void detectRenderFrameEntry(String fname, FuncTraits traits) {
+        if(fname == null) return;
+        for(String frag : RENDER_FRAME_ENTRY_FRAGMENTS) {
+            if(fname.contains(frag)) { traits.isRenderFrameEntry = true; return; }
+        }
+    }
+
+    // v9 Rule 127: non-ctor function writing >= 4 distinct +K($a0) slots.
+    private void detectStructInitializer(Function func, FuncTraits traits) {
+        if(traits.isCtor) return;
+        if(traits.byteSize > 800) return;
+        Set<Long> slots = new HashSet<>();
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int n = 0;
+        while(it.hasNext() && n < 60) {
+            Instruction inst = it.next(); n++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(!(mll.equals("sw") || mll.equals("sd") || mll.equals("sq") || mll.equals("sh") || mll.equals("sb"))) continue;
+            Object[] aop = inst.getOpObjects(1);
+            boolean baseA0 = false; long off = -1;
+            if(aop != null) for(Object o : aop) {
+                if(o instanceof ghidra.program.model.lang.Register &&
+                   ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("a0"))
+                    baseA0 = true;
+                else if(o instanceof ghidra.program.model.scalar.Scalar)
+                    off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+            }
+            if(baseA0 && off >= 0 && off < 0x400) slots.add(off);
+        }
+        if(slots.size() >= 4) traits.isStructInitializer = true;
+    }
+
+    // v9 Rule 131: stamp DC2 hardcoded role from KNOWN_DC2_FUNCTION_ADDRESSES.
+    private void stampDc2KnownRole(long addr, FuncTraits traits) {
+        for(Object[] row : KNOWN_DC2_FUNCTION_ADDRESSES) {
+            if(((Number)row[0]).longValue() != addr) continue;
+            traits.dc2KnownPhase       = (String)row[2];
+            traits.dc2KnownRole        = (String)row[3];
+            traits.dc2KnownCriticality = (String)row[4];
+            dc2KnownAddressMatched++;
+            return;
+        }
+    }
+
+    // v9 Rule 139: SID/FID composite recovery via $a1 lui+ori before sceSifCallRpc.
+    private void detectDiscoveredSidsFids(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        long lastA1Const = -1;
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
+            } else if(mll.equals("ori") || mll.equals("addiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                String src = null; long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(!rn.equalsIgnoreCase(dr)) src = rn;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(dr != null && src != null && regConsts.containsKey(src))
+                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
+                else if(dr != null && imm != 0)
+                    regConsts.put(dr, imm & 0xFFFFFFFFL);
+                if("a1".equalsIgnoreCase(dr) && regConsts.containsKey(dr))
+                    lastA1Const = regConsts.get(dr);
+                if("a0".equalsIgnoreCase(dr) && regConsts.containsKey(dr) && lastA1Const < 0)
+                    lastA1Const = regConsts.get(dr);
+            } else if(mll.equals("li")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+                if("a1".equalsIgnoreCase(dr)) lastA1Const = imm;
+                if("a0".equalsIgnoreCase(dr) && lastA1Const < 0) lastA1Const = imm;
+            } else if(mll.equals("jal") || mll.equals("jalr")) {
+                Object[] tops = inst.getOpObjects(0);
+                String tname = null;
+                if(tops != null && tops.length > 0) {
+                    if(tops[0] instanceof ghidra.program.model.address.Address) {
+                        try {
+                            Function c = funcManager.getFunctionAt((ghidra.program.model.address.Address)tops[0]);
+                            if(c != null) tname = c.getName();
+                        } catch(Exception ignore) {}
+                    }
+                }
+                if(tname != null && (tname.equals("sceSifCallRpc") || tname.equals("sceSifBindRpc"))) {
+                    Long a0 = regConsts.get("a0");
+                    if(a0 != null) {
+                        traits.discoveredRpcSids.add(a0 & 0xFFFFFFFFL);
+                        long fa = func.getEntryPoint().getOffset() & 0xFFFFFFFFL;
+                        discoveredSidToCallers.computeIfAbsent(a0 & 0xFFFFFFFFL, k -> new LinkedHashSet<>()).add(fa);
+                    }
+                    Long a1 = regConsts.get("a1");
+                    if(a1 != null && tname.equals("sceSifCallRpc")) {
+                        traits.discoveredRpcFids2.add(a1 & 0xFFFFFFFFL);
+                        long fa = func.getEntryPoint().getOffset() & 0xFFFFFFFFL;
+                        discoveredFidToCallers.computeIfAbsent(a1 & 0xFFFFFFFFL, k -> new LinkedHashSet<>()).add(fa);
+                    }
+                }
+                lastA1Const = -1;
+            }
+        }
+    }
+
+    // v9 Rule 128: scan non-.text blocks for runs of function-entry pointers.
+    private void scanFunctionPointerTables(List<FuncResult> results,
+                                            Map<Long,FuncResult> byAddr) {
+        Set<Long> entryAddrs = new HashSet<>();
+        for(FuncResult r : results) entryAddrs.add(r.address & 0xFFFFFFFFL);
+        Map<Long, Long> aliasMap = new HashMap<>();
+        for(Long e : entryAddrs) aliasMap.put(e, e);
+        for(Long e : entryAddrs)
+            for(int tag = 1; tag <= 0xF; tag++) aliasMap.putIfAbsent(e | (long)tag, e);
+        for(MemoryBlock blk : memory.getBlocks()) {
+            if(!blk.isInitialized()) continue;
+            String bn = blk.getName().toLowerCase();
+            if(bn.equals(".text") || bn.equals("text")) continue;
+            long start = blk.getStart().getOffset();
+            long end   = blk.getEnd().getOffset();
+            long size  = end - start + 1;
+            if(size < 16) continue;
+            try {
+                byte[] data = new byte[(int)Math.min(size, 1 << 22)];
+                blk.getBytes(blk.getStart(), data);
+                long runStart = -1;
+                List<long[]> runEntries = new ArrayList<>();
+                for(int i = 0; i + 4 <= data.length; i += 4) {
+                    long v = ((long)(data[i] & 0xFF))
+                           | ((long)(data[i+1] & 0xFF) << 8)
+                           | ((long)(data[i+2] & 0xFF) << 16)
+                           | ((long)(data[i+3] & 0xFF) << 24);
+                    Long resolved = aliasMap.get(v);
+                    if(resolved == null && (v & 0xFL) != 0) {
+                        Long maskTry = aliasMap.get(v & ~0xFL);
+                        if(maskTry != null) resolved = maskTry;
+                    }
+                    if(resolved != null) {
+                        if(runStart < 0) runStart = start + i;
+                        runEntries.add(new long[]{ resolved & 0xFFFFFFFFL, 0L });
+                    } else {
+                        if(runEntries.size() >= 3 && v == 0L) continue;
+                        if(runEntries.size() >= 3)
+                            functionPointerTables.put(runStart, new ArrayList<>(runEntries));
+                        runStart = -1;
+                        runEntries.clear();
+                    }
+                }
+                if(runEntries.size() >= 3)
+                    functionPointerTables.put(runStart, new ArrayList<>(runEntries));
+            } catch(Exception ignore) {}
+        }
+        // Synthesise class names for stripped binaries.
+        for(Map.Entry<Long,List<long[]>> e : functionPointerTables.entrySet()) {
+            long tableAddr = e.getKey() & 0xFFFFFFFFL;
+            String className = String.format("Class_0x%08X", tableAddr);
+            int slot = 0;
+            for(long[] row : e.getValue()) {
+                long fnAddr = row[0] & 0xFFFFFFFFL;
+                FuncResult fr = byAddr.get(fnAddr);
+                if(fr != null && fr.traits != null) {
+                    boolean stripped = fr.name == null || fr.name.startsWith("FUN_") || fr.name.startsWith("sub_");
+                    if(stripped && fr.traits.inferredClassName == null) {
+                        fr.traits.inferredClassName = className;
+                        fr.traits.inferredVtableSlot = slot;
+                    }
+                }
+                slot++;
+            }
+        }
+        // DISPATCH_TABLE_TARGET / TABLE_DISPATCH_CALL tags.
+        Set<Long> dispatchTargets = new HashSet<>();
+        for(List<long[]> entries : functionPointerTables.values())
+            for(long[] row : entries) dispatchTargets.add(row[0] & 0xFFFFFFFFL);
+        for(FuncResult r : results) {
+            if(dispatchTargets.contains(r.address & 0xFFFFFFFFL)) {
+                if(!r.tags.contains("DISPATCH_TABLE_TARGET")) {
+                    r.tags.add("DISPATCH_TABLE_TARGET");
+                    dispatchTableTargetCount++;
+                }
+            }
+            if(r.traits == null) continue;
+            if(r.traits.indirectCallT9Count == 0 && r.traits.virtualDispatchSites.isEmpty())
+                continue;
+            for(long[] cl : r.traits.constLoads) {
+                long v = cl[1] & 0xFFFFFFFFL;
+                if(functionPointerTables.containsKey(v)) {
+                    r.traits.tableDispatchSites.add(String.format("0x%08X", v));
+                    if(!r.tags.contains("TABLE_DISPATCH_CALL")) {
+                        r.tags.add("TABLE_DISPATCH_CALL");
+                        tableDispatchCallCount++;
+                    }
+                }
+            }
+        }
+    }
+
+    // v9 Rule 129: greedy module clustering. Bidirectional jal edges.
+    private void assignModuleIds(List<FuncResult> results) {
+        Map<Long, Set<Long>> adj = new HashMap<>();
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            long a = r.address & 0xFFFFFFFFL;
+            Set<Long> nbrs = adj.computeIfAbsent(a, k -> new HashSet<>());
+            for(long[] site : r.traits.jalSites) {
+                long t = site[1] & 0xFFFFFFFFL;
+                if(t == 0xFFFFFFFFL) continue;
+                nbrs.add(t);
+                adj.computeIfAbsent(t, k -> new HashSet<>()).add(a);
+            }
+        }
+        Map<Long, Long> compId = new HashMap<>();
+        for(FuncResult r : results) {
+            long a = r.address & 0xFFFFFFFFL;
+            if(compId.containsKey(a)) continue;
+            Deque<Long> q = new ArrayDeque<>();
+            Set<Long> seen = new HashSet<>();
+            q.add(a); seen.add(a);
+            long minAddr = a;
+            while(!q.isEmpty()) {
+                long cur = q.poll();
+                if(cur < minAddr) minAddr = cur;
+                Set<Long> ns = adj.get(cur);
+                if(ns == null) continue;
+                for(long n : ns) if(seen.add(n)) q.add(n);
+            }
+            for(long n : seen) compId.put(n, minAddr);
+        }
+        Map<Long, Integer> idMap = new HashMap<>();
+        int idCounter = 0;
+        for(FuncResult r : results) {
+            long a = r.address & 0xFFFFFFFFL;
+            Long cid = compId.get(a);
+            if(cid == null) continue;
+            Integer mid = idMap.get(cid);
+            if(mid == null) { mid = idCounter++; idMap.put(cid, mid); }
+            if(r.traits != null) r.traits.moduleId = mid;
+            moduleClusters.computeIfAbsent(mid, k -> new LinkedHashSet<>()).add(a);
+        }
+    }
+
+    // v9 Rule 130: name-prefix module index. Length 2-6, occur >= 5 times.
+    private void buildNamePrefixModules(List<FuncResult> results) {
+        Map<String, List<Long>> byPrefix = new HashMap<>();
+        for(FuncResult r : results) {
+            if(r.name == null || r.name.isEmpty()) continue;
+            String n = r.name;
+            if(n.startsWith("sub_") || n.startsWith("FUN_")) continue;
+            int maxLen = Math.min(6, n.length());
+            for(int len = 2; len <= maxLen; len++) {
+                String prefix = n.substring(0, len);
+                char last = prefix.charAt(len-1);
+                if(!Character.isLetter(last) && last != '_') continue;
+                byPrefix.computeIfAbsent(prefix, k -> new ArrayList<>()).add(r.address & 0xFFFFFFFFL);
+            }
+        }
+        List<Map.Entry<String,List<Long>>> kept = new ArrayList<>();
+        for(Map.Entry<String,List<Long>> e : byPrefix.entrySet())
+            if(e.getValue().size() >= 5) kept.add(e);
+        kept.sort((a,b) -> Integer.compare(b.getKey().length(), a.getKey().length()));
+        Set<Long> assigned = new HashSet<>();
+        for(Map.Entry<String,List<Long>> e : kept) {
+            List<Long> taken = new ArrayList<>();
+            for(Long a : e.getValue()) if(assigned.add(a)) taken.add(a);
+            if(taken.size() >= 5) {
+                Collections.sort(taken);
+                namePrefixModules.put(e.getKey(), taken);
+            }
+        }
+    }
+
+    // v9 Rule 134: tag every function that participates in a DC2 call chain.
+    private void tagDc2CallChains(List<FuncResult> results) {
+        for(Object[] row : DC2_CALL_CHAINS) {
+            String chainTag = (String)row[0];
+            String[] stations = (String[])row[1];
+            for(FuncResult r : results) {
+                if(r.name == null) continue;
+                for(String s : stations) {
+                    if(r.name.contains(s)) {
+                        if(r.traits != null) r.traits.dc2CallChainsTagged.add(chainTag);
+                        if(!r.tags.contains("DC2_CHAIN_" + chainTag.toUpperCase()))
+                            r.tags.add("DC2_CHAIN_" + chainTag.toUpperCase());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // v9 Rule 137: prioritise function tags for TOML comment generation.
+    private String prioritizeTagsForComment(List<String> tags, int max) {
+        if(tags == null || tags.isEmpty()) return "";
+        List<String> sorted = new ArrayList<>(tags);
+        sorted.sort((a,b) -> Integer.compare(
+            TAG_PRIORITY.getOrDefault(b, 0),
+            TAG_PRIORITY.getOrDefault(a, 0)));
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0; i < sorted.size() && i < max; i++) {
+            if(i > 0) sb.append(",");
+            sb.append(sorted.get(i));
+        }
+        return sb.toString();
+    }
+
+    // v9 Rule 136: synthetic focus score for fallback when no bullseyes fire.
+    private long scoreFocus(FuncTraits t) {
+        if(t == null) return 0;
+        long score = 0;
+        if(t.isCtor)                       score += 30;
+        if("CRITICAL".equals(t.ctorRiskTier)) score += 50;
+        if("HIGH".equals(t.ctorRiskTier))     score += 30;
+        if(t.isRenderFrameEntry)           score += 80;
+        if(t.isFrameClockDriver)           score += 50;
+        if(t.isInfiniteSpinLoop)           score += 40;
+        if(t.isSyncWaitLoop)               score += 40;
+        if(t.bitbltbufMacroSequence)       score += 70;
+        if(t.gifTagInlineBuilder)          score += 60;
+        if(t.dmaSourceChainTagBuilder)     score += 50;
+        if(t.dmaChcrStartKick)             score += 70;
+        if(t.isIrxLoader)                  score += 35;
+        if(t.isBitbltbufT4hhUploader)      score += 90;
+        if(t.isCtorMultiFieldInit)         score += 40;
+        if(t.isLifecycleLazyInit)          score += 40;
+        if(t.drawingChainDepth >= 0 && t.drawingChainDepth <= 6) score += 50;
+        if("BLOCKER".equals(t.dc2KnownCriticality)) score += 100;
+        if("HIGH".equals(t.dc2KnownCriticality))    score += 60;
+        if("MEDIUM".equals(t.dc2KnownCriticality))  score += 30;
+        if(t.dc2HostWaitCandidate)         score += 80;
+        score += Math.min(t.calleeNames.size(), 20);
+        score += Math.min(t.callers.size(), 10);
+        return score;
+    }
+
+    // =========================================================
     // CATEGORY HEURISTICS
     // =========================================================
     private String assignCategory(FuncTraits t) {
@@ -4023,7 +5545,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // UNIFIED CONFIG OUTPUT
     // =========================================================
     private void writeUnifiedConfig(File outFile,File step1Config,
-                                    List<String> newStubs,List<String> newSkips) throws IOException {
+                                    List<String> newStubs,List<String> newSkips,
+                                    List<FuncResult> results,
+                                    Map<Long,FuncResult> byAddr) throws IOException {
+        // v9 Rule 138: build address -> FuncResult lookup by name@addr token,
+        // so each spliced stub/skip line can carry a top-tag comment.
+        Map<String,FuncResult> byToken = new HashMap<>();
+        for(FuncResult r : results) {
+            byToken.put(r.name + "@" + hex(r.address), r);
+        }
         List<String> lines=new ArrayList<>();
         BufferedReader reader=new BufferedReader(new FileReader(step1Config));
         String line;while((line=reader.readLine())!=null)lines.add(line);
@@ -4038,20 +5568,34 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
         List<String> stubLines=new ArrayList<>();
         if(!newStubs.isEmpty()){
-            stubLines.add("  # --- Triage Enricher v3 additions ---");
-            for(String s:newStubs)stubLines.add("  \""+s+"\",");
+            stubLines.add("  # --- Triage Enricher v9 additions ---");
+            for(String s:newStubs){
+                FuncResult r = byToken.get(s);
+                String comment = (r != null) ? prioritizeTagsForComment(r.tags, 4) : "";
+                if(!comment.isEmpty())
+                    stubLines.add("  \""+s+"\",  # "+comment);
+                else
+                    stubLines.add("  \""+s+"\",");
+            }
         }
         List<String> skipLines=new ArrayList<>();
         if(!newSkips.isEmpty()){
-            skipLines.add("  # --- Triage Enricher v3 additions ---");
-            for(String s:newSkips)skipLines.add("  \""+s+"\",");
+            skipLines.add("  # --- Triage Enricher v9 additions ---");
+            for(String s:newSkips){
+                FuncResult r = byToken.get(s);
+                String comment = (r != null) ? prioritizeTagsForComment(r.tags, 4) : "";
+                if(!comment.isEmpty())
+                    skipLines.add("  \""+s+"\",  # "+comment);
+                else
+                    skipLines.add("  \""+s+"\",");
+            }
         }
         if(skipClose>=0&&!skipLines.isEmpty()){
             lines.addAll(skipClose,skipLines);
             if(stubsClose>=skipClose)stubsClose+=skipLines.size();
         }
         if(stubsClose>=0&&!stubLines.isEmpty())lines.addAll(stubsClose,stubLines);
-        lines.add(0,"# Unified config: "+step1Config.getName()+" + "+newStubs.size()+" stubs + "+newSkips.size()+" skips (Enricher v3)");
+        lines.add(0,"# Unified config: "+step1Config.getName()+" + "+newStubs.size()+" stubs + "+newSkips.size()+" skips (Enricher v9)");
         for(int i=0;i<lines.size();i++){
             String l=lines.get(i);
             if(l.startsWith("stub_count =")){
@@ -4061,7 +5605,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 int old=Integer.parseInt(l.split("=")[1].trim());
                 lines.set(i,"skip_count = "+(old+newSkips.size()));
             } else if(l.startsWith("input =") || l.startsWith("output_file =") || l.startsWith("output =") || l.startsWith("ghidra_output =")) {
-                // [FIX v4] Sanitize hardcoded absolute paths to relative paths
+                // Sanitize hardcoded absolute paths to relative paths
                 int q1 = l.indexOf('"');
                 int q2 = l.lastIndexOf('"');
                 if (q1 >= 0 && q2 > q1) {
@@ -4071,9 +5615,99 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
         }
+        // v9 Rule 137: append [triage_advisory] block. ps2recomp.exe will ignore
+        // unknown sections, so this serves as machine-readable hints for the
+        // report tool and human triage.
+        List<String> advisory = buildTriageAdvisoryBlock(results);
         PrintWriter w=new PrintWriter(new FileWriter(outFile));
         for(String l:lines)w.println(l);
+        for(String l:advisory)w.println(l);
         w.close();
+    }
+
+    // v9 Rule 137: build [triage_advisory] appendix lines.
+    private List<String> buildTriageAdvisoryBlock(List<FuncResult> results) {
+        List<String> out = new ArrayList<>();
+        List<String> nopList = new ArrayList<>();
+        List<String> patchList = new ArrayList<>();
+        List<String> forceRecompileList = new ArrayList<>();
+        List<String> mustImplementList = new ArrayList<>();
+        List<String> dc2BlockersList = new ArrayList<>();
+        List<String> dc2HostWaitList = new ArrayList<>();
+        List<String> bullseyeUploadList = new ArrayList<>();
+        List<String> patchCandidateLines = new ArrayList<>();
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            FuncTraits t = r.traits;
+            String token = r.name + "@" + hex(r.address);
+            String tagCmt = prioritizeTagsForComment(r.tags, 4);
+            String suffix = tagCmt.isEmpty() ? "" : "  # " + tagCmt;
+            // nop = libgcc/process-terminator that's currently STUB and provably side-effect-free
+            if(t.isLibgccIntrinsic && "STUB".equals(r.disposition))
+                nopList.add("  \""+token+"\","+suffix);
+            // patch = small functions with $a1 buffer convention violation
+            if(t.writesToA1Buffer && t.byteSize < 80)
+                patchList.add("  \""+token+"\","+suffix);
+            // force_recompile = bullseyes / critical ctors / lifecycle guards / DC2 BLOCKERs
+            boolean fr = t.isBitbltbufT4hhUploader || t.isCtorMultiFieldInit ||
+                         t.isLifecycleLazyInit || t.ctorWritesVTablePointer ||
+                         t.isRenderFrameEntry || t.bitbltbufMacroSequence ||
+                         t.isSceGifPkRefLoadImage || t.isTopPriorityFix ||
+                         "BLOCKER".equals(t.dc2KnownCriticality);
+            if(fr) forceRecompileList.add("  \""+token+"\","+suffix);
+            // must_implement = sceVu0 helpers + DC2 HIGH criticality
+            if(t.isSceVu0Helper ||
+               "HIGH".equals(t.dc2KnownCriticality) || "BLOCKER".equals(t.dc2KnownCriticality))
+                mustImplementList.add("  \""+token+"\","+suffix);
+            // dc2_blockers
+            if("BLOCKER".equals(t.dc2KnownCriticality))
+                dc2BlockersList.add("  \""+token+"\","+suffix);
+            // dc2_host_wait
+            if(t.dc2HostWaitCandidate)
+                dc2HostWaitList.add("  \""+token+"\","+suffix);
+            // bullseye_upload — functions matching expected_uploads dpsm + dbp
+            if(!t.assetUploadTagsHit.isEmpty())
+                bullseyeUploadList.add("  \""+token+"\","+suffix);
+            // patch instruction candidates for backward branches
+            for(Long pc : t.patchCandidatePcs) {
+                if(patchCandidateLines.size() >= 256) break;
+                String reason = t.isSyncWaitLoop ? "BACKWARD_BRANCH_SYNC_WAIT" :
+                                t.containsInfiniteFailLoop ? "INFINITE_FAIL_LOOP" :
+                                t.isInfiniteSpinLoop ? "INFINITE_SPIN_LOOP" :
+                                "BACKWARD_BRANCH";
+                patchCandidateLines.add(String.format(
+                    "  {address = \"0x%08X\", value = \"0x00000000\"},  # %s in %s",
+                    pc & 0xFFFFFFFFL, reason, token));
+            }
+        }
+        out.add("");
+        out.add("# ============================================================");
+        out.add("# [triage_advisory] - Enricher v9 (DC2). Hints only.");
+        out.add("# ps2recomp.exe ignores this section. Consumed by report tool.");
+        out.add("# Each line: \"name@0xADDR\",  # TOP_TAG,NEXT_TAG,...");
+        out.add("# ============================================================");
+        out.add("[triage_advisory]");
+        emitTomlList(out, "nop",                  nopList);
+        emitTomlList(out, "patch",                patchList);
+        emitTomlList(out, "force_recompile",      forceRecompileList);
+        emitTomlList(out, "must_implement",       mustImplementList);
+        emitTomlList(out, "dc2_blockers",         dc2BlockersList);
+        emitTomlList(out, "dc2_host_wait",        dc2HostWaitList);
+        emitTomlList(out, "bullseye_upload",      bullseyeUploadList);
+        // Commented patches block — humans uncomment manually after verifying.
+        out.add("");
+        out.add("# [patches]");
+        out.add("# instructions = [");
+        for(String l : patchCandidateLines) out.add("#" + l);
+        out.add("# ]");
+        return out;
+    }
+
+    private void emitTomlList(List<String> out, String name, List<String> entries) {
+        out.add("");
+        out.add(name + " = [");
+        for(String e : entries) out.add(e);
+        out.add("]");
     }
 
     // v8 Rule 109: cheap line-scanning reader. Extracts {address: "disposition|category"}
@@ -4116,7 +5750,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                                  int totalFuncs,int uncategorized) throws IOException {
         PrintWriter w=new PrintWriter(new FileWriter(outFile));
         w.println("{");
-        w.println("  \"schema_version\": 8.0,");
+        w.println("  \"schema_version\": 9.0,");
         w.println("  \"elf_hash\": \""+elfHash+"\",");
         if(gpValue!=0)w.println("  \"global_pointer\": \""+hex(gpValue)+"\",");
         w.println("  \"text_range\": { \"start\": \""+hex(textStart)+"\", \"end\": \""+hex(textEnd)+"\" },");
@@ -4220,7 +5854,29 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"dma_kick_via_sdk_caller\": "+dmaKickViaSdkCallerCount+",");
         w.println("    \"return_written_to_global_funcs\": "+returnWrittenToGlobalCount+",");
         w.println("    \"auto_extended_dc2_globals\": "+autoExtendedDc2GlobalsCount+",");
-        w.println("    \"class_registry_count\": "+classRegistry.size());
+        w.println("    \"class_registry_count\": "+classRegistry.size()+",");
+        // v9 stats
+        w.println("    \"gif_tag_inline_builder\": "+gifTagInlineBuilderCount+",");
+        w.println("    \"bitbltbuf_macro_sequence\": "+bitbltbufMacroSeqCount+",");
+        w.println("    \"dma_chcr_start_kick\": "+dmaChcrStartKickCount+",");
+        w.println("    \"dma_source_chain_tag_builder\": "+dmaSourceChainBuilderCount+",");
+        w.println("    \"composite_mmio_recovered\": "+compositeMmioRecoveryCount+",");
+        w.println("    \"syscall_trampoline\": "+syscallTrampolineCount+",");
+        w.println("    \"backward_branch_sync_wait\": "+backwardSyncWaitCount+",");
+        w.println("    \"infinite_spin_loop\": "+infiniteSpinLoopCount+",");
+        w.println("    \"infinite_fail_loop\": "+infiniteFailLoopCount+",");
+        w.println("    \"irx_loader\": "+irxLoaderCount+",");
+        w.println("    \"iop_reboot_handler\": "+iopRebootHandlerCount+",");
+        w.println("    \"render_frame_entry\": "+renderFrameEntryCount+",");
+        w.println("    \"struct_initializer\": "+structInitializerCount+",");
+        w.println("    \"dispatch_table_target\": "+dispatchTableTargetCount+",");
+        w.println("    \"table_dispatch_call\": "+tableDispatchCallCount+",");
+        w.println("    \"dc2_host_wait_candidate\": "+dc2HostWaitCandidateCount+",");
+        w.println("    \"dc2_known_address_matched\": "+dc2KnownAddressMatched+",");
+        w.println("    \"discovered_iop_sid_funcs\": "+discoveredRpcSidCount+",");
+        w.println("    \"function_pointer_tables\": "+functionPointerTables.size()+",");
+        w.println("    \"module_clusters\": "+moduleClusters.size()+",");
+        w.println("    \"name_prefix_modules\": "+namePrefixModules.size());
         w.println("  },");
 
         // v5 Rule 55: known DC2 gp-relative globals (labels for literal_refs decode).
@@ -4876,6 +6532,21 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             List<FuncResult> focus = new ArrayList<>();
             for(FuncResult r : results)
                 if(r.traits != null && r.traits.isTopPriorityFix) focus.add(r);
+            // v9 Rule 136: synth fallback when no bullseyes fire — top-32 by score.
+            boolean synthetic = focus.isEmpty();
+            if(synthetic) {
+                List<FuncResult> scored = new ArrayList<>(results);
+                scored.sort((a,b) -> Long.compare(
+                    scoreFocus(b.traits == null ? null : b.traits),
+                    scoreFocus(a.traits == null ? null : a.traits)));
+                int cap = Math.min(32, scored.size());
+                for(int i = 0; i < cap; i++) {
+                    FuncResult r = scored.get(i);
+                    if(r.traits == null) continue;
+                    if(!r.tags.contains("FOCUS_SYNTHETIC")) r.tags.add("FOCUS_SYNTHETIC");
+                    focus.add(r);
+                }
+            }
             // v7 Rule 81: re-rank — CONFIRMED first, INDETERMINATE next,
             // MENU_ONLY then DORMANT. Stable within a bucket by address.
             focus.sort((a,b) -> {
@@ -4897,8 +6568,168 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 w.print("], \"mainloop_depth\": "+t.mainLoopDepth+
                         ", \"drawing_chain_depth\": "+t.drawingChainDepth+
                         ", \"caller_count\": "+t.callers.size()+
-                        ", \"runtime_status\": "+jsonString(t.runtimeStatus)+"}");
+                        ", \"runtime_status\": "+jsonString(t.runtimeStatus)+
+                        ", \"dc2_role\": "+jsonString(t.dc2KnownRole == null ? "" : t.dc2KnownRole)+
+                        ", \"dc2_phase\": "+jsonString(t.dc2KnownPhase == null ? "" : t.dc2KnownPhase)+
+                        ", \"dc2_criticality\": "+jsonString(t.dc2KnownCriticality == null ? "" : t.dc2KnownCriticality)+
+                        ", \"module_id\": "+t.moduleId+
+                        ", \"synthetic\": "+(synthetic ? "true" : "false")+"}");
                 if(i<focus.size()-1) w.println(","); else w.println();
+            }
+        }
+        w.println("  ],");
+
+        // v9 Rule 131: DC2 known function addresses (hardcoded from PROJECT_STATE.md)
+        w.println("  \"dc2_known_function_addresses\": [");
+        for(int i=0; i<KNOWN_DC2_FUNCTION_ADDRESSES.length; i++) {
+            Object[] row = KNOWN_DC2_FUNCTION_ADDRESSES[i];
+            w.print("    {\"address\": \""+hex(((Number)row[0]).longValue())+
+                    "\", \"name\": "+jsonString((String)row[1])+
+                    ", \"phase\": "+jsonString((String)row[2])+
+                    ", \"role\": "+jsonString((String)row[3])+
+                    ", \"criticality\": "+jsonString((String)row[4])+"}");
+            w.println(i<KNOWN_DC2_FUNCTION_ADDRESSES.length-1 ? "," : "");
+        }
+        w.println("  ],");
+
+        // v9 Rule 132: DC2 VRAM TBP labels
+        w.println("  \"dc2_known_tbp_labels\": {");
+        {
+            boolean f = true;
+            for(Map.Entry<Long,String> e : KNOWN_DC2_TBP_LABELS.entrySet()) {
+                if(!f) w.println(","); f = false;
+                w.print("    \"0x"+String.format("%04X", e.getKey() & 0xFFFFL)+
+                        "\": "+jsonString(e.getValue()));
+            }
+        }
+        w.println("\n  },");
+
+        // v9 Rule 133: DC2 runtime invariants confirmed across all 9 GS dumps
+        w.println("  \"dc2_runtime_invariants\": [");
+        for(int i=0; i<DC2_RUNTIME_INVARIANTS.length; i++) {
+            String[] row = DC2_RUNTIME_INVARIANTS[i];
+            w.print("    {\"name\": "+jsonString(row[0])+
+                    ", \"description\": "+jsonString(row[1])+"}");
+            w.println(i<DC2_RUNTIME_INVARIANTS.length-1 ? "," : "");
+        }
+        w.println("  ],");
+
+        // v9 Rule 134: DC2 pre-computed call chains
+        w.println("  \"dc2_call_chains\": {");
+        for(int i=0; i<DC2_CALL_CHAINS.length; i++) {
+            Object[] row = DC2_CALL_CHAINS[i];
+            String tag = (String)row[0];
+            String[] stations = (String[])row[1];
+            w.print("    "+jsonString(tag)+": [");
+            for(int j=0; j<stations.length; j++) {
+                if(j>0) w.print(", ");
+                w.print(jsonString(stations[j]));
+            }
+            w.print("]");
+            w.println(i<DC2_CALL_CHAINS.length-1 ? "," : "");
+        }
+        w.println("  },");
+
+        // v9 Rule 135: working DC2_PAD_INPUT scripts from fix logs
+        w.println("  \"dc2_pad_input_scripts\": [");
+        for(int i=0; i<DC2_PAD_INPUT_SCRIPTS.length; i++) {
+            String[] row = DC2_PAD_INPUT_SCRIPTS[i];
+            w.print("    {\"tag\": "+jsonString(row[0])+
+                    ", \"script\": "+jsonString(row[1])+
+                    ", \"frame_anchor\": "+jsonString(row[2])+
+                    ", \"observed_effect\": "+jsonString(row[3])+"}");
+            w.println(i<DC2_PAD_INPUT_SCRIPTS.length-1 ? "," : "");
+        }
+        w.println("  ],");
+
+        // v9 Rule 128: function pointer tables
+        w.println("  \"function_pointer_tables\": [");
+        {
+            int n = functionPointerTables.size(); int i = 0;
+            for(Map.Entry<Long,List<long[]>> e : functionPointerTables.entrySet()) {
+                w.print("    {\"address\": \""+hex(e.getKey())+
+                        "\", \"entries\": [");
+                List<long[]> entries = e.getValue();
+                for(int j = 0; j < entries.size(); j++) {
+                    if(j>0) w.print(", ");
+                    w.print("\""+hex(entries.get(j)[0])+"\"");
+                }
+                w.print("], \"size\": "+entries.size()+"}");
+                w.println((++i < n) ? "," : "");
+            }
+        }
+        w.println("  ],");
+
+        // v9 Rule 129: module clusters
+        w.println("  \"module_clusters\": {");
+        {
+            int n = moduleClusters.size(); int i = 0;
+            for(Map.Entry<Integer,Set<Long>> e : moduleClusters.entrySet()) {
+                w.print("    \"mod_"+e.getKey()+"\": [");
+                int j = 0;
+                for(Long a : e.getValue()) {
+                    if(j>0) w.print(", "); j++;
+                    w.print("\""+hex(a)+"\"");
+                }
+                w.print("]");
+                w.println((++i < n) ? "," : "");
+            }
+        }
+        w.println("  },");
+
+        // v9 Rule 130: name-prefix modules
+        w.println("  \"name_prefix_modules\": {");
+        {
+            int n = namePrefixModules.size(); int i = 0;
+            for(Map.Entry<String,List<Long>> e : namePrefixModules.entrySet()) {
+                w.print("    "+jsonString(e.getKey())+": [");
+                List<Long> lst = e.getValue();
+                for(int j = 0; j < lst.size(); j++) {
+                    if(j>0) w.print(", ");
+                    w.print("\""+hex(lst.get(j))+"\"");
+                }
+                w.print("]");
+                w.println((++i < n) ? "," : "");
+            }
+        }
+        w.println("  },");
+
+        // v9 Rule 139: discovered IOP SIDs with caller list
+        w.println("  \"discovered_iop_sids\": [");
+        {
+            List<Long> sids = new ArrayList<>(discoveredSidToCallers.keySet());
+            Collections.sort(sids);
+            for(int i = 0; i < sids.size(); i++) {
+                long sid = sids.get(i);
+                Set<Long> callers = discoveredSidToCallers.get(sid);
+                w.print("    {\"sid\": \""+hex(sid)+"\", \"callers\": [");
+                int j = 0;
+                for(Long c : callers) {
+                    if(j>0) w.print(", "); j++;
+                    w.print("\""+hex(c)+"\"");
+                }
+                w.print("]}");
+                w.println(i < sids.size()-1 ? "," : "");
+            }
+        }
+        w.println("  ],");
+
+        // v9: discovered FIDs (function-ids for sceSifCallRpc)
+        w.println("  \"discovered_iop_fids\": [");
+        {
+            List<Long> fids = new ArrayList<>(discoveredFidToCallers.keySet());
+            Collections.sort(fids);
+            for(int i = 0; i < fids.size(); i++) {
+                long fid = fids.get(i);
+                Set<Long> callers = discoveredFidToCallers.get(fid);
+                w.print("    {\"fid\": \""+hex(fid)+"\", \"callers\": [");
+                int j = 0;
+                for(Long c : callers) {
+                    if(j>0) w.print(", "); j++;
+                    w.print("\""+hex(c)+"\"");
+                }
+                w.print("]}");
+                w.println(i < fids.size()-1 ? "," : "");
             }
         }
         w.println("  ]");
