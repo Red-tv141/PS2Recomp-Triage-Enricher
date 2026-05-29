@@ -408,14 +408,53 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private static final long GS_ZBUF_2         = 0x4FL;
     private static final long GS_DISPFB1        = 0x59L;
     private static final long GS_DISPFB2        = 0x5BL;
-    // Known GS register name map (emitted to JSON for the report tool to label hits).
+    // v9.1: complete GIF A+D register table from pcsx2/pcsx2/GS/GSRegs.h
+    // (line 76-130, GIF_A_D_REG_*). Map: A+D id -> friendly name.
     private static final Map<Long,String> KNOWN_GS_REGS = new LinkedHashMap<>();
     static {
         KNOWN_GS_REGS.put(0x00L, "PRIM");
         KNOWN_GS_REGS.put(0x01L, "RGBAQ");
+        KNOWN_GS_REGS.put(0x02L, "ST");
+        KNOWN_GS_REGS.put(0x03L, "UV");
+        KNOWN_GS_REGS.put(0x04L, "XYZF2");
         KNOWN_GS_REGS.put(0x05L, "XYZ2");
         KNOWN_GS_REGS.put(0x06L, "TEX0_1");
         KNOWN_GS_REGS.put(0x07L, "TEX0_2");
+        KNOWN_GS_REGS.put(0x08L, "CLAMP_1");
+        KNOWN_GS_REGS.put(0x09L, "CLAMP_2");
+        KNOWN_GS_REGS.put(0x0AL, "FOG");
+        KNOWN_GS_REGS.put(0x0CL, "XYZF3");
+        KNOWN_GS_REGS.put(0x0DL, "XYZ3");
+        KNOWN_GS_REGS.put(0x0FL, "NOP");
+        KNOWN_GS_REGS.put(0x14L, "TEX1_1");
+        KNOWN_GS_REGS.put(0x15L, "TEX1_2");
+        KNOWN_GS_REGS.put(0x16L, "TEX2_1");
+        KNOWN_GS_REGS.put(0x17L, "TEX2_2");
+        KNOWN_GS_REGS.put(0x18L, "XYOFFSET_1");
+        KNOWN_GS_REGS.put(0x19L, "XYOFFSET_2");
+        KNOWN_GS_REGS.put(0x1AL, "PRMODECONT");
+        KNOWN_GS_REGS.put(0x1BL, "PRMODE");
+        KNOWN_GS_REGS.put(0x1CL, "TEXCLUT");
+        KNOWN_GS_REGS.put(0x22L, "SCANMSK");
+        KNOWN_GS_REGS.put(0x34L, "MIPTBP1_1");
+        KNOWN_GS_REGS.put(0x35L, "MIPTBP1_2");
+        KNOWN_GS_REGS.put(0x36L, "MIPTBP2_1");
+        KNOWN_GS_REGS.put(0x37L, "MIPTBP2_2");
+        KNOWN_GS_REGS.put(0x3BL, "TEXA");
+        KNOWN_GS_REGS.put(0x3DL, "FOGCOL");
+        KNOWN_GS_REGS.put(0x3FL, "TEXFLUSH");
+        KNOWN_GS_REGS.put(0x40L, "SCISSOR_1");
+        KNOWN_GS_REGS.put(0x41L, "SCISSOR_2");
+        KNOWN_GS_REGS.put(0x42L, "ALPHA_1");
+        KNOWN_GS_REGS.put(0x43L, "ALPHA_2");
+        KNOWN_GS_REGS.put(0x44L, "DIMX");
+        KNOWN_GS_REGS.put(0x45L, "DTHE");
+        KNOWN_GS_REGS.put(0x46L, "COLCLAMP");
+        KNOWN_GS_REGS.put(0x47L, "TEST_1");
+        KNOWN_GS_REGS.put(0x48L, "TEST_2");
+        KNOWN_GS_REGS.put(0x49L, "PABE");
+        KNOWN_GS_REGS.put(0x4AL, "FBA_1");
+        KNOWN_GS_REGS.put(0x4BL, "FBA_2");
         KNOWN_GS_REGS.put(0x4CL, "FRAME_1");
         KNOWN_GS_REGS.put(0x4DL, "FRAME_2");
         KNOWN_GS_REGS.put(0x4EL, "ZBUF_1");
@@ -424,8 +463,12 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         KNOWN_GS_REGS.put(0x51L, "TRXPOS");
         KNOWN_GS_REGS.put(0x52L, "TRXREG");
         KNOWN_GS_REGS.put(0x53L, "TRXDIR");
+        KNOWN_GS_REGS.put(0x54L, "HWREG");
         KNOWN_GS_REGS.put(0x59L, "DISPFB1");
         KNOWN_GS_REGS.put(0x5BL, "DISPFB2");
+        KNOWN_GS_REGS.put(0x60L, "SIGNAL");
+        KNOWN_GS_REGS.put(0x61L, "FINISH");
+        KNOWN_GS_REGS.put(0x62L, "LABEL");
     }
 
     // =========================================================
@@ -1797,6 +1840,28 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
 
         detectTextSection();
         long gpValue = detectGlobalPointer();
+
+        // v9.1: pre-scan KNOWN_DC2_FUNCTION_ADDRESSES. Counts both address +
+        // name hits across the ELF — independent of Step1/override gate that
+        // would otherwise skip pre-classified entries (so the static map is
+        // still populated even for funcs the main scan loop continues past).
+        {
+            int addrHits = 0, nameHits = 0;
+            ghidra.program.model.address.AddressFactory af = currentProgram.getAddressFactory();
+            for(Object[] row : KNOWN_DC2_FUNCTION_ADDRESSES) {
+                long want = ((Number)row[0]).longValue() & 0xFFFFFFFFL;
+                String wantName = (String)row[1];
+                Function f = funcManager.getFunctionAt(af.getDefaultAddressSpace().getAddress(want));
+                if(f != null) addrHits++;
+                else {
+                    SymbolIterator si = currentProgram.getSymbolTable().getSymbols(wantName);
+                    if(si.hasNext()) nameHits++;
+                }
+            }
+            dc2KnownAddressMatched = addrHits + nameHits;
+            println(String.format("[DC2-KNOWN] address_hits=%d name_hits=%d of %d entries.",
+                addrHits, nameHits, KNOWN_DC2_FUNCTION_ADDRESSES.length));
+        }
         String elfHash = computeElfHash();
 
         println("[SCAN] Analyzing...");
@@ -3653,10 +3718,12 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(traits.callsMpegFamily) break;
         }
 
-        // v5 Rule 43: bullseye for the Path3 4HH guard. Match bare name or
-        // Ghidra-mangled `sceGifPkRefLoadImage_0xADDR`.
+        // v5 Rule 43 (v9.1 broadened): bullseye for the Path3 4HH guard. Match
+        // bare name, Ghidra-mangled `sceGifPkRefLoadImage_0xADDR`, OR the
+        // GCC2-mangled `sceGifPkRefLoadImage__FP12sceGifPacket...` suffix.
         if(fname.equals(SCE_GIF_PK_REF_LOAD_IMAGE) ||
-           fname.startsWith(SCE_GIF_PK_REF_LOAD_IMAGE+"_0x"))
+           fname.startsWith(SCE_GIF_PK_REF_LOAD_IMAGE+"_0x") ||
+           fname.startsWith(SCE_GIF_PK_REF_LOAD_IMAGE+"__"))
             traits.isSceGifPkRefLoadImage = true;
 
         // v5 Rule 45: sceGifPk*/sceVif1Pk* family roster
@@ -4360,6 +4427,10 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         detectDmaSourceChainTagBuilder(func, traits);
         // Rule 119 composite MMIO recovery — catches hidden lui+ori MMIO writes
         detectCompositeMmioConsts(func, traits);
+        // v9.1 Rule A: sharpen A+D reg writer detection via const-tracked sd/sw.
+        detectAdRegImmediateStores(func, traits);
+        // v9.1: aggressive PSM constant scan covering reg-bag-shape composites.
+        if(!traits.loadsPsm4hhConstant) detectPsmConstantsAggressive(func, traits);
         // Rule 120 syscall trampoline — names anonymous syscall stubs
         if(traits.hasSyscall && traits.byteSize <= 64)
             detectSyscallTrampoline(func, traits);
@@ -4759,7 +4830,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
         }
-        if(s50 && s51 && s52 && s53) {
+        // v9.1: strict (all 4) OR loose (3 of 4 including 0x50 BITBLTBUF).
+        int cnt = (s50?1:0)+(s51?1:0)+(s52?1:0)+(s53?1:0);
+        if(s50 && cnt >= 3) {
             traits.bitbltbufMacroSequence = true;
             traits.writesBitbltbufReg = true;
         }
@@ -4789,7 +4862,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             }
         }
         traits.loadsChcrStartConst = loaded101;
-        if(loaded101 && !traits.dmaKickChannels.isEmpty())
+        // v9.1: dmaKickChannels often empty because raw-MMIO scan misses
+        // composite addrs. Fall back to dmaTagIdsBuilt OR storedDmaTagIds
+        // OR touchesGifCtrl as kick-context indicator.
+        if(loaded101 && (!traits.dmaKickChannels.isEmpty()
+                       || !traits.dmaTagIdsBuilt.isEmpty()
+                       || !traits.storedDmaTagIds.isEmpty()
+                       || traits.touchesGifCtrl
+                       || traits.path3Initiator))
             traits.dmaChcrStartKick = true;
     }
 
@@ -5066,18 +5146,29 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
-    // v9 Rule 122/123: 1-2 BB function whose only branch targets entry (spin).
-    // Plus: backward branch into break/syscall/nop-only block (fail loop).
+    // v9 Rule 122/123 (v9.1 loosened): infinite spin = small body, has backward
+    // branch, no `jr ra` return. F27 evidence: entry_0x100008 inlines MainLoop
+    // and never returns — original 1-2-BB + self-branch shape missed it.
+    // Also: backward branch into break/syscall/nop-only block (fail loop).
     private void detectInfiniteLoops(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
         long entryPc = func.getEntryPoint().getOffset();
         int branchCount = 0;
         boolean selfBranchSeen = false;
         boolean failBranchSeen = false;
+        boolean backwardBranchSeen = false;
+        boolean returnSeen = false;
         while(it.hasNext()) {
             Instruction inst = it.next();
             String mn = inst.getMnemonicString(); if(mn == null) continue;
             String mll = mn.toLowerCase();
+            // jr ra terminator detection (function returns somewhere).
+            if(mll.equals("jr")) {
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.lang.Register &&
+                       ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("ra"))
+                        returnSeen = true;
+            }
             if(!(mll.startsWith("b") || mll.equals("j") || mll.equals("jal"))) continue;
             if(mll.startsWith("bal")) continue;
             ghidra.program.model.address.Address[] flows = inst.getFlows();
@@ -5088,10 +5179,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 if(ft == entryPc || ft == inst.getAddress().getOffset()) selfBranchSeen = true;
                 if(ft < inst.getAddress().getOffset() && (ft >= entryPc) &&
                    func.getBody().contains(fa)) {
-                    // Backward branch within body. Capture as patch candidate.
+                    backwardBranchSeen = true;
                     if(traits.patchCandidatePcs.size() < 32)
                         traits.patchCandidatePcs.add(inst.getAddress().getOffset() & 0xFFFFFFFFL);
-                    // Examine the target's first 4 insns for break/syscall/nop-only.
                     try {
                         Instruction probe = currentProgram.getListing().getInstructionAt(fa);
                         int look = 0;
@@ -5111,7 +5201,11 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
         }
-        if(branchCount <= 2 && selfBranchSeen) traits.isInfiniteSpinLoop = true;
+        // v9.1: strict shape (≤2 branches + self-target) OR loose shape (backward
+        // branch + no jr ra reachable). Loose form catches F27 inlined-MainLoop class.
+        if((branchCount <= 2 && selfBranchSeen) ||
+           (backwardBranchSeen && !returnSeen && traits.byteSize > 0))
+            traits.isInfiniteSpinLoop = true;
         if(failBranchSeen) traits.containsInfiniteFailLoop = true;
     }
 
@@ -5189,14 +5283,96 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if(slots.size() >= 4) traits.isStructInitializer = true;
     }
 
-    // v9 Rule 131: stamp DC2 hardcoded role from KNOWN_DC2_FUNCTION_ADDRESSES.
+    // v9.1: detectAdRegImmediateStores (General Rule A port). Sharpens
+    // PRIM/RGBAQ/TEX0/ZBUF/DISPFB/BITBLTBUF writer detection via const-tracked
+    // sd/sw of an A+D reg id. Distinct from raw MMIO scan (which catches
+    // GS priv reg writes at 0x12000000+, not GIF A+D payloads).
+    private void detectAdRegImmediateStores(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            } else if(mll.equals("sd") || mll.equals("sw") || mll.equals("sq")) {
+                Object[] dop = inst.getOpObjects(0);
+                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                if(src != null && regConsts.containsKey(src)) {
+                    long v = regConsts.get(src);
+                    if(v <= 0x6CL) {
+                        if(v == 0x00L) traits.writesGsPrimReg = true;
+                        else if(v == 0x01L) traits.writesRgbaqReg = true;
+                        else if(v == 0x06L || v == 0x07L) traits.writesTex0Reg = true;
+                        else if(v == 0x4EL || v == 0x4FL) traits.writesZbufReg = true;
+                        else if(v == 0x59L || v == 0x5BL) traits.writesDispfbReg = true;
+                        else if(v == 0x50L) traits.writesBitbltbufReg = true;
+                        // Track named hit for JSON gsRegHits set.
+                        String nm = KNOWN_GS_REGS.get(v);
+                        if(nm != null) traits.gsRegHits.add(nm);
+                    }
+                }
+            }
+        }
+    }
+
+    // v9.1: aggressive PSMT-constant scan. Walks every const-load and matches
+    // PSMT4HH (0x2C), PSMT4HL (0x24), PSMT8H (0x1B), PSMT8 (0x13), PSMT4 (0x14).
+    // Looser than the existing Rule 73/87 path — accepts the constant in any
+    // reg, any context.
+    private void detectPsmConstantsAggressive(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            long imm = -1;
+            String dr = null;
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") ||
+               mll.equals("daddiu") || mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            }
+            for(Long cBoxed : regConsts.values()) {
+                long c = cBoxed & 0xFFFFFFFFL;
+                if(c == 0x2CL || c == 0x24L || c == 0x1BL)
+                    traits.loadsPsm4hhConstant = true;
+                if(c == 0x13L) traits.loadsPsm4hhConstant = true;
+                if(c > 0 && c <= 0x3FFFL) traits.tbpConstantsLoaded.add(c);
+                if(EXPECTED_DBP_SET.contains(c)) {
+                    for(Object[] row : EXPECTED_UPLOADS) {
+                        if(((Number)row[2]).longValue() == c)
+                            traits.assetUploadTagsHit.add((String)row[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    // v9 Rule 131 (v9.1): stamp DC2 hardcoded role from KNOWN_DC2_FUNCTION_ADDRESSES
+    // when address matches. Counter incremented separately in pre-scan so totals
+    // are address-uniqueness based, not per-getTraits-call.
     private void stampDc2KnownRole(long addr, FuncTraits traits) {
         for(Object[] row : KNOWN_DC2_FUNCTION_ADDRESSES) {
             if(((Number)row[0]).longValue() != addr) continue;
             traits.dc2KnownPhase       = (String)row[2];
             traits.dc2KnownRole        = (String)row[3];
             traits.dc2KnownCriticality = (String)row[4];
-            dc2KnownAddressMatched++;
             return;
         }
     }
