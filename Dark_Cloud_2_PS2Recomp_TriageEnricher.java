@@ -1,527 +1,790 @@
-// PS2Recomp Triage Enricher v11.1 (DC2 Edition) - Ghidra Script (Step 2 of Pipeline)
+// PS2Recomp Triage Enricher v12 (DC2 Edition) - Ghidra Script (Step 2 of Pipeline)
 // ==================================================================
 // Run AFTER ExportPS2Functions.java on the same Ghidra project.
 //
-// WHAT'S NEW IN v11.1 (re-entrant evolving-config workflow + lock):
-//   RE-ENTRANT INPUT  The step1 input may now be a PREVIOUS enricher output
-//          (evolving config_auto_recomp.toml workflow) instead of the frozen
-//          DAC.toml. writeUnifiedConfig sanitizes its own artifacts on read
-//          (header comment block, advisory pointer comment, any old
-//          [triage_advisory] section + banner + commented patch candidates),
-//          so headers/advisory never stack across runs.
-//   COUNT RECOMPUTE   stub_count / skip_count recomputed from ACTUAL array
-//          contents (old `old + new - rescued` delta math compounded on
-//          re-entrant input).
-//   PROVENANCE SPLIT  entries under a "# --- Triage Enricher" marker parse
-//          as step1_source = "enricher_prev" (vs "exporter") in the JSON.
-//   LOCK              `"name@0xADDR",  # LOCKED` trailing comment or a
-//          `locked = ["..."]` array in [general]: the keep gate is BYPASSED
-//          and no promote pass (drawing-chain / ctor-risk / sceVu0 / v13
-//          binding firewall / Rule 161b) ever rescues the binding. Use for
-//          deliberate F-phase stubs that carry no host-boundary evidence -
-//          without the lock the gate would strip them and silently regress
-//          the working build. Locked entries: STEP1_LOCKED tag,
-//          "step1_locked": true, statistic step1_locked_kept. Only the Rule
-//          158 overlay veto beats a lock; Rule 151 name mismatch still
-//          surfaces for review but does not unbind.
-//   ELF_HASH EMBED    output [general] now carries `elf_hash = "<md5>"` of
-//          THIS ELF, so the next re-entrant run gets the Rule 154 identity
-//          guard automatically.
+// RULES (1-164) - organized numerically for AI readability
+// ================================================================
 //
-// WHAT'S NEW IN v11 (DC2 Edition; schema 11.0 - port of General v13-v15.5
-// benchmark hardening: SF3, FF1/Himuro ground truth, Jak 1/2/3 tri-game):
-//   STEP1 VETTING (Rule 9 REWRITE) DAC.toml stub/skip entries are no longer
-//          trusted blindly and skipped. Every function is analyzed and
-//          included in the JSON with provenance (origin = auto/step1/
-//          override); inherited bindings survive only through a
-//          high-confidence keep gate (host-boundary evidence: syscall / SIF
-//          RPC / IRX / IPU-MPEG / SDK thunk). Everything else is rescued to
-//          RECOMPILE, dropped from the unified TOML, and documented in the
-//          JSON "rescued_from_step1" ledger (reason/evidence/derived_from).
-//          TOML executes, JSON explains.
-//   RADAR REWRITE  Exact-name set + word-boundary prefix families replace
-//          bare startsWith() (FF1 stubbed `exponent` via "exp"; DC2's
-//          Scene*/mg* can never collide with "sce" again). Pure-computation
-//          names (mem*/str*/math/_Z/__sti/malloc) REMOVED from stub
-//          candidacy; a radar stub now also needs trait corroboration.
-//   v13 BINDING FIREWALL  post-pass rescues stub/skip entries that are
-//          address-taken callbacks / dispatch-table targets / init-chain
-//          members / render-critical (RUNTIME_CONFIRMED = Rule 155 veto).
-//          SKIP no longer fires on hasSyscall||hasCOP0 (game ISRs use
-//          di/ei/mfc0); only bare syscall-trampoline shapes skip.
-//   v13 DETECTOR GATES  INFINITE_SPIN_LOOP requires storeOps==0 (copy loops
-//          stored every iteration -> NOP-patch would corrupt data);
-//          PSMT4HH_REFERENCE requires GS-side context; VIF_OPCODE_BUILDER
-//          requires independent VIF/DMA/GIF evidence; A+D writer flags need
-//          >=2 distinct GS reg ids (`flag=1` stores tagged 464 funcs on SF3).
-//   v14    SIF_PACKET_BUILDER demotion (16-byte-stride SIF RPC headers were
-//          reported as GIF tag builders); native_impl_needed + review
-//          advisory lists.
-//   Rule 151 STEP1_NAME_MISMATCH   name@addr disagrees with ELF symbol ->
-//          stale/wrong-region DAC.toml; forced RECOMPILE + review.
-//   Rule 152 dual-binding hygiene  entry in BOTH stubs and skip -> keep stub.
-//   Rule 153 RUNTIME-HANDLER ROSTER  scrapes ps2xRuntime (tries
-//          D:\ps2r\PS2Recomp\ps2xRuntime first, then asks) for implemented
-//          handler names; bound stubs without a handler get
-//          NO_RUNTIME_HANDLER -> native_impl_needed + review; per-func
-//          has_runtime_handler in JSON. Roster-backed keeps beat promote
-//          passes (handler existence = intent + tested implementation).
-//   Rule 154 ELF IDENTITY GUARD    DAC.toml `elf_hash` vs this ELF's md5.
-//   Rule 156 MAINLOOP SHIELD DEPTH-3 (capped 768; was direct callees only).
-//   Rule 157 SUGGESTED TRIAGE RETURNS  per bound stub: reta0 /
-//          ret0_or_ret1_ab_test / ret0 / ret0_then_verify.
-//   Rule 158 OVERLAY GUARD         overlay-block bindings vetoed;
-//          out-of-text bindings tagged OUT_OF_TEXT_BINDING -> review.
-//   Rule 159 SYSCALL_TRAMPOLINE POLICY  trampoline shape decided FIRST:
-//          STUB only when the runtime implements the handler by name; SKIP
-//          only when xref count is 0; otherwise RECOMPILE (recompiler turns
-//          `syscall` into runtime->handleSyscall(), always correct).
-//   Rule 160 STRIPPED TRAMPOLINE NAME RECOVERY  decoded $v1 immediate ->
-//          EE_SYSCALL_NAMES -> roster -> bind "Handler@0xADDR".
-//   Rule 161/161b DYNAMIC_CODE_LOADER  FlushCache + file/archive evidence
-//          (same body or layered across the call graph). DC2 is a single
-//          flat ELF: statistic should be 0; non-zero is a project red flag.
-//   Bugfixes (General R-W): UTF-8 everywhere (utf8Writer/utf8Reader; cp125x
-//          hosts emitted mojibake into the JSON); jsonString full RFC 8259
-//          control-char escaping; EE_SYSCALL_NAMES rebuilt against pcsx2
-//          R5900OpcodeImpl.cpp + ps2xRuntime Dispatcher.cpp (0x66/0x67/0x68
-//          were wrong; i-variant negative encodings added; runtime handler
-//          spellings); detectSyscallTrampoline $v1 always wins over spurious
-//          scalars; single-line TOML arrays parsed + rewritten correctly;
-//          Rule 78 TBP list gated on GS-side evidence (trampolines reported
-//          "TBP constants").
-//   Output-surface split (v15.2): unified TOML = executable safe subset +
-//          pointer comment; full advisory content (incl. all DC2 categories)
-//          moved to triage_map.json "triage_advisory" as {entry, tags}
-//          objects. Set EMIT_VERBOSE_TOML_ADVISORY=true for legacy behavior.
+// Rule 1  No DANGEROUS_KEYWORDS (removed - was killing game logic)
+// Rule 2  IOP_MODULE_STRINGS: only .IRX/.irx + specific module names (no .BIN/.DAT)
+// Rule 3  referencesIopModule: size cap 800 bytes (larger = game logic)
+// Rule 4  accessesHardware: DATA references only (not CALL/FLOW)
+// Rule 5  accessesHardware - ACCESSES_MMIO tag only (not disposition)
+// Rule 6  KSEG1 masking in all address checks (addr & 0x1FFFFFFF)
+// Rule 7  isKernelInternal replaces isRadarBehaviorallyDangerous (syscall+COP0 only)
+// Rule 8  IOP refs - STUB, kernel internals - SKIP
+// Rule 9  TOML parser: handles name-only AND name@address entries
+// Rule 10 Whitelist: entry/_start exempt from all firewalls; BUSY_WAIT_HAZARD with backward branch + jal to syscall stub
+// Rule 11 MainLoop shield: ML + depth-1 callees exempt (manual or auto-detect)
+// Rule 12 $gp fallback: lui+addiu scan in entry point for stripped binaries
+// Rule 13 SMC detection: function boundaries + instruction-at-target check
+// Rule 14 No lui scanner for VIF (didn't work, removed)
+// Rule 15 No VIF_DMA_UPLOAD tag (ACCESSES_MMIO covers it)
+// Rule 16 vcallms - VU0_MICROCODE - forced STUB
+// Rule 17 jr $reg (reg!=ra) - COMPLEX_CONTROL_FLOW tag; ORPHAN_CODE tag for zero-xref functions; Unified config output
 //
-// WHAT'S NEW IN v10.1 (PCSX2-source- + recomp-skill-grounded; schema 10.1):
-//   Five rules surfaced by reading the bundled PCSX2 emulator source (pcsx2/)
-//   and the recompilation skill (skill/), filtered to signals NOT already in
-//   Rules 1-145, cleanly static, and mapping to real static-recompiler failures.
-//   Rule 146 COMPUTED_JUMP_TARGETS      Back-solves computed `jr $reg` switch
-//          tables: harvests Ghidra's resolved jump-table destinations per site
-//          and emits them (top-level `computed_jump_targets`) so the recompiler
-//          can pre-populate its indirect-jump dispatch instead of panicking on an
-//          unknown target. Sites with no resolved target → COMPUTED_JUMP_UNRESOLVED
-//          (the real risk set). (jalr $t9 vtable slots remain in virtual_dispatch_sites.)
-//   Rule 147 COP2_SPECIAL_OPS_REVIEW    EE COP2 macro ops beyond the Rule 140
-//          dest-mask blends — vdiv/vsqrt/vrsqrt (EFU Q latency), vclipw (CLIP
-//          flag), vrnext/vrget/vrxor (R register), vmr32, vwaitq/p, vopmsub/
-//          vopmula, xgkick. The F51.8 fix log explicitly says to spot-check these;
-//          they share the COP2 codegen path that reversed the dest mask. Firewalled
-//          against STUB.
-//   Rule 148 FPU_NONIEEE_SENSITIVE      EE FPU is non-IEEE (no denormals/NaN,
-//          truncation, soft div/sqrt). Flags funcs that write FPU control
-//          (ctc1/cfc1) or use div.s/sqrt.s/rsqrt.s while FPU-heavy — naive host
-//          float diverges (collision/physics drift).
-//   Rule 149 SDK_COVERAGE_AUDIT         Cross-references every SDK-shaped callee
-//          (sce*) against the known rosters + game_override bindings; emits
-//          `sdk_coverage_audit` partitioned into must_implement / must_stub /
-//          coverage_gap (called but neither bound nor recognized → needs a
-//          stub/implement decision before the recomp build).
-//   Rule 150 OVERLAY_LOADER             Detects EE code-overlay exec/load callees
-//          (LoadExecPS2/ExecPS2/LoadModuleBuffer ...). Static recompilers assume a
-//          flat address space; an overlay game needs per-bank TOMLs. Empty for a
-//          single-binary game (DC2) — absence is itself the finding.
+// Rule 18 DC2_GAME_OVERRIDE_PARSER: Reads dc2_game_override.cpp (or any *_game_override.cpp)
+//        and imports every bindAddressHandler / registerFunction address as already-classified.
+//        Prevents re-stubbing functions that the runtime has already manually bound.
 //
-// WHAT'S NEW IN v10 (DC2 Phase F47-F52 retrospective — the dungeon-render era):
-//   The v9 knowledge froze at F46.6. F47-F52 found whole new failure CLASSES;
-//   these rules surface them statically so they never cost 50 phases again.
-//   Rule 140 COP2_DESTMASK_VERIFY      VU0-macro COP2 ops with a PARTIAL dest
-//          field (.xy / .z / .xyz ...). F51.8 ROOT CAUSE: the recompiler emitted
-//          the COP2 dest-component blend mask in REVERSED lane order, so every
-//          partial-dest op wrote X/Y/Z into the wrong SIMD lane → ALL VU0-macro
-//          3D perspective transforms degenerate (off-screen) → dungeon black for
-//          50+ phases. Full `.xyzw` masks are symmetric → spared → hid the bug
-//          behind working 2D/UI. Emits per-func partial/full counts + dest_fields
-//          and a top-level `cop2_partial_dest_risk` list (Vertex__11mgCDrawPrim,
-//          mgInversMatrix, mgClipBox*, mgDistVector*). Firewalled against STUB.
-//   Rule 141 STATIC_INIT_MANIFEST       For every `__sinit_*` (no jal caller —
-//          runs only via the global-ctors table) emit the globals/vtables it
-//          installs + UNCALLED_STATIC_INIT. F50.4/F50.7: un-run __sinit leaves a
-//          global object's vtable pointer null → its virtual init dispatch
-//          silently no-ops (MainScene+0x10548=__vt__6CScene; CRandomCircle /
-//          CGeoStone). Top-level `static_init_manifest` is replayable.
-//   Rule 142 MEMORY_ALLOCATOR_NEVER_STUB Allocator / pool-init / placement-new /
-//          array-ctor (memoryInit, Alloc__9mgCMemory, __nw__, construct_new_array,
-//          stAlloc, SetHeapMem). F50.1/F50.2: auto-stubbing one returns 0 → null
-//          pool → construct-on-null = garbage vtable PC (masquerades as a bad
-//          ctor). Forced RECOMPILE; top-level `memory_allocators` list.
-//   Rule 143 GUEST_LOCK_HOG_CANDIDATE   Thread yield/spin function that may hold
-//          the single guest-execution mutex without releasing it (GamePadStep →
-//          RotateThreadReadyQueue syscall 0x2B). F49.5/F50 menu→dungeon deadlock.
-//   Rule 144 EABI_ARG_T0                Function reads $t0 ($a4) before defining
-//          it — consuming the MIPS-EABI 5th integer arg. F50.1/F50.2: DC2 passes
-//          arg5 in $t0, not on the stack; a CRT/runtime override must match.
-//   Rule 145 MAP_CLUT_PSMCT16_UPLOADER  BITBLTBUF writer that loads a PSMCT16
-//          (dpsm=0x2) constant. F50.8-F50.11: the dungeon map texture subsystem
-//          (tbp=0x2580 / CLUT cbp=0x2980 PSMCT16) is separate from
-//          mgCTextureManager and its CLUT is NEVER transferred → empty CLUT →
-//          black.
-//   Refreshed Rules 131-135/107/104: KNOWN_DC2_FUNCTION_ADDRESSES (+InitDungeonMain,
-//          DngStep, Vertex__mgCDrawPrim, sceVu0InversMatrix, __sinit_mainloop, …),
-//          TBP labels (map 0x2580/CLUT 0x2980/T8 0x3220, RTT fbp 0x139),
-//          runtime invariants (COP2 lane reversal, Path2-DIRECT map, mgDBuffID),
-//          call chains (dungeon_init / dungeon_render / thread_yield_lock), pad
-//          scripts (F48.4 costume-confirm, F50.6 debug-dungeon-0), trace flags
-//          (DC2_TRACE_VU1 / RENDER_QUALITY / HANG / DC2_DEBUG_MENU), and a new
-//          `sce_vu0_unimplemented` roster. Schema version bumped to 10.0.
+// Rule 19 CONVENTION_VIOLATION tag: Detects functions where Ghidra's decompiler reports a0/a1
+//        arg aliasing or where the function writes to $a1 as if it were a return buffer
+//        (pattern from GetFullPath__FPcPc bug in Phase F5).
 //
-// WHAT'S NEW IN v9 (DC2-targeted; folds in General v11/v12 detectors +
-// DC2 PROJECT_STATE.md F21-F46.6 knowledge):
-//   Rule 113 GIF_TAG_INLINE_BUILDER         4-stride store cluster (0/8/0x10/0x18)
-//          to a common base, with stored constants whose upper byte encodes a
-//          GIFtag REGS/FLG field. Catches mgEndFrame / drawing-prim packet
-//          builders that the v8 raw-MMIO detectors miss.
-//   Rule 114 BITBLTBUF_MACRO_SEQUENCE       Function stores const 0x50/0x51/0x52/0x53
-//          (BITBLTBUF / TRXPOS / TRXREG / TRXDIR) — a complete upload macro
-//          regardless of dpsm. Auto-sets writesBitbltbufReg.
-//   Rule 115 DMA_CHCR_START_KICK            Loads const 0x101 (STR | TIE) AND
-//          writes to a known DMA channel CHCR (Path3 starter detection).
-//   Rule 116 DMA_SOURCE_CHAIN_TAG_BUILDER   Stores composite const with high
-//          nibble 0x10/0x30/0x40/0x50/0x60/0x70 at offset 0 of any base —
-//          CNT/REF/REFS/CALL/RET/END source-chain DMA tags.
-//   Rule 117 VIF_TAG_STORED_IMMEDIATE       Any store of const-tracked reg
-//          whose upper byte matches VIF_OPCODES — captures MPG/MSCAL/UNPACK
-//          built ahead of DMA kick (Rule 67 detected lui only).
-//   Rule 118 DMA_TAG_STORED_IMMEDIATE       Same for high-nibble DMA tag ids.
-//   Rule 119 COMPOSITE_MMIO_RECOVERY        Tracks lui+ori|addiu|or composite
-//          values per reg and matches against every EE peripheral range. Fixes
-//          MMIO miss when Ghidra doesn't ref-flag the synthesised addr (the
-//          F26 vu_micromem=0 / F31 vif1 chunk class of false negatives).
-//   Rule 120 SYSCALL_TRAMPOLINE             addiu $v1,$zero,N; syscall; jr ra
-//          stub — names the function from EE_SYSCALL_NAMES (db-syscalls.md).
-//   Rule 121 BACKWARD_BRANCH_SYNC_WAIT      Small body, backward branch, polls
-//          a load/syscall in body — F24 / F27 / F28 host-wait blocker class.
-//          Tagged DC2_HOST_WAIT_CANDIDATE when also in mainLoopShield.
-//   Rule 122 INFINITE_SPIN_LOOP             1-2 BB function whose only branch
-//          targets its entry. Same family as F24's never-returning dispatch
-//          path; quietly retired by the F23c libgcc unblock.
-//   Rule 123 INFINITE_FAIL_LOOP             Backward branch into a `break`/
-//          `syscall` / `nop`-only block — assertion / panic loops.
-//   Rule 124 IRX_LOADER                     >=2 calls to sceSifLoadModule, or
-//          1 call + IRX path string ref. IOP-side init function.
-//   Rule 125 IOP_REBOOT_HANDLER             Calls sceSifRebootIop.
-//   Rule 126 RENDER_FRAME_ENTRY             Name match against the DC2 render
-//          frame entry list (mgEndFrame*, mgEndDraw*, mgBeginFrame*,
-//          BeginDrawing*, EndDrawing*).
-//   Rule 127 STRUCT_INITIALIZER             Non-ctor func that writes >=4
-//          distinct +K($a0) slots. Catches mgInit-style initializers the
-//          ctor demangler misses.
-//   Rule 128 FUNCTION_POINTER_TABLES        Scans non-.text initialized
-//          blocks for runs of >=3 valid function entry pointers (tag-tolerant
-//          for boxed pointers). Discovers vtables Ghidra didn't auto-create.
-//          Tags entries DISPATCH_TABLE_TARGET and table-reading funcs
-//          TABLE_DISPATCH_CALL. Anonymous classes named Class_0xADDR / slot N.
-//   Rule 129 MODULE_CLUSTERS                Connected components on jal
-//          edges. Each function gets module_id; module addr lists emitted at
-//          top level. Useful for grouping mg*/mgC*/CScene/CMap/CMenu code.
-//   Rule 130 NAME_PREFIX_MODULES            Prefixes of length 2-6 occurring
-//          >=5 times — surfaces engineer-visible subsystems independent of
-//          callgraph.
-//   Rule 131 DC2_KNOWN_FUNCTION_ADDRESSES   Hardcoded address -> {name,phase,
-//          role,criticality} map from PROJECT_STATE.md so the report tool
-//          can lay out priority lists without re-deriving them.
-//   Rule 132 DC2_KNOWN_TBP_LABELS           VRAM heatmap labels per memory
-//          invariants doc (T8_map=0x2720, font_4HH=0x10E0, CLUT_T4HH=0x3FDC,
-//          mgDBuff_fbp=0x68, HUD_font_cache=16284..16316).
-//   Rule 133 DC2_RUNTIME_INVARIANTS         Top-level section listing every
-//          invariant confirmed across all 9 GS dumps (Path1/2 dead, REGLIST/
-//          IMAGE2 never used, IMR=0x7F00, PMODE=0x7F23, FRAME PSM=0, ZBUF
-//          PSM=1, HUD pages 16324..16348). Lets the report tool gray-out
-//          functions whose only output is into a confirmed-dead pipe.
-//   Rule 134 DC2_CALL_CHAINS                Pre-computed forward callgraphs
-//          for the 5 critical chains: save_to_map_load / title_to_menu /
-//          texture_upload / frame_loop / render_chain.
-//   Rule 135 DC2_PAD_INPUT_SCRIPTS          Working DC2_PAD_INPUT scripts
-//          from F40/F42/F46 fix logs — embedded so the runtime side can
-//          re-use them as headless input templates.
-//   Rule 136 SCORE_FOCUS_SYNTH              Fallback for focus_set when zero
-//          bullseyes fire — picks top-32 by static score.
-//   Rule 137 TRIAGE_ADVISORY_TOML           New TOML appendix [triage_advisory]
-//          with nop / patch / force_recompile categorised lists, each line
-//          carrying a 4-tag prioritised comment.
-//   Rule 138 STUB_TOML_TAG_COMMENTS         Every spliced stub/skip entry
-//          gets ` # TAG1,TAG2,TAG3` so ps2recomp.exe operators can triage
-//          at a glance.
-//   Rule 139 DISCOVERED_IOP_SIDS_SECTION    Aggregated map of every detected
-//          SID with its caller list — captures ezMIDI / save data / loader
-//          RPCs the hardcoded KNOWN_IOP_SIDS table misses.
-//   Schema version bumped to 9.0.
+// Rule 20 INIT_LARGE_FUNC guard: Functions named *init* / *Init* / *__ct__* / *__sinit_*
+//        that have calleeCount > 10 OR byteSize > 2000 are tagged INIT_LARGE_FUNC and
+//        forced to RECOMPILE (not nop-stubbed). Prevents the Phase F4 bug where init__Fv
+//        (large, spawns threads) was silently nop'd.
 //
-// WHAT'S NEW IN v8 (DC2 Phase F36-F49 retrospective + forward F47):
-//   Tier 0 — Broken-counter fixes
-//   Rule 86 VIF_BUILDER counter wiring   counters now incremented; per-func
-//          vif_opcodes_built[] retained.
-//   Rule 87 PSMT constant — expand match Now also matches addiu/li-zero, ori-zero,
-//          single-imm li for 0x2C/0x24/0x1B/0x13/0x2D (T4HH/T4HL/T8H/PSMCT16/T4).
-//   Rule 88 LIBGCC_INTRINSIC exact-name  Hardcoded list (__divdi3 etc.) wired
-//          alongside regex; PS2 64-bit single-reg ABI tag.
-//   Rule 89 JALR_T9 accept-any-flow      Counter no longer gated on flow type;
-//          tail_call_indirect splits direct vs $t9.
-//   Rule 90 SPR_SYNC split fields        uses_spr / has_sync_instr / spr_sync_combined
-//          emitted separately.
-//   Rule 91 BITBLTBUF_T4HH depth-2       Caller of an uploader also tagged via
-//          asset_upload_traces post-pass; runtime menu_only no longer suppresses.
+// Rule 21 DMA_CHAIN_TTE_RISK tag: Functions that call both a DMA Send variant AND touch
+//        VIF1-range MMIO (0x10009000) are tagged DMA_CHAIN_TTE_RISK. Flags potential
+//        TTE=0 + embedded VIFcodes patterns (Phase F7 root cause).
 //
-//   Tier 1 — New detectors (F36/F42/F46.5/F46.6/F49 root causes)
-//   Rule 92 CTOR class+global+vtable     Demangled __ct__ class name, vtable
-//          install offset, vtable target addr, caller mode (direct_only /
-//          indirect_only / dual / unobserved), assigned-to-global flag, sibling
-//          ctor calls, ctor_risk_tier (CRITICAL / HIGH / MEDIUM / LOW).
-//   Rule 93 CLASS_REGISTRY top-level     classes section grouping ctors / dtor /
-//          methods / vtable_addr / has_virtual_draw / instantiation_sites.
-//   Rule 94 VIRTUAL_DISPATCH_SITES       Per-func list of `lw $rX,K($a0); lw $rY,K2($rX); jalr $rY`
-//          dispatch sites; slot offset captured.
-//   Rule 95 GLOBAL_RETURN_TRACKING       For every jal site, look ahead for
-//          `sw $v0, +imm($gp)` to discover ctor->global bindings. Catches F46.5
-//          TitleCamera null-deref class of bugs. Auto-extends known_dc2_globals.
-//   Rule 96 GIF_NLOOP_DOUBLE_COUNT_RISK  Function that calls both
-//          makeGiftagAplusD/MakeGiftagAplusD and closePacketGifTag (Rule 86 F37).
-//   Rule 97 PAD_BUTTON_MASK_CONSUMER     andi/and against a known PS2 pad mask
-//          constant. Emits pad_masks_tested[] with friendly names.
-//   Rule 98 OVERRIDE_CLASSIFICATION      Parses dc2_game_override.cpp helper
-//          bodies; tags each binding as nop_stub / constant_return / state_machine
-//          / probe / real_shim; flags retire_candidate.
-//   Rule 99 FILE_PATH_SPRINTF_SOURCE     Caller of LoadFile2/sceCdRead/sceOpen
-//          whose $a0 argument was set by sprintf with %s format; emits the
-//          format string when resolvable.
-//   Rule 100 FRAME_CLOCK_DRIVER          Function calls sceGsSyncV / WaitVSync /
-//          mgEndFrame; emit per-func + collect frame_clock_drivers[].
-//   Rule 101 SIF_CALL_RPC_FID            Capture the constant passed in $a1
-//          to sceSifCallRpc (function-id) alongside SID.
-//   Rule 102 SCEVU0_HELPER_MUSTIMPL      Whitelist sceVu0* matrix/vector
-//          helpers; never auto-stubbed; emitted with vu0_helper_family.
+// Rule 22 IOP_RPC_DISPATCH tag: Detects the sceSifCallRpc / sceSifBindRpc pattern + sid
+//        constant scan. Extracts the SID literal if found, emits it into JSON for
+//        cross-referencing with ps2_iop.cpp known SIDs.
 //
-//   Tier 2 — Top-level schema additions
-//   Rule 103 ASSET_UPLOAD_TRACES         Cross-references gs_runtime_evidence
-//          vram_upload_tbps_union and bitbltbuf_dpsms_union against per-func
-//          ori/li constants + writes_bitbltbuf_reg. Back-solves which ELF
-//          func should emit the missing T8 dbp=0x2720 dpsm=0x13 upload.
-//   Rule 104 CURRENT_PHASE_INPUTS        Expected upload manifest (dpsm/dbp
-//          pairs per phase) consumed by asset_upload_traces.
-//   Rule 105 CALL_CHAINS                 save_to_map_load / title_to_menu /
-//          texture_upload — pre-computed forward callgraphs to bullseye sinks.
-//   Rule 106 BUILD_INVARIANTS            Build cmd + do-not-modify list emitted
-//          for downstream tools.
-//   Rule 107 PHASE_TRACE_FLAGS           Inventory of DC2_TRACE_* env flags.
+// Rule 23 ARCHIVE_IO tag: Detects DATA.DAT / DATA.HD2 string references inside I/O wrapper
+//        functions (from Phase F6). Tags for human review; these are game-specific archive
+//        stubs that need real implementations, not nop returns.
 //
-//   Tier 3 — Quality of life
-//   Rule 108 C++ DEMANGLER               Itanium-style __ct__<digits><name>F<args>,
-//          __dt__, __vt__, method-mangled names. Adds class_name+method_name to
-//          per-func record.
-//   Rule 109 DIFF MODE                   If prior triage_map.json sits next to
-//          output, emit `delta` section listing new/changed/removed funcs.
-//   Rule 110 OVERRIDE_COVERAGE_REPORT    For every game_override binding, flag
-//          retire_candidate based on current static signals.
-//   Rule 111 SDK_CALLER_DEDUP_COUNT      Companion *_via_sdk_caller depth-1
-//          metric for every count-zero raw-MMIO detector.
-//   Rule 112 SCHEMA_VERSION              8.0.
+// Rule 24 PAD_POLL_LOOP tag: Detects the busy-wait pattern: small function, calls
+//        scePadGetState (or has a loop branch + jal), byteSize < 200. Phase F3.5 lesson:
+//        always flag pad-state polling loops early.
+//
+// Rule 25 (reserved/skipped)
+//
+// Rule 26 CTOR_FIELD_WRITER: __ct__ that writes *(this+K); never nop-stub
+// Rule 27 VTABLE_SETTER: CTOR + lui+addiu constant -> *(this+K) (vtable)
+// Rule 28 POLL_RETURN_CONSUMER: Tiny returner polled by a backward-branching caller
+// Rule 29 A0_PASSTHROUGH_RETURNER: move $v0,$a0/$a1 — auto-stub returning 0 breaks chains
+// Rule 30 PROCESS_TERMINATOR: _Exit/abort/TerminateLibrary — never nop_stub
+// Rule 31 LIBGCC_INTRINSIC: __[u]div/mod/mul/fix/floatXXdiYY libgcc helpers
+// Rule 32 GIF_PATH3_HAZARD: Touches GIF CTRL/CHCR or GS PRIM offset (0x00)
+// Rule 33 Z_BUFFER_ALIAS_RISK: ZBUF reg + dsll32/dsrl32 shift-24 pattern (4HH font)
+// Rule 34 MPEG_DECODER_TRAP: Calls sceIpu*/sceMpeg*/sceDvd* or refs mpeg.irx
+// Rule 35 DISPFB_WRITER: Writes GS reg 0x59/0x5B (DISPFB1/DISPFB2)
+// Rule 36 VIF1_TAGHI_BUILDER: VIF1 channel MMIO + dsll32/dsrl32 (DMAtag tag-high)
+// Rule 37 TAIL_CALL_INDIRECT: Terminal jr $reg (reg!=ra) as a call/computed flow
+// Rule 38 INDIRECT_CALL_T9: jalr $t9 count > 0 (vtable / PIC dispatch)
+// Rule 39 mainloop_depth: BFS depth from MainLoop (-1 if unreachable)
+// Rule 40 init_chain_depth: BFS depth from entry/_start
+// Rule 41 archive_io_callers: Per ARCHIVE_IO function, named caller list
+// Rule 42 jalSites dedup: Set semantics on (callSitePc,target) — fixes 3-count anomaly
+// Rule 43 IS_SCE_GIF_PK_REF_LOAD_IMAGE: Bullseye for the 4HH/Path3 guard
+// Rule 44 PATH3_INITIATOR: Writes to GIF CHCR (0x1000A000) — Path3 starters
+// Rule 45 SCE_GIF_PK_FAMILY: sceGifPk*/sceVif1Pk* roster
+// Rule 46 TEX0_REG_WRITER: GS reg 0x06/0x07 writers (TEX state corruption hunt)
+// Rule 47 PRIM_REG_READER: Reads GS reg 0x00 (PRIM corruption witnesses)
+// Rule 48 RGBAQ_WRITER: Writes GS reg 0x01 (vertex color setters)
+// Rule 49 DMA_KICK_PATTERN: Writes any DMA channel CHCR base (+0x00)
+// Rule 50 DMA_QWC_TADR_WRITER: Writes any DMA channel +0x20 (QWC) / +0x30 (TADR)
+// Rule 51 MICROCODE_UPLOADER: VIF1 MMIO + load from .text/.data (MPG payload)
+// Rule 52 AUDIO_RPC_HANDLER: sceSd*/sceSpu2*/libsd.irx audio path
+// Rule 53 MESWIN_LOADER: Refs string "meswin" — dialogue rendering pipeline
+// Rule 54 MC_TRANSITION_GATE: *ForMC/*McCheck*/*McError* small gates (FinishForMC pattern)
+// Rule 55 known_dc2_globals: JSON map of known DC2 gp-relative offsets
+// Rule 56 is_top_priority_fix: Derived: any community-bullseye tag is set
+// Rule 57 focus_set: Top-level array of every top-priority function
+// Rule 58 CORRECTED GS privileged MMIO map (0x12000070=DISPFB1, 0x12000090=DISPFB2, ...)
+// Rule 59 ACCESSES_IPU_MMIO: 0x10002000-0x10003000 — MPEG decoder hardware
+// Rule 60 WRITES_IPU_CMD: 0x10002000 — the MPEG kick (sub-MPEG_DECODER_TRAP)
+// Rule 61 GIF_PATH3_REG_TOUCHER: GIF_P3CNT (0x10003090) or GIF_P3TAG (0x100030A0)
+// Rule 62 GIF_FIFO_DIRECT_WRITER: 0x10006000 — bypass-DMA GIF write
+// Rule 63 VIF1_FIFO_DIRECT_WRITER: 0x10005000 — bypass-DMA VIF1 write
+// Rule 64 VIF0_FIFO_DIRECT_WRITER: 0x10004000
+// Rule 65 ACCESSES_VU_MICROMEM: VU0/VU1 micro-mem ranges (0x11000000/0x11008000)
+// Rule 66 ACCESSES_VU_DATAMEM: VU0/VU1 data-mem ranges
+// Rule 67 VIF_OPCODE_BUILDER: lui constant matches MPG/MSCAL/DIRECT/UNPACK opcode
+// Rule 68 VIF_MPG_OPCODE_BUILDER: lui 0x4A__ pattern (microcode upload)
+// Rule 69 VIF_MSCAL_OPCODE_BUILDER: lui 0x14__/0x15__ (kick)
+// Rule 70 VIF_DIRECT_OPCODE_BUILDER: lui 0x50__/0x51__ (GIF inline)
+// Rule 71 VIF_UNPACK_OPCODE_BUILDER: lui 0x60__-0x7F__ (vertex upload)
+// Rule 72 DMA_TAG_BUILDER: lui constant matches CNT/REF/REFS/CALL/RET/END/REFE
+// Rule 73 PSMT4HH_REFERENCE: lui/ori constant == 0x2C (font Z-buffer alias PSM)
+// Rule 74 SBUS_IOP_COMM_TOUCHER: 0x1000F200 (MSCOM) / 0x1000F210 (SMCOM)
+//
+// Rule 75 DISPFB_SDK_WRITER: Callee in {sceGsPutDispEnv, sceGsSetDispEnv, sceGsSetCRTC,
+//        mgSetDispEnv, sceGsResetGraph} — picks up SDK-routed DISPFB writers that
+//        the raw-MMIO Rule 35/58 misses. Includes GS-dump runtime corroboration input:
+//        optional folder of `*.gs.summary.json` from gs_dump_to_summary.py.
+//
+// Rule 76 PATH3_KICK_VIA_DMA_API: Caller of sceDmaSend*/sceGifSendChain*/
+//        sceGsSwapDBuff/sceGsExecStoreImage — the SDK-routed Path3 starters
+//        (raw-CHCR Rule 44 misses them).
+//
+// Rule 77 (reserved/skipped)
+//
+// Rule 78 VRAM_TBP_OVERLAY: Constants (lui/ori/addiu/li) matching runtime-witnessed
+//        tex0_tbps or vram_upload_tbps; emitted as `tbp_constants_loaded` + intersection
+//        with merged runtime as `tbp_runtime_confirmed`. TBP list gated on GS-side evidence
+//        (trampolines reported "TBP constants").
+//
+// Rule 79 GS_IRQ_HANDLER_SAFE_STUB: Name matches Signal/Finish/Label/Intc/sceGsSyncH/V
+//        handler shape AND all loaded GS-dump captures show IMR fully masking GS IRQs →
+//        tag as safe-stub candidate (decoration; no auto disposition flip).
+//
+// Rule 80 runtime_corroboration: Per-function block cross-checking static bullseye
+//        predictions against the merged runtime evidence. Adds tags:
+//        RUNTIME_CONFIRMED — at least one bullseye prediction has a witness.
+//        RUNTIME_DORMANT_GLOBAL — bullseye predictions but zero runtime witness.
+//        RUNTIME_MENU_ONLY — PSMT4HH_REFERENCE only witnessed in UI checkpoints
+//        (Inventory/Pause/Character/UI scenes), not in 3D-scene captures.
+//        gs_runtime_evidence top-level JSON block with per-checkpoint facts + merged unions.
+//
+// Rule 81 focus_set re-rank: Confirmed entries first, dormant last.
+//
+// Rule 82 CTOR_MULTI_FIELD_INITIALIZER: Ctor / Initialize that writes >= 5 distinct
+//        this+K slots in first 40 instructions. F33 caught __ct__11mgCDrawPrimFv nop-stubbed
+//        → manager/PRIM/Q/Z slots all garbage → entire Begin/Texture/Color chain dead.
+//        Firewalled against STUB classification (forceRecompile).
+//
+// Rule 83 DRAWING_CHAIN_DEPTH: BFS from GS-bullseye roots (sceGifPk family, PATH3_INITIATOR,
+//        mgEndFrame, Begin__11mgCDrawPrim). Functions with chain_depth <= 6 firewalled
+//        against STUB. Locks in F33's TitleModeDraw -> PrimQuad -> SetSpriteEnv -> Begin chain.
+//
+// Rule 84 LIFECYCLE_LAZY_INIT_GUARD: Initialize* / Begin__ / Open* / Acquire* whose first
+//        instructions read this+0x00 and branch on zero, with byteSize > 50. The
+//        "if (manager==null) { install manager; }" pattern that F33 had to manually override.
+//        Firewalled.
+//
+// Rule 85 BITBLTBUF_T4HH_UPLOADER: Function writes BITBLTBUF (GIF reg 0x50) AND loads
+//        PSMT4HH/4HL/8H constant. The F32 BITBLTBUF.dpsm=0x2C upload bullseye. Tagged
+//        separately from generic PSMT4HH_REFERENCE (which is sampler-side TEX0.psm) so
+//        runtime menu_only does not deprioritize these. RUNTIME_MENU_ONLY refinement:
+//        skip the tag when the function is a BITBLTBUF_T4HH_UPLOADER or drawing_chain_depth <= 3.
+//
+// Rule 86 VIF_BUILDER counter wiring: counters now incremented; per-func vif_opcodes_built[] retained.
+// Rule 87 PSMT constant — expand match: Now also matches addiu/li-zero, ori-zero, single-imm li
+//        for 0x2C/0x24/0x1B/0x13/0x2D (T4HH/T4HL/T8H/PSMCT16/T4).
+// Rule 88 LIBGCC_INTRINSIC exact-name: Hardcoded list (__divdi3 etc.) wired alongside regex;
+//        PS2 64-bit single-reg ABI tag.
+// Rule 89 JALR_T9 accept-any-flow: Counter no longer gated on flow type; tail_call_indirect splits direct vs $t9.
+// Rule 90 SPR_SYNC split fields: uses_spr / has_sync_instr / spr_sync_combined emitted separately.
+// Rule 91 BITBLTBUF_T4HH depth-2: Caller of an uploader also tagged via asset_upload_traces
+//        post-pass; runtime menu_only no longer suppresses.
+//
+// Rule 92 CTOR class+global+vtable: Demangled __ct__ class name, vtable install offset,
+//        vtable target addr, caller mode (direct_only / indirect_only / dual / unobserved),
+//        assigned-to-global flag, sibling ctor calls, ctor_risk_tier (CRITICAL / HIGH / MEDIUM / LOW).
+//
+// Rule 93 CLASS_REGISTRY top-level: classes section grouping ctors / dtor / methods /
+//        vtable_addr / has_virtual_draw / instantiation_sites.
+//
+// Rule 94 VIRTUAL_DISPATCH_SITES: Per-func list of `lw $rX,K($a0); lw $rY,K2($rX); jalr $rY`
+//        dispatch sites; slot offset captured.
+//
+// Rule 95 GLOBAL_RETURN_TRACKING: For every jal site, look ahead for `sw $v0, +imm($gp)`
+//        to discover ctor->global bindings. Catches F46.5 TitleCamera null-deref class of bugs.
+//        Auto-extends known_dc2_globals.
+//
+// Rule 96 GIF_NLOOP_DOUBLE_COUNT_RISK: Function that calls both makeGiftagAplusD/
+//        MakeGiftagAplusD and closePacketGifTag (Rule 86 F37).
+//
+// Rule 97 PAD_BUTTON_MASK_CONSUMER: andi/and against a known PS2 pad mask constant.
+//        Emits pad_masks_tested[] with friendly names.
+//
+// Rule 98 OVERRIDE_CLASSIFICATION: Parses dc2_game_override.cpp helper bodies; tags
+//        each binding as nop_stub / constant_return / state_machine / probe / real_shim;
+//        flags retire_candidate.
+//
+// Rule 99 FILE_PATH_SPRINTF_SOURCE: Caller of LoadFile2/sceCdRead/sceOpen whose $a0
+//        argument was set by sprintf with %s format; emits the format string when resolvable.
+//
+// Rule 100 FRAME_CLOCK_DRIVER: Function calls sceGsSyncV / WaitVSync / mgEndFrame;
+//        emit per-func + collect frame_clock_drivers[].
+//
+// Rule 101 SIF_CALL_RPC_FID: Capture the constant passed in $a1 to sceSifCallRpc
+//        (function-id) alongside SID.
+//
+// Rule 102 SCEVU0_HELPER_MUSTIMPL: Whitelist sceVu0* matrix/vector helpers; never
+//        auto-stubbed; emitted with vu0_helper_family.
+//
+// Rule 103 ASSET_UPLOAD_TRACES: Cross-references gs_runtime_evidence vram_upload_tbps_union
+//        and bitbltbuf_dpsms_union against per-func ori/li constants + writes_bitbltbuf_reg.
+//        Back-solves which ELF func should emit the missing T8 dbp=0x2720 dpsm=0x13 upload.
+//
+// Rule 104 CURRENT_PHASE_INPUTS: Expected upload manifest (dpsm/dbp pairs per phase)
+//        consumed by asset_upload_traces.
+//
+// Rule 105 CALL_CHAINS: save_to_map_load / title_to_menu / texture_upload — pre-computed
+//        forward callgraphs to bullseye sinks.
+//
+// Rule 106 BUILD_INVARIANTS: Build cmd + do-not-modify list emitted for downstream tools.
+// Rule 107 PHASE_TRACE_FLAGS: Inventory of DC2_TRACE_* env flags.
+//
+// Rule 108 C++ DEMANGLER: Itanium-style __ct__<digits><name>F<args>, __dt__, __vt__,
+//        method-mangled names. Adds class_name+method_name to per-func record.
+//
+// Rule 109 DIFF MODE: If prior triage_map.json sits next to output, emit `delta` section
+//        listing new/changed/removed funcs.
+//
+// Rule 110 OVERRIDE_COVERAGE_REPORT: For every game_override binding, flag retire_candidate
+//        based on current static signals.
+//
+// Rule 111 SDK_CALLER_DEDUP_COUNT: Companion *_via_sdk_caller depth-1 metric for every
+//        count-zero raw-MMIO detector.
+//
+// Rule 112 SCHEMA_VERSION: 12.0 (v12 adds Rules 165-177).
+//
+// Rule 113 GIF_TAG_INLINE_BUILDER: 4-stride store cluster (0/8/0x10/0x18) to a common base,
+//        with stored constants whose upper byte encodes a GIFtag REGS/FLG field. Catches
+//        mgEndFrame / drawing-prim packet builders that the v8 raw-MMIO detectors miss.
+//
+// Rule 114 BITBLTBUF_MACRO_SEQUENCE: Function stores const 0x50/0x51/0x52/0x53
+//        (BITBLTBUF / TRXPOS / TRXREG / TRXDIR) — a complete upload macro regardless of dpsm.
+//        Auto-sets writesBitbltbufReg.
+//
+// Rule 115 DMA_CHCR_START_KICK: Loads const 0x101 (STR | TIE) AND writes to a known DMA
+//        channel CHCR (Path3 starter detection).
+//
+// Rule 116 DMA_SOURCE_CHAIN_TAG_BUILDER: Stores composite const with high nibble
+//        0x10/0x30/0x40/0x50/0x60/0x70 at offset 0 of any base — CNT/REF/REFS/CALL/RET/END
+//        source-chain DMA tags.
+//
+// Rule 117 VIF_TAG_STORED_IMMEDIATE: Any store of const-tracked reg whose upper byte
+//        matches VIF_OPCODES — captures MPG/MSCAL/UNPACK built ahead of DMA kick
+//        (Rule 67 detected lui only).
+//
+// Rule 118 DMA_TAG_STORED_IMMEDIATE: Same for high-nibble DMA tag ids.
+//
+// Rule 119 COMPOSITE_MMIO_RECOVERY: Tracks lui+ori|addiu|or composite values per reg and
+//        matches against every EE peripheral range. Fixes MMIO miss when Ghidra doesn't
+//        ref-flag the synthesised addr (the F26 vu_micromem=0 / F31 vif1 chunk class
+//        of false negatives).
+//
+// Rule 120 SYSCALL_TRAMPOLINE: addiu $v1,$zero,N; syscall; jr ra stub — names the function
+//        from EE_SYSCALL_NAMES (db-syscalls.md).
+//
+// Rule 121 BACKWARD_BRANCH_SYNC_WAIT: Small body, backward branch, polls a load/syscall
+//        in body — F24 / F27 / F28 host-wait blocker class. Tagged DC2_HOST_WAIT_CANDIDATE
+//        when also in mainLoopShield.
+//
+// Rule 122 INFINITE_SPIN_LOOP: 1-2 BB function whose only branch targets its entry. Same
+//        family as F24's never-returning dispatch path; quietly retired by the F23c libgcc
+//        unblock. INFINITE_SPIN_LOOP requires storeOps==0 (copy loops stored every iteration
+//        -> NOP-patch would corrupt data).
+//
+// Rule 123 INFINITE_FAIL_LOOP: Backward branch into a `break`/`syscall` / `nop`-only block
+//        — assertion / panic loops.
+//
+// Rule 124 IRX_LOADER: >=2 calls to sceSifLoadModule, or 1 call + IRX path string ref.
+//        IOP-side init function.
+//
+// Rule 125 IOP_REBOOT_HANDLER: Calls sceSifRebootIop.
+//
+// Rule 126 RENDER_FRAME_ENTRY: Name match against the DC2 render frame entry list
+//        (mgEndFrame*, mgEndDraw*, mgBeginFrame*, BeginDrawing*, EndDrawing*).
+//
+// Rule 127 STRUCT_INITIALIZER: Non-ctor func that writes >=4 distinct +K($a0) slots.
+//        Catches mgInit-style initializers the ctor demangler misses.
+//
+// Rule 128 FUNCTION_POINTER_TABLES: Scans non-.text initialized blocks for runs of >=3
+//        valid function entry pointers (tag-tolerant for boxed pointers). Discovers
+//        vtables Ghidra didn't auto-create. Tags entries DISPATCH_TABLE_TARGET and
+//        table-reading funcs TABLE_DISPATCH_CALL. Anonymous classes named Class_0xADDR / slot N.
+//
+// Rule 129 MODULE_CLUSTERS: Connected components on jal edges. Each function gets module_id;
+//        module addr lists emitted at top level. Useful for grouping mg*/mgC*/CScene/CMap/CMenu code.
+//
+// Rule 130 NAME_PREFIX_MODULES: Prefixes of length 2-6 occurring >=5 times — surfaces
+//        engineer-visible subsystems independent of callgraph.
+//
+// Rule 131 DC2_KNOWN_FUNCTION_ADDRESSES: Hardcoded address -> {name,phase,role,criticality}
+//        map from PROJECT_STATE.md so the report tool can lay out priority lists without
+//        re-deriving them. (+v11.3 block): VU1 model render+kick chain, character draw chain,
+//        CRunScript event VM, front-end, treemap/pad path, UI-text repros.
+//
+// Rule 132 DC2_KNOWN_TBP_LABELS: VRAM heatmap labels per memory invariants doc
+//        (T8_map=0x2720, font_4HH=0x10E0, CLUT_T4HH=0x3FDC, mgDBuff_fbp=0x68,
+//        HUD_font_cache=16284..16316). (+G-era atlas/CLUT pages 0x2aa0 title,
+//        0x2920/0x2c20 fukusel/cursor, 0x3fd4/0x3fd8 CLUTs).
+//
+// Rule 133 DC2_RUNTIME_INVARIANTS: Top-level section listing every invariant confirmed
+//        across all 9 GS dumps (Path1/2 dead, REGLIST/IMAGE2 never used, IMR=0x7F00,
+//        PMODE=0x7F23, FRAME PSM=0, ZBUF PSM=1, HUD pages 16324..16348). Lets the
+//        report tool gray-out functions whose only output is into a confirmed-dead pipe.
+//        (+G-era): EE_SCRATCHPAD_DMA_CH8_9_REQUIRED, SUBWORD_DMA_STR_KICK,
+//        VU1_XGKICK_LIVE_FOR_CHARACTER_MODELS, STALE_PTR_CACHE_CTOR, UNFUNDED_GUEST_HEAP_OOM,
+//        EVENT_VM_AUDIO_GATED_STALL, LIVE_PAD_IS_read_pad_stub, DC2_KEY_GLOBALS roster.
+//
+// Rule 134 DC2_CALL_CHAINS: Pre-computed forward callgraphs for the 5 critical chains:
+//        save_to_map_load / title_to_menu / texture_upload / frame_loop / render_chain.
+//        (+character_model_vu1 / event_script_vm / costume_select).
+//
+// Rule 135 DC2_PAD_INPUT_SCRIPTS: Working DC2_PAD_INPUT scripts from F40/F42/F46 fix logs
+//        — embedded so the runtime side can re-use them as headless input templates.
+//        (+F64 dungeon/opening, +G9 costume).
+//
+// Rule 136 SCORE_FOCUS_SYNTH: Fallback for focus_set when zero bullseyes fire —
+//        picks top-32 by static score.
+//
+// Rule 137 TRIAGE_ADVISORY_TOML: New TOML appendix [triage_advisory] with nop / patch /
+//        force_recompile categorised lists, each line carrying a 4-tag prioritised comment.
+//
+// Rule 138 STUB_TOML_TAG_COMMENTS: Every spliced stub/skip entry gets ` # TAG1,TAG2,TAG3`
+//        so ps2recomp.exe operators can triage at a glance.
+//
+// Rule 139 DISCOVERED_IOP_SIDS_SECTION: Aggregated map of every detected SID with its caller
+//        list — captures ezMIDI / save data / loader RPCs the hardcoded KNOWN_IOP_SIDS table misses.
+//
+// Rule 140 COP2_DESTMASK_VERIFY: VU0-macro COP2 ops with a PARTIAL dest field (.xy / .z / .xyz ...).
+//        F51.8 ROOT CAUSE: the recompiler emitted the COP2 dest-component blend mask in REVERSED
+//        lane order, so every partial-dest op wrote X/Y/Z into the wrong SIMD lane → ALL
+//        VU0-macro 3D perspective transforms degenerate (off-screen) → dungeon black for 50+ phases.
+//        Emits per-func partial/full counts + dest_fields and a top-level `cop2_partial_dest_risk`
+//        list (Vertex__11mgCDrawPrim, mgInversMatrix, mgClipBox*, mgDistVector*). Firewalled against STUB.
+//
+// Rule 141 STATIC_INIT_MANIFEST: For every `__sinit_*` (no jal caller — runs only via the
+//        global-ctors table) emit the globals/vtables it installs + UNCALLED_STATIC_INIT. F50.4/F50.7:
+//        un-run __sinit leaves a global object's vtable pointer null → its virtual init dispatch
+//        silently no-ops (MainScene+0x10548=__vt__6CScene; CRandomCircle / CGeoStone).
+//        Top-level `static_init_manifest` is replayable.
+//
+// Rule 142 MEMORY_ALLOCATOR_NEVER_STUB: Allocator / pool-init / placement-new / array-ctor
+//        (memoryInit, Alloc__9mgCMemory, __nw__, construct_new_array, stAlloc, SetHeapMem).
+//        F50.1/F50.2: auto-stubbing one returns 0 → null pool → construct-on-null = garbage
+//        vtable PC (masquerades as a bad ctor). Forced RECOMPILE; top-level `memory_allocators` list.
+//
+// Rule 143 GUEST_LOCK_HOG_CANDIDATE: Thread yield/spin function that may hold the single
+//        guest-execution mutex without releasing it (GamePadStep → RotateThreadReadyQueue syscall 0x2B).
+//        F49.5/F50 menu→dungeon deadlock.
+//
+// Rule 144 EABI_ARG_T0: Function reads $t0 ($a4) before defining it — consuming the MIPS-EABI
+//        5th integer arg. F50.1/F50.2: DC2 passes arg5 in $t0, not on the stack; a CRT/runtime
+//        override must match.
+//
+// Rule 145 MAP_CLUT_PSMCT16_UPLOADER: BITBLTBUF writer that loads a PSMCT16 (dpsm=0x2)
+//        constant. F50.8-F50.11: the dungeon map texture subsystem (tbp=0x2580 / CLUT cbp=0x2980
+//        PSMCT16) is separate from mgCTextureManager and its CLUT is NEVER transferred → empty CLUT → black.
+//
+// Rule 146 COMPUTED_JUMP_TARGETS: Back-solves computed `jr $reg` switch tables: harvests
+//        Ghidra's resolved jump-table destinations per site and emits them (top-level
+//        `computed_jump_targets`) so the recompiler can pre-populate its indirect-jump dispatch
+//        instead of panicking on an unknown target. Sites with no resolved target →
+//        COMPUTED_JUMP_UNRESOLVED (the real risk set). (jalr $t9 vtable slots remain
+//        in virtual_dispatch_sites.)
+//
+// Rule 147 COP2_SPECIAL_OPS_REVIEW: EE COP2 macro ops beyond the Rule 140 dest-mask blends
+//        — vdiv/vsqrt/vrsqrt (EFU Q latency), vclipw (CLIP flag), vrnext/vrget/vrxor (R register),
+//        vmr32, vwaitq/p, vopmsub/vopmula, xgkick. The F51.8 fix log explicitly says to spot-check
+//        these; they share the COP2 codegen path that reversed the dest mask. Firewalled against STUB.
+//
+// Rule 148 FPU_NONIEEE_SENSITIVE: EE FPU is non-IEEE (no denormals/NaN, truncation, soft div/sqrt).
+//        Flags funcs that write FPU control (ctc1/cfc1) or use div.s/sqrt.s/rsqrt.s while FPU-heavy
+//        — naive host float diverges (collision/physics drift).
+//
+// Rule 149 SDK_COVERAGE_AUDIT: Cross-references every SDK-shaped callee (sce*) against the known
+//        rosters + game_override bindings; emits `sdk_coverage_audit` partitioned into must_implement /
+//        must_stub / coverage_gap (called but neither bound nor recognized → needs a stub/implement
+//        decision before the recomp build).
+//
+// Rule 150 OVERLAY_LOADER: Detects EE code-overlay exec/load callees (LoadExecPS2/ExecPS2/
+//        LoadModuleBuffer ...). Static recompilers assume a flat address space; an overlay game needs
+//        per-bank TOMLs. Empty for a single-binary game (DC2) — absence is itself the finding.
+//
+// Rule 151 STEP1_NAME_MISMATCH: name@addr disagrees with ELF symbol → stale/wrong-region DAC.toml;
+//        forced RECOMPILE + review. Also: TRUNCATED NAMES (v9-era input truncated mangled C++ labels).
+//        step1 tokens bind by ADDRESS so these are NOT wrong-region drift - they were inflating
+//        name_mismatches. Now detected (isTruncatedNameOf), counted as step1_truncated_names, tagged
+//        STEP1_TRUNCATED_NAME, and passed through the NORMAL keep gate (decided on real traits)
+//        instead of force-rescued with a misleading "wrong-region?" reason.
+//
+// Rule 152 dual-binding hygiene: entry in BOTH stubs and skip -> keep stub.
+//
+// Rule 153 RUNTIME-HANDLER ROSTER: scrapes ps2xRuntime (tries D:\ps2r\PS2Recomp\ps2xRuntime first,
+//        then asks) for implemented handler names; bound stubs without a handler get
+//        NO_RUNTIME_HANDLER -> native_impl_needed + review; per-func has_runtime_handler in JSON.
+//        Roster-backed keeps beat promote passes (handler existence = intent + tested implementation).
+//
+// Rule 154 ELF IDENTITY GUARD: DAC.toml `elf_hash` vs this ELF's md5. output [general] now carries
+//        `elf_hash = "<md5>"` of THIS ELF, so the next re-entrant run gets the Rule 154 identity
+//        guard automatically.
+//
+// Rule 155 (reserved - veto override)
+//
+// Rule 156 MAINLOOP SHIELD DEPTH-3: capped 768; was direct callees only.
+//
+// Rule 157 SUGGESTED TRIAGE RETURNS: per bound stub: reta0 / ret0_or_ret1_ab_test / ret0 / ret0_then_verify.
+//
+// Rule 158 OVERLAY GUARD: overlay-block bindings vetoed; out-of-text bindings tagged OUT_OF_TEXT_BINDING
+//        -> review. The keep gate is BYPASSED for LOCKED entries and no promote pass (drawing-chain /
+//        ctor-risk / sceVu0 / v13 binding firewall / Rule 161b) ever rescues the binding. Only the
+//        Rule 158 overlay veto beats a lock.
+//
+// Rule 159 SYSCALL_TRAMPOLINE POLICY: trampoline shape decided FIRST: STUB only when the runtime
+//        implements the handler by name; SKIP only when xref count is 0; otherwise RECOMPILE
+//        (recompiler turns `syscall` into runtime->handleSyscall(), always correct).
+//
+// Rule 160 STRIPPED TRAMPOLINE NAME RECOVERY: decoded $v1 immediate -> EE_SYSCALL_NAMES -> roster
+//        -> bind "Handler@0xADDR".
+//
+// Rule 161 DYNAMIC_CODE_LOADER: FlushCache + file/archive evidence (same body or layered across
+//        the call graph). PRECISION: dynamic_code_loaders over-fired on DC2 (34 false: asset loaders
+//        that stream DATA.DAT/HD2 + FlushCache per DMA). Real code loader must EXECUTE loaded bytes
+//        - now requires an overlay/exec callee (LoadExecPS2/ExecPS2/LoadModuleBuffer) in the same body,
+//        and the layered Rule 161b post-pass only runs when the ELF has >=1 overlay-exec callee
+//        anywhere (overlay_loaders>0). DC2 (flat ELF, overlay_loaders=0) -> 0. DC2 is a single flat
+//        ELF: statistic should be 0; non-zero is a project red flag.
+//
+// Rule 162 SPR_DMA_STAGER / SUBWORD_DMA_STR_KICK: The G26 root-cause class, generalised. Flags funcs
+//        that program a fromSPR(ch8 0x1000D000)/toSPR(ch9 0x1000D400) DMA channel, and funcs that kick
+//        a DMA via a sub-word (sb/sh) store into a CHCR word (the STR bit). DC2 stages each VU1 model
+//        VIF packet in EE scratchpad then copies it into mgVif1Packet via a fromSPR DMA started by a
+//        `sb` to CHCR+1; a runtime whose writeIORegister only dispatches GIF/VIF1 word writes drops it
+//        -> empty model slot -> no XGKICK. Detected in BOTH the Ghidra-ref and the composite-MMIO-recovery
+//        scan paths; per-func + top-level `spr_dma_stagers` list (with override_hookable for the fix strategy).
+//
+// Rule 163 VU1_DOUBLE_BUFFER_FRAMER: Builds BASE+OFFSET VIFcodes = the TOPS double-buffer framing
+//        the model needs (the context G23/G24 hunted). Derived from vifOpcodesBuilt (BASE 0x03 +
+//        OFFSET 0x02 both present).
+//
+// Rule 164 STALE_PTR_CACHE_CTOR: A ctor that caches a derived global pointer (a Get*Ptr/Man/Data/Mgr
+//        callee result) into this+K. If it runs before the source is funded it caches 0/stale and the
+//        downstream Draw silently skips (G12 cursor / G13 names / F50.4). Repair idempotently in a
+//        per-frame wrapper, never in the ctor. Per-func emit: derived `override_hookable` (= called
+//        only via indirect jalr/jr $t9, never via direct jal). registerFunction overrides are consulted
+//        ONLY for indirect dispatch; a direct-jal-only function is NOT hookable that way and must be
+//        fixed by wrapping the jal target or codegen.
+//
+// ================================================================
+// v12 RULES (165-177) - DC2 G27-G52 retrospective + general PS2 RTT/present hazards
+// ================================================================
+//
+// Rule 165 VRAM_OVERLAP_MAP (top-level `vram_overlap_pairs`): cross-function VRAM page-aliasing
+//        hunt. Every G-phase from G33-G50 chased one bug class - a FRAME/ZBUF target whose VRAM
+//        page ALIASES a texture/CLUT page (the model RTT fbp=0x139 == tex page 0x2720; the costume
+//        Z block 0x1a00 == menu-text VRAM, G45). This pass intersects each function's loaded
+//        VRAM-page constants (tbpConstantsLoaded ∩ KNOWN_DC2_TBP_LABELS) with the GS reg KIND it
+//        writes (FRAME / ZBUF / TEX0 / BITBLTBUF / DISPFB) and emits pairs of functions that
+//        target the SAME labelled page with DIFFERING kinds → RTT_ALIAS / Z_ALIAS / TIMESHARE.
+//        One static signal that would have front-loaded ~20 phases of blind page hunting.
+//
+// Rule 166 RTT_TARGET (per-func): writesFrameReg AND loads a const that hits a known texture/CLUT
+//        page (or fbp 0x139) → tag RTT_TARGET + rtt_aliased_pages[]. Firewalled against STUB
+//        (G37/G44 had to hand-protect the in-place RTT writers).
+//
+// Rule 167 ZBUF_VRAM_ALIAS_RISK (per-func): writesZbufReg AND a loaded const hits a FRAME/texture
+//        page → the G45 root (synthetic Z block aliases live VRAM). Generalises the narrow v4
+//        Rule 33 (which only caught the 4HH dsll32 font shape).
+//
+// Rule 168 SKINNED_DRAW_CHAIN refresh: DC2_KNOWN_FUNCTION_ADDRESSES extended with the G26-G52
+//        skinned-model chain (DrawDirect__12CActionChara/CCharacter2, COutLineDraw, DrawDivSprite4,
+//        DeformMesh, MotionProc2, GetLWMatrix, mgInversMatrix, mgGetDrawRect). Marks skin_chain_role.
+//
+// Rule 169 VF0_DEPENDENT_INVERSE (per-func): a matrix-inverse helper (name ~Invers / mgInvers*)
+//        that uses COP2 + an EFU_Q-latency op (vdiv/vrsqrt → Q) feeding a vmulq. The G40 50-phase
+//        collapse: Q = vf0.w/det, and vf0.w must be the HW-hardwired 1. Emits a note that the
+//        runtime must pin vu0_vf[0]=(0,0,0,1). Firewalled against STUB.
+//
+// Rule 170 AUDIO_COMPLETION_GATE (per-func): backward-branch wait that polls an audio/stream
+//        completion signal (sceSifCheckStatRpc / StreamOpenState / sceSd* / voice-done flag).
+//        F63/F64 event stall class AND the #3 active foundation blocker (audio). Tagged
+//        DC2_AUDIO_GATED_STALL when also a sync-wait loop.
+//
+// Rule 171 MEMCARD_IO (per-func): calls the sceMc*/libmc save-data family (card detect / dir /
+//        file / format). #4 active blocker (save/load) - not yet implemented, so a roster of the
+//        subsystem entry points is pure forward-help. Top-level `memcard_io_roster`.
+//
+// Rule 172 EVENT_SCRIPT_VM: CRunScript VM materialised in DC2_KNOWN + DC2_RUNTIME_INVARIANTS
+//        (exe/resume/run @0x1873c0/0x1871e0/0x187210; layout +0x38 vmcode / +0x3c done / +0x40
+//        skip / +0x08 ext table; opcodes 3 push / 0x13 call / 0x15 ext / 0xf|0x1b end / 0x17 yield).
+//
+// Rule 173 PRESENTATION_FIELD_STATE (per-func): writes a GS privileged field/interlace reg
+//        (SMODE1 / SMODE2 / PMODE / CSR / SYNCV) beyond plain DISPFB. #5 blocker (interlace jitter).
+//        Top-level `presentation_field_writers`. General PS2: the deinterlace/field-timing surface.
+//
+// Rule 174 DISPLAY_BUFFER_FLIP (per-func): a DISPFB writer that is also a frame-clock driver or
+//        loads >=2 distinct fbp-shape constants → the double-buffer/present boundary signal G49
+//        needed (clear private Z once per flip). General PS2 double-buffer detection.
+//
+// Rule 175 CLUT_CACHE_INVALIDATOR (per-func): issues TEXFLUSH (GS reg 0x3F) or writes TEX0 while
+//        loading a known CLUT-page const. PROJECT_STATE flags CLUT upload / cache-invalidation as a
+//        top corruption suspect after allocator fixes; no prior detector. Top-level `clut_cache_ops`.
+//
+// Rule 176 PERF_HOT_FRAME_PATH (per-func, derived): mainloop_depth in [0,3] AND has a backward
+//        branch (inner loop) AND calleeCount high → frame-hot optimisation candidate. #7 blocker
+//        (few FPS). Static cannot measure frequency; ranks the suspects. Top-level `perf_hot_candidates`.
+//
+// Rule 177 GS_LOCAL_MEM_BUDGET (top-level `gs_local_mem_budget`): sum of distinct labelled VRAM
+//        pages referenced statically; flags >4MB (PS2 GS local memory) → bank-switched VRAM the
+//        recompiler's flat model would break. Pairs with Rule 150 overlay logic on the GS side.
+//
+// ================================================================
+// v13 RULES (178-189) - DC2 G53-G82 title-3D retrospective + general PS2 hazards
+// ================================================================
+//
+// Rule 178 CONDITIONAL_INIT_ON_GLOBAL (per-func): instruction-scan for the shape
+//        `lw $rX, <global>; beq/beqz $rX,$zero,skip; <stores that configure an object>`.
+//        G58/G81 KILLER (cost ~6 phases): TitleModeInit's camera-setup block runs only
+//        `if (TitleCamera != 0)`; headless TitleCamera@0x377E38 was still 0 (its producer
+//        had not run) → the block was skipped → the camera kept its ctor defaults
+//        (mgCCameraFollow distance=40/height=30/look-at-origin) → the rock cavern was out of
+//        frame. Same shape as the empty scene-camera slots (CScene::Initialize ordering).
+//        Generalises Rule 84 (LIFECYCLE_LAZY_INIT_GUARD, which only saw `this+0`) to a
+//        GLOBAL-guarded configuration block. Captures guard_globals + configured_slots.
+//        Firewalled against STUB. Feeds Rule 186.
+//
+// Rule 179 RENDER_MODE_SELECTOR (per-func): a function that picks a per-mesh render mode
+//        (copy/passthrough vs transform/VU-packer) and writes the selector into a render-info
+//        struct. G75-G80 (cost ~6 phases): every title map-part mesh was flagged TRANSFORM
+//        (`mgRENDER_INFO+0xfc4`!=0 → VU packers 0x1c50/0x1ff0/0x1dc0 whose +2048/ADC gate culls
+//        100%) instead of COPY (passthrough packer 0x1b68 that carries tbp + per-vertex ADC) →
+//        flat-blue background. The discriminator is `mgClipInBoxW@0x12f380` ret stored as the mode
+//        flag. Detected as: callee in the clip-test/render-mode roster OR name in the render-mode
+//        roster, with a store of the result. Top-level `render_mode_selectors`. Firewalled.
+//
+// Rule 180 VERTEX_LIGHTING_NORMAL_TERM (per-func): per-vertex directional-light path. G82:
+//        the title rock per-vertex SHADE had RED ≈ half HW (runner R≈36 vs HW R≈66) → MODULATEd
+//        brown texture went green everywhere; prime suspect = the title map-part directional-light
+//        N·L sign / normal-transform applied with the wrong sign (HW brightens R, runner darkens it).
+//        Detected as: callee in {GetLightInfo, mgSetLight, mgSetAmbient, mgSetFogParam, *Light*} OR
+//        (COP2 OUTER_PRODUCT/dot feeding an RGBAQ writer), with a draw-chain anchor. Top-level
+//        `vertex_lighting_terms`. Firewalled. Static cannot prove the sign — it ranks suspects.
+//
+// Rule 181 VTABLE_TAILCALL_THUNK (per-func): a terminal `jr $rX` (rX∉{ra,t9}) where $rX was
+//        loaded from `*(objptr + K)` (a vtable slot) — the inherited-virtual tail-call. G59:
+//        Draw__8mgCFrame@0x1387f0 (`a1=0; jr *(vtable+0x44)`) was mistranslated by the recompiler
+//        into a return-to-dispatcher ("Function at address 0xN not found") instead of completing
+//        the inherited call → mgDraw exited early → process fell through to _Exit. Distinct from
+//        Rule 37 (generic indirect tail) and Rule 38 (jalr $t9). Emits tailcall_vtable_slots[].
+//        Firewalled (recompiler-dispatch risk). General PS2: every C++ game with virtual inheritance.
+//
+// Rule 182 RTT_NO_RESTORE (per-func): an RTT_TARGET (Rule 166) FRAME writer that targets an RTT/
+//        texture page but does NOT also write a display-buffer FRAME (0x0/0x68) back in the same
+//        body → GS render-target / scissor left pointing at the RTT page. G79: after Title→New
+//        Game→costume→back, the costume RTT (fbp=0x139) was never restored → title 3D bg flat-blue.
+//        Top-level `rtt_no_restore`. General PS2: RTT scope leaks.
+//
+// Rule 183 TITLE_CHAIN_ROSTER refresh: KNOWN_DC2_FUNCTION_ADDRESSES + KNOWN_DC2_TBP_LABELS +
+//        DC2_RUNTIME_INVARIANTS + DC2_CALL_CHAINS extended with the G53-G82 title-3D facts
+//        (TitleLoop/TitleModeInit/TitleMapDraw, the clip-test render-mode discriminator, the
+//        copy vs transform packer addresses, mgRENDER_INFO lightInfo layout, TitleCamera globals,
+//        the per-vertex-RED-deficit invariant). Pure data — stops the report re-deriving them.
+//
+// Rule 184 VU_FLAG_PIPELINE_UPLOADER (per-func, advisory): an EE function that uploads VU
+//        microcode (Rule 51/68 MICROCODE_UPLOADER, or mgSendVuProg). The EE script cannot scan VU
+//        μcode, but G71 found the VU1 interpreter never maintained MAC/STATUS flags, so any
+//        FMEQ/FMAND/FMOR/FCAND→IBxx in an uploaded program evaluated against constant 0. Top-level
+//        `vu_flag_pipeline_uploaders` flags the upload sites whose programs need flag upkeep verified.
+//
+// Rule 185 LOOP_STATE_MODEL (top-level `loop_state_model`): the front-end/dungeon LoopNo legend +
+//        the mutually-exclusive front-end sub-states. G79: `LoopNo=3 && titleMode=2 && menuId=0x17`
+//        is an illegal-concurrent state (TitleLoop New-Game menu + MenuCostumeSel both live) that
+//        leaked GS state. Materialised so the report can flag draws reachable in contradictory states.
+//
+// Rule 186 INIT_ORDER_DEPENDENCY (top-level `init_order_hazards`, general PS2): cross-function
+//        producer→consumer ordering for globals. Builds global→writers (ctor/return-to-global/
+//        __sinit installs) and global→guarded-readers (Rule 178). Emits INIT_ORDER_HAZARD when a
+//        global is read-and-branched-on by a reader whose only writer is a __sinit / uncalled
+//        static-init (headless-init-ordering gap, the most reusable G58/G81 signal).
+//
+// Rule 187 PACKED_RGBAQ_BUILDER (per-func, advisory, general PS2): a GIF_TAG_INLINE_BUILDER
+//        (Rule 113) that also writes RGBAQ. G82: GIF PACKED RGBAQ is a SPREAD layout (R=byte0,
+//        G=byte4, B=byte8, A=byte12) — a contiguous parser gets (R,0,0,0). Flags the builders whose
+//        emitted PACKED vertex colour the runtime GS decode must read as spread. Top-level
+//        `packed_rgbaq_builders`.
+//
+// Rule 188 FRAME_RESUME_RISK (per-func, advisory, general PS2): a large draw/frame function that
+//        can be preempted/resumed mid-body (re-entered at an interior label) — G58/G59 resumed
+//        TitleMapDraw at an interior label with the wrong $sp ($0x830 too low) → garbage saved-$ra
+//        → bad-PC. Approximated as: byteSize large AND (render-frame-entry OR drawing_chain_depth in
+//        [0,6]) AND terminal indirect flow. Top-level `frame_resume_risk`.
+//
+// Rule 189 SCHEMA_VERSION: 13.0 (v13 adds Rules 178-189).
+//
+// ================================================================
+// v15 RULES (190-198) - DC2 G83-G115 retrospective + general PS2 ADC/packer,
+//                       allocator-coherence, frame-pacing, camera hazards
+// ================================================================
+//
+// Rule 190 GIFTAG_PRIM_CLASS_SELECTOR (per-func + top-level `prim_class_selectors`):
+//        an EE function that builds the VIF UNPACK selector qword (DC2 `qword38`) a VU
+//        dispatcher reads to PICK the PRIM-class packer (indep-tri / tristrip / trifan /
+//        copy). G77-G115 (cost ~30 phases) hand-decoded this every phase. DC2 anchor =
+//        CreateRenderInfoPacket__12mgCVisualMDT@0x1404d0; the selector bit formula is
+//        materialised as static metadata (bit0=fc0||fc4, bit1=fc4, bit2=desc+0x2c, ...).
+//        Detected as: name in PRIM_SELECTOR_NAMES, OR (builds a VIF UNPACK opcode AND is a
+//        render-mode selector). Firewalled against STUB. General PS2: every mg/libgraph-style
+//        VU engine routes primitives through a selector qword.
+//
+// Rule 191 ADC_KICK_VERTEX_SOURCE (per-func + top-level `adc_kick_sources`): the 50-phase
+//        title hole (G65-G115). The VU `+2048`/0x800 add that sets the per-vertex ADC
+//        ("Add Drawing Kick" suppression = tristrip strip-restart) is UNCONDITIONAL in the
+//        packer, so HW's selective ~60% pattern is driven by the per-vertex INPUT (the vertex
+//        `.w` / a per-vertex ADC flag in the EE-built geometry stream). The runner zeroes /
+//        uniformly-sets it (blue void or over-draw). Flags EE-side per-vertex geometry builders
+//        and classifies adc_source = input_driven_xyz3 (writes both XYZ2+XYZ3 = restart control
+//        present) / uniform_xyz2 / constant_kick (only the 0x800 add). Firewalled. THE signal
+//        that would have front-loaded the active blocker. General PS2: any VU1 tristrip game.
+//
+// Rule 192 XYZ2_VS_XYZ3_KICK_WRITER (per-func + top-level `kick_mode_writers`): GS reg 0x05
+//        XYZ2 (draw-kick) vs 0x0D XYZ3 (no-kick / strip-restart) writer. Both already in
+//        KNOWN_GS_REGS but had no detector. Alternating them is per-vertex drawing-kick control;
+//        in PACKED mode the ADC bit is bit 111 of the XYZ qword (a SPREAD field, cf. Rule 187
+//        RGBAQ). Detected via the const-tracked A+D reg store (0x05/0x0D). General PS2.
+//
+// Rule 193 TEXTURE_RELOAD_INTERLEAVE_HAZARD (per-func + top-level `texture_reload_interleave`):
+//        G90-G97 (cost ~8 phases). A "per-block reload" function binds MANY TEX0 up front then
+//        draws MANY batches in a loop, so each batch samples whatever was last-bound (HW binds
+//        one TEX0 per strip). Detected as: writes TEX0 AND a per-batch loop (backward branch)
+//        AND draw-kick evidence (gifTagInlineBuilder / path3 / indirect dispatch), or a
+//        texture-manager name. Advisory. General PS2: any block-batched texture pipeline.
+//
+// Rule 194 ALLOCATOR_FAMILY_COHERENCE (top-level `allocator_family` + `allocator_family_split`):
+//        the PROJECT_STATE regen caveat #1. malloc/_malloc_r, free/_free_r, realloc, calloc,
+//        memalign/_memalign_r, operator new/delete MUST all land on the SAME side (all runtime
+//        or all recompiled); a split heap frees through a different allocator → silent
+//        alignment / CLUT / menu corruption. Audits the whole family's dispositions and raises
+//        ALLOCATOR_FAMILY_SPLIT. A build-correctness invariant the map now enforces. General PS2.
+//
+// Rule 195 VSYNC_COUPLED_GAME_STEP (per-func + top-level `frame_pacing_drivers`): the #2
+//        foundation blocker (perf). The title game-loop steps logic only when render completes
+//        (~0.3-1.5x/s vs 30; G103/F52 half-rate). Flags functions that BOTH advance game state
+//        (writes globals, fan-out) AND wait on vsync/frame completion (FRAME_CLOCK_DRIVER /
+//        sceGsSyncV / mgEndFrame) in one body, shallow from the main loop. Static cannot measure
+//        FPS - it names the coupling site so the perf phase starts at the right function.
+//        Complements Rule 176 PERF_HOT_FRAME_PATH. General PS2.
+//
+// Rule 196 VIEW_PROJECTION_MATRIX_WRITER (per-func + top-level `view_projection_writers`):
+//        G98/G99. The SHARED camera/view-projection matrix (DC2 mgRENDER_INFO@0x380ec0 +0x10
+//        view / +0x110 proj / +0x150) was wrong while the per-part WORLD matrices were
+//        byte-perfect. Separates view/projection writers from world-matrix writers so an
+//        "off-screen geometry" bug routes to the camera source, not the (correct) world
+//        transform. Detected via camera/projection callee+name roster + a write to a renderinfo
+//        global. Firewalled. General PS2: every 3D engine with a shared view matrix.
+//
+// Rule 197 OBJECT_ARRAY_CTOR (per-func + top-level `object_array_ctors`): the G92 deferred
+//        georama null-vtable. An array of polymorphic objects (CEditMap+0x1054[i]) each needs
+//        its vtable; an auto-stubbed element ctor leaves vtable+K null → the indexed virtual
+//        dispatch (`*(base+i*stride + K)` jalr) faults (DrawSub__8CEditMapFi pc-zero). Extends
+//        Rule 142 construct_new_array with the construct-loop + the indexed-dispatch consumer.
+//        Firewalled against STUB. General PS2: any C++ game with arrays of virtual objects.
+//
+// Rule 184+ VU_EXEC_HAZARD_MANIFEST (top-level `vu_exec_hazard_manifest`): consolidation of the
+//        four worst VU/COP2 interpreter divergences this project burned phases on - Q-register
+//        latency (G87), MAC/STATUS/CLIP flag pipeline (G71), vf0=(0,0,0,1) (G40), COP2 dest-mask
+//        lane order (F51.8), plus EE-FPU/denormal clamp - emitted per relevant function as a
+//        checklist so a future regen/route cannot silently miss one. Derived from existing
+//        traits (no new scan). General PS2.
+//
+// Rule 198 SCHEMA_VERSION: 14.0 (v15 adds Rules 190-198; refreshes Rule 184).
+//
+// ================================================================
+// v15.1 RULES (199-202) - PCSX2 source cross-check (D:\ps2r\pcsx2-master).
+// All EE constants verified against PCSX2 (GS A+D reg ids GSRegs.h; PACKED ADC =
+// U32[3]&0x8000 = bit 111; DMA tag ids REFE=0..END=7 Dmac.h; VIF cmd map
+// Vif_Codes.cpp). These add the few HW behaviours PCSX2 models that no rule flagged.
+// ================================================================
+//
+// Rule 199 VIF_UNPACK_DECOMPRESS_STATE (per-func + top-level `vif_unpack_decompress_state`):
+//        PCSX2 Vif_Unpack.cpp/Vif_Codes.cpp. The VIF1 UNPACK path decompresses with STMOD
+//        (mode 1 = dest+MaskRow, mode 2 = difference-accumulate), STMASK (per-component 2-bit:
+//        0 data / 1 MaskRow / 2 MaskCol / 3 SKIP the VU-mem write), STCYCL (cl/wl fill-skip),
+//        STROW/STCOL (the row/col regs), plus ITOP/BASE/OFFSET (double-buffer framing). A
+//        runtime VIF that ignores mode/mask/row/col/cycle silently corrupts the unpacked
+//        vertex/colour stream. DC2 stages every VU1 model packet through UNPACK (G26 delivery).
+//        Detected from const-tracked VIF command bytes, GATED on independent VIF evidence
+//        (vifOpcodesBuilt / VIF1 MMIO / microcode upload / double-buffer framer). General PS2.
+//
+// Rule 200 GS_XYOFFSET_GUARD_BAND (per-func + top-level `xyoffset_guard_writers`): writes GS
+//        XYOFFSET (A+D 0x18/0x19) — the 12.4 guard-band centre (typ. 2048<<4). G88: the title
+//        rock's `+2048` integer bias places verts into the ±2047 guard band; an XYOFFSET /
+//        bias mismatch fans geometry off-screen. Pairs with Rule 191's kick_const_add (0x800).
+//        General PS2: every VU1 geometry game biases into the guard band.
+//
+// Rule 201 GS_TEX1_FILTER_WRITER (per-func + top-level `tex1_filter_writers`): writes GS TEX1
+//        (A+D 0x14/0x15) — MMAG/MMIN texture filter (+ MXL/LCM mip). G8: DC2 UI/HUD fonts are
+//        point-sampled (TEX1=0x201, MMAG/MMIN=0); "fix the blur" by changing filter mode is
+//        wrong. Flags the filter-mode setters so a sampling bug routes to TEX1, not the sampler.
+//        General PS2.
+//
+// Rule 184++ VU_EXEC_HAZARD_MANIFEST adds P_LATENCY: PCSX2 VUops.cpp confirms the VU EFU
+//        P-register pipeline (ESADD/ERSADD/ELENG/ERLENG/EATAN/ESUM/ESQRT/ERSQRT/ESIN/EEXP +
+//        WAITP) - reading P before WAITP gives the stale pipelined value (the exact G87 Q-latency
+//        class, separate register). Every microcode uploader's program is flagged to verify P
+//        (and Q) latency + MAC/STATUS/CLIP flags. EE script cannot scan VU microcode; it marks
+//        the upload sites. General PS2.
+//
+// Rule 202 SCHEMA_VERSION: 14.1 (v15.1 adds Rules 199-202; refreshes Rule 184 with P_LATENCY).
+//
+// ================================================================
+// v15.2 RULES (203-206) - skill cross-check (D:\ps2r\dc2\skill). The agent skill the
+// porter reads names FOUR silent-wrong recompiler codegen classes (SKILL.md L13;
+// 10-agent-guardrails L27/L64 "audit the WHOLE class"): VU0/COP2 partial-dest masks
+// (Rule 140), MMI, control-reg maps, branch thunks (Rule 181). It also lists CFC2/CTC2
+// in the 15-vu1-gs-debugging §2 VU checklist and a "sampled page with no upload" decisive
+// probe in §4.1. These add the rosters that let the AI sweep those whole classes.
+// ================================================================
+//
+// Rule 203 MMI_SIMD_OP (per-func + top-level `mmi_codegen_risk`): the EE R5900 Multimedia
+//        Instructions (128-bit SIMD integer: PADDW/PEXTLW/PMADDW/PCPYLD/PMFHL/PPACW/QFSRV...
+//        + the pipeline-1 ops MULT1/DIV1/MADD1/MFHI1/MFLO1). The recompiler can emit wrong
+//        C++ for these (lane/pack/HI1-LO1 errors) SILENTLY, exactly like the partial-dest
+//        class. No prior rule flagged them. Emits the roster so the AI can "audit the whole
+//        class" (guardrails L64) instead of one op at a time. General PS2.
+//
+// Rule 204 COP2_CONTROL_REG_ACCESS (per-func + top-level `cop2_control_reg_access`; adds
+//        CONTROL_REG_MAP to the Rule 184 manifest): CFC2/CTC2 read/write a VU0 control
+//        register by ARCHITECTURAL macro index (15-vu1-gs-debugging §2.1: STATUS=16, MAC=17,
+//        CLIP=18, R=20, I=21, Q=22, P=23, TPC=26, CMSAR0=27, FBRST=28, VPU_STAT=29,
+//        CMSAR1=31). The F51.8 audit found a control-reg map defect; the recompiler can map
+//        the numeric field to the wrong reg. Completes the §2 VU checklist coverage. Captures
+//        the index when resolvable. General PS2.
+//
+// Rule 205 UNFUNDED_TEXTURE_PAGE (top-level `unfunded_texture_pages`, advisory): the
+//        15-vu1-gs-debugging §4.1 DECISIVE probe materialised statically - a labelled VRAM
+//        page that is SAMPLED (a TEX0 writer loads its const) but has NO BITBLTBUF uploader
+//        in the static set → the "game binds a tbp/cbp the texture manager never uploads to"
+//        black-texture class. Static can miss composite/computed uploads (false positives),
+//        so it is flagged "confirm with a runtime BITBLTBUF-dbp counter", not asserted.
+//        Derived from the Rule 165 vramPageWriters map. General PS2.
+//
+// Rule 206 SCHEMA_VERSION: 14.2 (v15.2 adds Rules 203-206; surfaces the v15 hazard counts in
+//        functions_index statistics{}; fixes the per-func/index schema_version stamp).
+//
+// PIPELINE (v11.3): the script now asks "FIRST run for this ELF?" up front:
+//   - YES -> full pipeline. Delegates the Step-1 export to ExportPS2Functions via runScript,
+//            then enriches; emits csv + assembly + decompiled + flowchart + unified TOML + triage_map.json.
+//   - NO -> INCREMENTAL. Re-emits triage_map.json and MODIFIES the live config IN PLACE, but only
+//           when the executable content actually changed. Preserves # LOCKED + manual edits via the
+//           re-entrant+LOCK machinery. Pick NO whenever the ELF is unchanged.
+//
+// POST-REGEN COP2 (v11.3): emitCop2FixScript writes fix_cop2_destmask.py (RECOMP path pre-filled) +
+//   post_regen_steps.md beside the output, derived from this run's cop2_partial_dest_risk model.
+//   The F51.8 fix CANNOT run inside this Ghidra pass, so it ships with the map and is listed as
+//   a mandatory post-regen step.
+//
+// RE-ENTRANT INPUT: The step1 input may now be a PREVIOUS enricher output (evolving config_auto_recomp.toml
+//   workflow) instead of the frozen DAC.toml. writeUnifiedConfig sanitizes its own artifacts on read
+//   (header comment block, advisory pointer comment, any old [triage_advisory] section), so headers/advisory
+//   never stack across runs. COUNT RECOMPUTE: stub_count / skip_count recomputed from ACTUAL array contents.
+//   PROVENANCE SPLIT: entries under a "# --- Triage Enricher" marker parse as step1_source = "enricher_prev"
+//   (vs "exporter") in the JSON. LOCK: `"name@0xADDR",  # LOCKED` trailing comment or a `locked = ["..."]`
+//   array in [general]: the keep gate is BYPASSED and no promote pass ever rescues the binding. Use for
+//   deliberate F-phase stubs that carry no host-boundary evidence. Locked entries: STEP1_LOCKED tag,
+//   "step1_locked": true, statistic step1_locked_kept.
+//
+// OUTPUT-SURFACE POLICY (v11): unified TOML = executable safe subset + pointer comment; full advisory
+//   content (incl. all DC2 categories) moved to triage_map.json "triage_advisory" as {entry, tags} objects.
+//   UTF-8 everywhere (utf8Writer/utf8Reader); jsonString full RFC 8259 control-char escaping.
+//   EE_SYSCALL_NAMES rebuilt against pcsx2 R5900OpcodeImpl.cpp + ps2xRuntime Dispatcher.cpp.
+//   detectSyscallTrampoline $v1 always wins over spurious scalars; single-line TOML arrays parsed + rewritten correctly.
+//   STEP1 VETTING: DAC.toml stub/skip entries are no longer trusted blindly and skipped. Every function is analyzed
+//   and included in the JSON with provenance (origin = auto/step1/override); inherited bindings survive only through
+//   a high-confidence keep gate (host-boundary evidence). RADAR REWRITE: Exact-name set + word-boundary prefix
+//   families replace bare startsWith(). v13 BINDING FIREWALL: post-pass rescues stub/skip entries that are
+//   address-taken callbacks / dispatch-table targets / init-chain members / render-critical. v13 DETECTOR GATES:
+//   PSMT4HH_REFERENCE requires GS-side context; VIF_OPCODE_BUILDER requires independent VIF/DMA/GIF evidence;
+//   A+D writer flags need >=2 distinct GS reg ids. v14: SIF_PACKET_BUILDER demotion; native_impl_needed + review
+//   advisory lists. SKIP no longer fires on hasSyscall||hasCOP0 (game ISRs use di/ei/mfc0); only bare syscall-trampoline
+//   shapes skip.
 //
 // OUTPUTS:
 //   1. config_auto_recomp.toml - UNIFIED config ready for ps2recomp.exe
-//      (merges Step 1 config.toml + our triage additions)
 //   2. triage_map.json - full DNA map with tags for the report tool
 //
-// WHAT'S NEW IN v4 (learned from DC2 Phase F22-F31):
-//   Rule 26 CTOR_FIELD_WRITER       __ct__ that writes *(this+K); never nop-stub
-//   Rule 27 VTABLE_SETTER           CTOR + lui+addiu constant -> *(this+K) (vtable)
-//   Rule 28 POLL_RETURN_CONSUMER    Tiny returner polled by a backward-branching caller
-//   Rule 29 A0_PASSTHROUGH_RETURNER move $v0,$a0/$a1 — auto-stub returning 0 breaks chains
-//   Rule 30 PROCESS_TERMINATOR      _Exit/abort/TerminateLibrary — never nop_stub
-//   Rule 31 LIBGCC_INTRINSIC        __[u]div/mod/mul/fix/floatXXdiYY libgcc helpers
-//   Rule 32 GIF_PATH3_HAZARD        Touches GIF CTRL/CHCR or GS PRIM offset (0x00)
-//   Rule 33 Z_BUFFER_ALIAS_RISK     ZBUF reg + dsll32/dsrl32 shift-24 pattern (4HH font)
-//   Rule 34 MPEG_DECODER_TRAP       Calls sceIpu*/sceMpeg*/sceDvd* or refs mpeg.irx
-//   Rule 35 DISPFB_WRITER           Writes GS reg 0x59/0x5B (DISPFB1/DISPFB2)
-//   Rule 36 VIF1_TAGHI_BUILDER      VIF1 channel MMIO + dsll32/dsrl32 (DMAtag tag-high)
-//   Rule 37 TAIL_CALL_INDIRECT      Terminal jr $reg (reg!=ra) as a call/computed flow
-//   Rule 38 INDIRECT_CALL_T9        jalr $t9 count > 0 (vtable / PIC dispatch)
-//   Rule 39 mainloop_depth          BFS depth from MainLoop (-1 if unreachable)
-//   Rule 40 init_chain_depth        BFS depth from entry/_start
-//   Rule 41 archive_io_callers      Per ARCHIVE_IO function, named caller list
-//   Rule 42 jalSites dedup          Set semantics on (callSitePc,target) — fixes 3-count anomaly
-//   Plus:   known_gs_registers map + extended IOP module string list
-//
-// WHAT'S NEW IN v5 (community gap closure + DC2 next-step bullseye):
-//   Rule 43 IS_SCE_GIF_PK_REF_LOAD_IMAGE  Bullseye for the 4HH/Path3 guard
-//   Rule 44 PATH3_INITIATOR        Writes to GIF CHCR (0x1000A000) — Path3 starters
-//   Rule 45 SCE_GIF_PK_FAMILY      sceGifPk*/sceVif1Pk* roster
-//   Rule 46 TEX0_REG_WRITER        GS reg 0x06/0x07 writers (TEX state corruption hunt)
-//   Rule 47 PRIM_REG_READER        Reads GS reg 0x00 (PRIM corruption witnesses)
-//   Rule 48 RGBAQ_WRITER           Writes GS reg 0x01 (vertex color setters)
-//   Rule 49 DMA_KICK_PATTERN       Writes any DMA channel CHCR base (+0x00)
-//   Rule 50 DMA_QWC_TADR_WRITER    Writes any DMA channel +0x20 (QWC) / +0x30 (TADR)
-//   Rule 51 MICROCODE_UPLOADER     VIF1 MMIO + load from .text/.data (MPG payload)
-//   Rule 52 AUDIO_RPC_HANDLER      sceSd*/sceSpu2*/libsd.irx audio path
-//   Rule 53 MESWIN_LOADER          Refs string "meswin" — dialogue rendering pipeline
-//   Rule 54 MC_TRANSITION_GATE     *ForMC/*McCheck*/*McError* small gates (FinishForMC pattern)
-//   Rule 55 known_dc2_globals      JSON map of known DC2 gp-relative offsets
-//   Rule 56 is_top_priority_fix    Derived: any community-bullseye tag is set
-//   Rule 57 focus_set              Top-level array of every top-priority function
-//
-// WHAT'S NEW IN v6 (PCSX2 source-grounded):
-//   Rule 58 CORRECTED GS privileged MMIO map (0x12000070=DISPFB1, 0x12000090=DISPFB2, ...)
-//   Rule 59 ACCESSES_IPU_MMIO      0x10002000-0x10003000 — MPEG decoder hardware
-//   Rule 60 WRITES_IPU_CMD         0x10002000 — the MPEG kick (sub-MPEG_DECODER_TRAP)
-//   Rule 61 GIF_PATH3_REG_TOUCHER  GIF_P3CNT (0x10003090) or GIF_P3TAG (0x100030A0)
-//   Rule 62 GIF_FIFO_DIRECT_WRITER 0x10006000 — bypass-DMA GIF write
-//   Rule 63 VIF1_FIFO_DIRECT_WRITER 0x10005000 — bypass-DMA VIF1 write
-//   Rule 64 VIF0_FIFO_DIRECT_WRITER 0x10004000
-//   Rule 65 ACCESSES_VU_MICROMEM   VU0/VU1 micro-mem ranges (0x11000000/0x11008000)
-//   Rule 66 ACCESSES_VU_DATAMEM    VU0/VU1 data-mem ranges
-//   Rule 67 VIF_OPCODE_BUILDER     lui constant matches MPG/MSCAL/DIRECT/UNPACK opcode
-//   Rule 68 VIF_MPG_OPCODE_BUILDER lui 0x4A__ pattern (microcode upload)
-//   Rule 69 VIF_MSCAL_OPCODE_BUILDER lui 0x14__/0x15__ (kick)
-//   Rule 70 VIF_DIRECT_OPCODE_BUILDER lui 0x50__/0x51__ (GIF inline)
-//   Rule 71 VIF_UNPACK_OPCODE_BUILDER lui 0x60__-0x7F__ (vertex upload)
-//   Rule 72 DMA_TAG_BUILDER        lui constant matches CNT/REF/REFS/CALL/RET/END/REFE
-//   Rule 73 PSMT4HH_REFERENCE      lui/ori constant == 0x2C (font Z-buffer alias PSM)
-//   Rule 74 SBUS_IOP_COMM_TOUCHER  0x1000F200 (MSCOM) / 0x1000F210 (SMCOM)
-//   Plus: known_gs_priv_regs, vif_opcode_constants, dma_tag_ids, pcsx2_baseline metadata
-//
-// WHAT'S NEW IN v7 (GS-dump runtime corroboration):
-//   Input: optional folder of `*.gs.summary.json` produced by
-//          gs_dump_to_summary.py from PCSX2 .gs dumps. One per checkpoint
-//          (SCE_Logo / Title / 3D_Scene / Inventory / Pause / Cutscene / ...).
-//          Merged into runtime evidence used to corroborate static rules.
-//   Rule 75 DISPFB_SDK_WRITER       Callee in {sceGsPutDispEnv,sceGsSetDispEnv,
-//                                   sceGsSetCRTC,mgSetDispEnv,sceGsResetGraph}
-//                                   — picks up SDK-routed DISPFB writers that
-//                                   the raw-MMIO Rule 35/58 misses.
-//   Rule 76 PATH3_KICK_VIA_DMA_API  Caller of sceDmaSend*/sceGifSendChain*/
-//                                   sceGsSwapDBuff/sceGsExecStoreImage — the
-//                                   SDK-routed Path3 starters (raw-CHCR
-//                                   Rule 44 misses them).
-//   Rule 78 VRAM_TBP_OVERLAY        Constants (lui/ori/addiu/li) matching
-//                                   runtime-witnessed tex0_tbps or
-//                                   vram_upload_tbps; emitted as
-//                                   `tbp_constants_loaded` + intersection
-//                                   with merged runtime as
-//                                   `tbp_runtime_confirmed`.
-//   Rule 79 GS_IRQ_HANDLER_SAFE_STUB Name matches Signal/Finish/Label/Intc/
-//                                   sceGsSyncH/V handler shape AND all
-//                                   loaded GS-dump captures show IMR fully
-//                                   masking GS IRQs → tag as safe-stub
-//                                   candidate (decoration; no auto disposition flip).
-//   Rule 80 runtime_corroboration   Per-function block cross-checking
-//                                   static bullseye predictions against the
-//                                   merged runtime evidence. Adds tags:
-//                                   RUNTIME_CONFIRMED         — at least one
-//                                       bullseye prediction has a witness.
-//                                   RUNTIME_DORMANT_GLOBAL    — bullseye
-//                                       predictions but zero runtime witness
-//                                       across loaded checkpoints.
-//                                   RUNTIME_MENU_ONLY         — PSMT4HH_REFERENCE
-//                                       only witnessed in UI checkpoints
-//                                       (Inventory/Pause/Character/UI scenes),
-//                                       not in 3D-scene captures.
-//   Rule 81 focus_set re-rank       Confirmed entries first, dormant last.
-//   Plus: gs_runtime_evidence top-level JSON block with per-checkpoint
-//         facts + merged unions; auto-populated pcsx2_baseline checkpoints.
-//
-// WHAT'S NEW IN v7.1 (F32-F34 retrospective):
-//   Rule 82 CTOR_MULTI_FIELD_INITIALIZER  Ctor / Initialize that writes
-//          >= 5 distinct this+K slots in first 40 instructions. F33 caught
-//          __ct__11mgCDrawPrimFv nop-stubbed → manager/PRIM/Q/Z slots all
-//          garbage → entire Begin/Texture/Color chain dead. Firewalled
-//          against STUB classification (forceRecompile).
-//   Rule 83 DRAWING_CHAIN_DEPTH         BFS from GS-bullseye roots
-//          (sceGifPk family, PATH3_INITIATOR, mgEndFrame, Begin__11mgCDrawPrim).
-//          Functions with chain_depth <= 6 firewalled against STUB. Locks in
-//          F33's TitleModeDraw -> PrimQuad -> SetSpriteEnv -> Begin chain.
-//   Rule 84 LIFECYCLE_LAZY_INIT_GUARD   Initialize* / Begin__ / Open* / Acquire*
-//          whose first instructions read this+0x00 and branch on zero, with
-//          byteSize > 50. The "if (manager==null) { install manager; }"
-//          pattern that F33 had to manually override. Firewalled.
-//   Rule 85 BITBLTBUF_T4HH_UPLOADER     Function writes BITBLTBUF (GIF reg 0x50)
-//          AND loads PSMT4HH/4HL/8H constant. The F32 BITBLTBUF.dpsm=0x2C
-//          upload bullseye. Tagged separately from generic PSMT4HH_REFERENCE
-//          (which is sampler-side TEX0.psm) so runtime menu_only does not
-//          deprioritize these.
-//   Plus: RUNTIME_MENU_ONLY refinement — skip the tag when the function is
-//         a BITBLTBUF_T4HH_UPLOADER or drawing_chain_depth <= 3.
-//
-// RULES IMPLEMENTED (17 + tags):
-//   1.  No DANGEROUS_KEYWORDS (removed - was killing game logic)
-//   2.  IOP_MODULE_STRINGS: only .IRX/.irx + specific module names (no .BIN/.DAT)
-//   3.  referencesIopModule: size cap 800 bytes (larger = game logic)
-//   4.  accessesHardware: DATA references only (not CALL/FLOW)
-//   5.  accessesHardware - ACCESSES_MMIO tag only (not disposition)
-//   6.  KSEG1 masking in all address checks (addr & 0x1FFFFFFF)
-//   7.  isKernelInternal replaces isRadarBehaviorallyDangerous (syscall+COP0 only)
-//   8.  IOP refs - STUB, kernel internals - SKIP
-//   9.  TOML parser: handles name-only AND name@address entries
-//   10. Whitelist: entry/_start exempt from all firewalls
-//   11. MainLoop shield: ML + depth-1 callees exempt (manual or auto-detect)
-//   12. $gp fallback: lui+addiu scan in entry point for stripped binaries
-//   13. SMC detection: function boundaries + instruction-at-target check
-//   14. No lui scanner for VIF (didn't work, removed)
-//   15. No VIF_DMA_UPLOAD tag (ACCESSES_MMIO covers it)
-//   16. vcallms - VU0_MICROCODE - forced STUB
-//   17. jr $reg (reg!=ra) - COMPLEX_CONTROL_FLOW tag
-//   +   ORPHAN_CODE tag for zero-xref functions
-//   +   Unified config output (ready for ps2recomp.exe)
-//
-// WHAT'S NEW IN v3 (learned from DC2 Phase F3-F12 triage):
-//
-//  Rule 18 - DC2 GAME OVERRIDE PARSER
-//      Reads a dc2_game_override.cpp (or any *_game_override.cpp) and
-//      imports every bindAddressHandler / registerFunction address as
-//      already-classified. Prevents re-stubbing functions that the
-//      runtime has already manually bound.
-//
-//  Rule 19 - CONVENTION_VIOLATION tag
-//      Detects functions where Ghidra's decompiler reports a0/a1 arg
-//      aliasing or where the function writes to $a1 as if it were a
-//      return buffer (pattern from GetFullPath__FPcPc bug in Phase F5).
-//
-//  Rule 20 - INIT_LARGE_FUNC guard
-//      Functions named *init* / *Init* / *__ct__* / *__sinit_* that
-//      have calleeCount > 10 OR byteSize > 2000 are tagged
-//      INIT_LARGE_FUNC and forced to RECOMPILE (not nop-stubbed).
-//      Prevents the Phase F4 bug where init__Fv (large, spawns threads)
-//      was silently nop'd.
-//
-//  Rule 21 - DMA_CHAIN_TTE_RISK tag
-//      Functions that call both a DMA Send variant AND touch VIF1-range
-//      MMIO (0x10009000) are tagged DMA_CHAIN_TTE_RISK. Flags potential
-//      TTE=0 + embedded VIFcodes patterns (Phase F7 root cause).
-//
-//  Rule 22 - IOP_RPC_DISPATCH tag
-//      Detects the sceSifCallRpc / sceSifBindRpc pattern + sid constant
-//      scan. Extracts the SID literal if found, emits it into JSON for
-//      cross-referencing with ps2_iop.cpp known SIDs.
-//
-//  Rule 23 - ARCHIVE_IO tag
-//      Detects DATA.DAT / DATA.HD2 string references inside I/O
-//      wrapper functions (from Phase F6). Tags for human review;
-//      these are game-specific archive stubs that need real
-//      implementations, not nop returns.
-//
-//  Rule 24 - PAD_POLL_LOOP tag
-//      Detects the busy-wait pattern: small function, calls
-//      scePadGetState (or has a loop branch + jal), byteSize < 200.
-//      Phase F3.5 lesson: always flag pad-state polling loops early.
-//
-//  Improved BUSY_WAIT_HAZARD (Rule 10 refinement):
-//      Now also fires when function contains a backward branch AND
-//      a jal to a known syscall stub (sceGsSyncV pattern from F3.5).
-//
-//  Improved STUB classification (Rule 3 refinement):
-//      `sceDevFont`, `sceDevCons`, `sceMSIn`, `sceSifAllocSysMemory`,
-//      `sceSifLoad*`, `sceSifUnload*`, `InitTLB`, `_InitTLB`,
-//      `SetTLBEntry`, `GetTLBEntry`, `InitAlarm`, `ReleaseAlarm`
-//      added to RADAR_FIREWALL_PREFIXES (all appear in dc2_game_override.cpp
-//      Group D as confirmed safe stubs).
-//
-//  OUTPUTS (unchanged filenames):
-//      config_auto_recomp.toml  - unified config for ps2recomp.exe
-//      triage_map.json          - full DNA map with new tags
-//      assembly.txt / decompiled.txt / flowchart.txt  (unchanged)
-//
-// @author Puggsy + Claude (v3: DC2 Phase F3-F12 knowledge integration)
+// @author Puggsy + Claude (v11: DC2 comprehensive rule reorganization)
 // @category PS2Recomp
 
 import ghidra.app.decompiler.DecompInterface;
@@ -555,6 +818,13 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // the old FileWriter default produced mojibake / U+FFFD bytes on Windows
     // (cp125x) hosts.
     private static PrintWriter utf8Writer(File f) throws IOException {
+        // Self-heal the output tree: every file write funnels through here, so creating the
+        // parent dir on demand guarantees index/ and functions/ exist regardless of which
+        // output location the run picked (the one-time mkdirs at setup can be a no-op when the
+        // chosen outputDir has no pre-existing index/ subdir -> FileNotFoundException).
+        File p = f.getParentFile();
+        if (p != null && !p.isDirectory() && !p.mkdirs() && !p.isDirectory())
+            throw new IOException("Cannot create output directory: " + p.getAbsolutePath());
         return new PrintWriter(new BufferedWriter(new OutputStreamWriter(
             new FileOutputStream(f), StandardCharsets.UTF_8)));
     }
@@ -1059,6 +1329,18 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         KNOWN_DC2_GP_OFFSETS.put(-0x74D8L & 0xFFFFFFFFL, "CScene_ptr");
         KNOWN_DC2_GP_OFFSETS.put(-0x74C0L & 0xFFFFFFFFL, "mgCTextureManager_ptr");
         KNOWN_DC2_GP_OFFSETS.put(-0x74B0L & 0xFFFFFFFFL, "EzMidi_rpcClient");
+        // ===== v11.3: F52-G26 gp-relative globals (gp=0x0037E4F0) =====
+        // Absolute = gp + signed_offset. Dungeon/free-roam + costume + VU1-stage.
+        KNOWN_DC2_GP_OFFSETS.put(-0x70FCL & 0xFFFFFFFFL, "DngTreeMode");          // F64 half @0x003773F4; 0=display map
+        KNOWN_DC2_GP_OFFSETS.put(-0x7228L & 0xFFFFFFFFL, "MainChara_ptr");        // F66 @0x003772C8; pos +0xe0, vtable 0x3756f0
+        KNOWN_DC2_GP_OFFSETS.put(-0x7268L & 0xFFFFFFFFL, "DebugPause");           // F66 @0x00377288; gates DngMainKey movement
+        KNOWN_DC2_GP_OFFSETS.put(-0x7538L & 0xFFFFFFFFL, "DebugFlag");            // F50.6/debug-menu enable @0x00376FB8
+        KNOWN_DC2_GP_OFFSETS.put(-0x63D0L & 0xFFFFFFFFL, "MenuCosPtr");           // G12/G13 @0x00378120; +0x2d0 char-data cache, +0x2d8 cursor texObj
+        KNOWN_DC2_GP_OFFSETS.put(-0x63DCL & 0xFFFFFFFFL, "MenuCosutumeLoadPhase");// G10 @0x00378114; phase 4 = interactive costume list
+        KNOWN_DC2_GP_OFFSETS.put(-0x7530L & 0xFFFFFFFFL, "LanguageCode");         // G13 @0x00376FC0; indexes static name tables
+        KNOWN_DC2_GP_OFFSETS.put(-0x78ACL & 0xFFFFFFFFL, "GetScrPad_dbuf_slot");  // G26 @0x00376C44; EE scratchpad double-buffer toggle (0x70000000/0x70002000)
+        KNOWN_DC2_GP_OFFSETS.put(-0x7890L & 0xFFFFFFFFL, "SendDMA_sprchcr_cache");// G26 @0x00376C60; cached =0x1000D000 (fromSPR CHCR) used by SendDMA@0x13e3d0
+        KNOWN_DC2_GP_OFFSETS.put(-0x7FE0L & 0xFFFFFFFFL, "mgVuProg_resident_id"); // G21/G22 @0x003764D0; resident VU1 microprogram cache id (mpg skip gate)
     }
 
     // v9 Rule 131: DC2 known function addresses from PROJECT_STATE.md fix logs.
@@ -1123,6 +1405,63 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         { 0x00142560L, "mgEndDrawReloadTexture__Fv",                         "F51",        "texture_reload_frame_end", "MEDIUM"  },
         { 0x001E8F30L, "SetupMainUnit",                                      "F50.5",      "equipment_model_loader",   "MEDIUM"  },
         { 0x00149320L, "LoadFile__FPcPvPi",                                  "F50.5",      "fatal_loadfile_aborts",    "HIGH"    },
+        // ===== v11.3: F52-G26 character/deform 3D-MODEL VU1 chain (active blocker, Known Issue #2) =====
+        // The model is a per-draw VU1 MSCAL packet STAGED in EE scratchpad and copied into mgVif1Packet
+        // via a fromSPR (ch8) DMA. See DC2_RUNTIME_INVARIANTS EE_SCRATCHPAD_DMA_CH8_9_REQUIRED.
+        { 0x0013E3B0L, "GetScrPad__Fv",                                      "G26",        "ee_scratchpad_allocator",  "BLOCKER" },
+        { 0x0013E3D0L, "SendDMA__FUiUiUi",                                   "G26",        "spr_ch8_dma_stager_subword_str_kick","BLOCKER" },
+        { 0x001404D0L, "CreateRenderInfoPacket__12mgCVisualMDT",             "G25/G26",    "vu1_model_packet_builder", "BLOCKER" },
+        { 0x00142FD0L, "mgDrawDirect__Fv",                                   "G24/G26",    "vu1_packet_emit_root",     "BLOCKER" },
+        { 0x00142EA0L, "mgSendPacket__Fv",                                   "G24",        "mgvif1packet_dma_send_ch1","HIGH"    },
+        { 0x00143A20L, "mgFlushRenderInfo__Fv",                              "G25",        "vu1_packet_trailer",       "HIGH"    },
+        { 0x00137E10L, "Draw__8mgCFrame",                                    "G18/G19",    "mesh_frame_emit",          "HIGH"    },
+        { 0x0013F4E0L, "Draw__12mgCVisualMDT",                              "G15/G16",    "mesh_visual_emit",         "HIGH"    },
+        { 0x00145E80L, "mgSendVuProg__Fv",                                   "G21",        "vu1_microprog_upload_mpg", "HIGH"    },
+        { 0x00145E20L, "mgGetVuProgPacket__Fv",                              "G21",        "vu1_microprog_packet",     "MEDIUM"  },
+        { 0x00145DC0L, "CheckVuProgID__Fv",                                  "G21",        "vu1_resident_prog_cache",  "MEDIUM"  },
+        { 0x0012F2E0L, "mgClipBoxW__Fv",                                     "G15",        "mesh_clip_test_not_culled","LOW"     },
+        { 0x001731F0L, "DrawDirect__11CCharacter2",                          "G13/G24",    "character_model_draw",     "BLOCKER" },
+        { 0x0016B940L, "DrawDirect__12CActionChara",                         "G14",        "actor_model_draw",         "HIGH"    },
+        { 0x002BD640L, "Draw__15CMenuCostumeSel",                            "G13",        "costume_select_draw",      "HIGH"    },
+        { 0x002BC500L, "__ct__15CMenuCostumeSel",                            "G13",        "stale_ptr_cache_ctor",     "HIGH"    },
+        { 0x00223A50L, "MenuCursorDraw__Fv",                                 "G12",        "menu_cursor_uv_consumer",  "MEDIUM"  },
+        { 0x00197700L, "GetName__13CGameDataUsedFi",                         "G13",        "name_from_static_eltable", "MEDIUM"  },
+        { 0x00374310L, "__sinit_menudraw",                                   "G12",        "uncalled_static_init_uv",  "HIGH"    },
+        // ===== v11.3: F63-G7 event VM / front-end / pad / UI-text =====
+        { 0x001D1360L, "RunMainEvent__Fv",                                   "F64",        "event_run_sets_dngstatus0","HIGH"    },
+        { 0x002555E0L, "EventLoop__Fv",                                      "F63/F64",    "event_loop_wait_selector", "HIGH"    },
+        { 0x001873C0L, "exe__10CRunScriptFP8vmcode_t",                       "F63/F64",    "event_script_vm_stackmachine","HIGH" },
+        { 0x001871E0L, "resume__10CRunScript",                               "F63",        "event_script_resume",      "MEDIUM"  },
+        { 0x00187210L, "run__10CRunScript",                                  "F63",        "event_script_restart",     "MEDIUM"  },
+        { 0x0029FFA0L, "TitleLoop__Fv",                                      "F64/G9",     "frontend_loopno3_root",    "HIGH"    },
+        { 0x00233FF0L, "MenuMainKey__Fv",                                    "G12/G13",    "frontend_perframe_wrapper_idempotent_restore","HIGH" },
+        { 0x00232DF0L, "MenuMainInit__Fv",                                   "G9",         "menu_main_init_selector",  "MEDIUM"  },
+        { 0x00234290L, "MenuMainDraw__Fv",                                   "F64",        "menu_draw_replaces_3d",    "MEDIUM"  },
+        { 0x001909A0L, "GetNowLoopNo__Fv",                                   "F64",        "top_level_loopno_getter",  "MEDIUM"  },
+        { 0x0014A930L, "UpDate__8CGamePad",                                  "F66",        "cgamepad_update_read_pad",  "HIGH"   },
+        { 0x0023E320L, "CheckPushButton__Fv",                               "F66",        "treemap_button_decoder",   "MEDIUM"  },
+        { 0x0023E1B0L, "MenuCheckPushButton_treemap_0x23e1b0",               "F66",        "treemap_abstract_pad_code","MEDIUM"  },
+        { 0x001EFF40L, "Step__12CMenuTreeMapFv",                             "F66",        "floorselect_treemap_step", "MEDIUM"  },
+        { 0x00186380L, "__putc__11dbgCJISFont",                              "G5",         "debug_psmt4hh_font_putc",  "MEDIUM"  },
+        { 0x001D4260L, "DebugMainDraw__Fv",                                  "G5",         "debug_menu_draw_root",     "MEDIUM"  },
+        // ===== v12 Rule 168: G27-G52 skinned-model draw chain (ROADMAP "Durable 3D-model chain") =====
+        { 0x0014D390L, "DeformMesh__Fv",                                     "G40",        "skin_matrix_build_root",   "HIGH"    },
+        { 0x0014CB60L, "MotionProc2__Fv",                                    "G40",        "skin_motion_proc",         "HIGH"    },
+        { 0x00137030L, "GetLWMatrix__Fv",                                    "G40",        "joint_lw_matrix_getter",   "HIGH"    },
+        { 0x001302D0L, "mgInversMatrix__Fv",                                 "G40",        "vf0_dependent_inverse",    "BLOCKER" },
+        { 0x0017C2D0L, "Draw__12COutLineDraw",                               "G47/G48",    "model_rtt_outline_draw",   "BLOCKER" },
+        { 0x0017CB20L, "DrawDivSprite4__Fv",                                 "G36",        "rtt_to_display_composite", "HIGH"    },
+        { 0x00143160L, "mgGetDrawRect__Fv",                                  "G37",        "vu0_bbox_screen_projection","HIGH"   },
+        { 0x001381C0L, "GetDrawRect__8mgCFrame",                             "G37",        "vu0_aabb_drawrect",        "HIGH"    },
+        // ===== v13 Rule 183: G53-G82 main-title 3D-background chain =====
+        { 0x002A1020L, "TitleModeInit__Fv",                                  "G81",        "title_camera_init_on_global","BLOCKER"},
+        { 0x0012F380L, "mgClipInBoxW__Fv",                                   "G78",        "render_mode_copy_discriminator","BLOCKER"},
+        { 0x001387F0L, "Draw__8mgCFrameFv_thunk",                            "G59",        "vtable_tailcall_thunk",    "BLOCKER" },
+        { 0x00142F90L, "mgDraw__Fv",                                         "G59",        "frame_draw_tailcall_parent","HIGH"    },
+        { 0x00168FD0L, "GetTextureBlockNo__11CMdsListSetFi",                 "G58/G59",    "title_mds_block_walk",     "HIGH"    },
+        { 0x002BE040L, "MenuCostumeDraw__Fv",                                "G79",        "costume_rtt_state_leak",   "HIGH"    },
+        { 0x002838C0L, "GetCamera__6CScene",                                 "G58",        "scene_camera_slot_getter", "HIGH"    },
+        { 0x00282EA0L, "Initialize__6CScene",                                "G58",        "scene_init_sets_cam_count","HIGH"    },
     };
 
     // v9 Rule 132: DC2 VRAM TBP labels per dc2_runtime_invariants memory + F37/F43/F44 fix logs.
@@ -1149,6 +1488,23 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         KNOWN_DC2_TBP_LABELS.put(0x3FE0L,  "Title_CLUT_stale");      // F51.4 title CLUT, empty in-dungeon
         // Framebuffer pages (fbp units): display + in-place RTT
         KNOWN_DC2_TBP_LABELS.put(0x139L,   "RTT_fbp_in_place");      // F51.2 game-set in-place render-to-texture (= tbp 0x2720/32)
+        // v11.3: G9-G13 front-end / costume-select texture pages (mgCTextureManager slots).
+        KNOWN_DC2_TBP_LABELS.put(0x2AA0L,  "Title_atlas_slot64");    // G10/G11/G12 men0.pac common-menu frame; correctly bound on HW too (NOT the costume bug)
+        KNOWN_DC2_TBP_LABELS.put(0x2920L,  "Fukusel_atlas_slot84_b");// G12 costume sheet page 2 (slot[84])
+        KNOWN_DC2_TBP_LABELS.put(0x2C20L,  "Fukusel_cursor_tex");    // G12 cursor texObj tbp (CLUT 0x3fd4); menu_long_hand UV consumer
+        KNOWN_DC2_TBP_LABELS.put(0x3FD8L,  "Title_CLUT_slot64");     // G11 title-atlas CLUT companion to 0x2aa0
+        // v13 G80-G82: main-title rock-cavern T8 textures (s19_01..s19_11a),
+        // VRAM 0x2720..0x3960, MODULATE tfx=0 tcc=1, sampled by the COPY-mode
+        // map-part meshes (per-vertex RED-deficit / green tint, G82).
+        KNOWN_DC2_TBP_LABELS.put(0x2760L, "Title_rock_s19_b");
+        KNOWN_DC2_TBP_LABELS.put(0x28A0L, "Title_rock_s19_c");
+        KNOWN_DC2_TBP_LABELS.put(0x2B20L, "Title_rock_wall_s19_02");
+        KNOWN_DC2_TBP_LABELS.put(0x2F20L, "Title_rock_wall_s19_04");
+        KNOWN_DC2_TBP_LABELS.put(0x3320L, "Title_rock_wall_s19_06");
+        KNOWN_DC2_TBP_LABELS.put(0x3720L, "Title_rock_s19_d");
+        KNOWN_DC2_TBP_LABELS.put(0x3820L, "Title_rock_upper_s19_e");
+        KNOWN_DC2_TBP_LABELS.put(0x3920L, "Title_rock_upper_s19_f");
+        KNOWN_DC2_TBP_LABELS.put(0x3960L, "Title_rock_block_s19_05");
         // HUD/font cache - stable 24-page block across all 9 captured GS dumps
         for (long p = 16284L; p <= 16348L; p += 4L)
             KNOWN_DC2_TBP_LABELS.put(p, "HUD_font_cache_page_" + p);
@@ -1185,6 +1541,28 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         { "RUNTIME_LOG_DEAD_IN_RELEASE","F51.7: RUNTIME_LOG is compiled out in Release. VU/VIF/GS diagnostics must use env-gated fprintf(stderr,...); a silent RUNTIME_LOG probe is NOT evidence of absence." },
         { "GUEST_EXEC_SINGLE_MUTEX","F49.5/F50: all recompiled guest threads serialize on one m_guestExecutionMutex. A thread spinning without releasing it (GamePadStep -> RotateThreadReadyQueue syscall 0x2B) starves every other guest thread. Yield/sleep syscalls must wrap their wait in GuestExecutionReleaseScope." },
         { "UNRUN_SINIT_NULL_VTABLE","F50.4/F50.7: __sinit_* static initializers have no jal caller and run only via the global-ctors table. Headless static-init coverage is incomplete, so a global object's vtable pointer can stay null and its virtual init dispatch silently no-ops. Replay STATIC_INIT_VTABLE_INSTALLER manifests to repair." },
+        // ===== v11.3: F52-G26 retrospective facts (runner-side). Several SCOPE or CORRECT older invariants. =====
+        { "VU1_XGKICK_LIVE_FOR_CHARACTER_MODELS","G21-G26 SCOPES/CORRECTS PATH1_DEAD: that invariant held only for the 9 original non-character GS dumps (title/menu/dungeon-map). Character/deform 3D models ARE rendered by a RESIDENT VU1 microprogram (uploaded mpg=7 to VU1 code 0x320) executed per-draw via MSCAL, emitting per-strip screen-space tristrip giftags (prim=0x5c) = canonical VU1 XGKICK output (Select_costume.gs count_prims_path={3:4876}=Path1New). Do NOT treat PATH1/VU1 as dead when a character or deform mesh is on screen. The dungeon MAP geometry is still Path2 DIRECT (DUNGEON_MAP_PATH2_DIRECT); only character/deform meshes use VU1." },
+        { "EE_SCRATCHPAD_DMA_CH8_9_REQUIRED","G26 ROOT CAUSE of the 13-phase model chase: DC2's mg library builds each model VIF packet in the EE SCRATCHPAD (GetScrPad@0x13e3b0 -> 0x70000000/0x70002000, double-buffered via gp-0x78AC) then copies it into its RAM slot in the mgVif1Packet DMA chain with a fromSPR DMA on DMAC channel 8 (SendDMA@0x13e3d0). A runtime whose writeIORegister only dispatches GIF(0x1000A000)+VIF1(0x10009000) silently drops ch8(0x1000D000 fromSPR)+ch9(0x1000D400 toSPR) -> the staged packet never reaches VIF1 -> empty model slot -> no XGKICK. Runtime MUST implement SPR_FROM/SPR_TO normal-mode copies (SADR+0x80 / MADR+0x10 / QWC+0x20)." },
+        { "SUBWORD_DMA_STR_KICK","G26: SendDMA starts the SPR ch8 transfer with a single BYTE store (sb) to CHCR+1 (the STR bit), NOT a word store to CHCR+0. A runtime IO dispatcher that only matches word-aligned CHCR writes will miss the kick; write8/write16 to an MMIO/DMA register must be reconstructed into the full-word register write. Statically: a delivery-critical packet stager is a func that programs a fromSPR/toSPR channel (uses_spr + dma channel) and kicks via sb/sh." },
+        { "STALE_PTR_CACHE_CTOR","G12/G13/F50.4 recurring FIX class: a ctor caches a DERIVED global pointer ONCE at construction (e.g. __ct__15CMenuCostumeSel@0x2bc500 caches MenuCosPtr+0x2d0 = GetCharaDataPtr(GetUserDataMan(),0)); if it runs before the source (ActiveSaveData / a __sinit / disc data) is funded, it caches 0/stale -> the downstream Draw silently skips (names/cursor/model absent). Repair idempotently in a per-frame wrapper (MenuMainKey@0x233ff0), never by editing the ctor. Same class as G12 menu_long_hand UV (un-run __sinit_menudraw@0x374310)." },
+        { "UNFUNDED_GUEST_HEAP_OOM","F57/F58: malloc/_malloc_r are runtime stubs -> PS2Runtime::guestMalloc over [base,limit] set by SetupHeap (syscall 0x3D) from the guest's $a0/$a1, clamped to [0,kGuestHeapHardLimit]. DC2's _end=0x1F64E00 fills RAM and it asks for [_end, top]; kGuestHeapHardLimit MUST exceed _end or the clamp collapses the window to base==limit (empty) -> every alloc fails -> operator new throws bad_alloc -> uncaught -> abort (silent exit). A guest that 'mostly works' via static pools can still have a dead malloc; only checked operator new exposes it." },
+        { "EVENT_VM_AUDIO_GATED_STALL","F63/F64: the CRunScript event VM (object @0x01ece3d0; exe@0x1873c0 stack machine, vmcode_t=[op,arg1,arg2]) can park forever on an ext command (op 0x15) or a wait sub-fn that loops until a director asserts the skip flag (+0x40). Headless, with no audio subsystem, scene-sound/stream waits (op 3 push_str names like snd2/sp/sp_030.snd; EventLoop selector DAT_01ece504=3 StreamOpenState) never signal done -> DngStatus stuck at 2. For event-progress bugs, check a sound/stream wait BEFORE assuming game-logic. RunMainEvent@0x1d1360 sets DngStatus=0 when EventLoop returns 1 (needs CRunScript+0x3c done != 0)." },
+        { "LIVE_PAD_IS_read_pad_stub","F66/G7: the live pad read is read_pad_stub (registered @0x0014A490, overrides read_pad__FP10PAD_STATUS) -> dc2_write_pad_status, writing the button mask to PAD_STATUS+0 and four analog ints (+4 LY,+8 LX,+0xc RY,+0x10 RX). scePadRead is DEAD (the game never calls it) -> editing it is inert. In-dungeon free-roam MOVEMENT is the LEFT ANALOG STICK (RunScript__CActionChara->Analog__CPadControl), not the D-pad; a digital-only injector navigates menus but never moves the player. Face buttons are not read on the floor-select treemap (Step__CMenuTreeMap reads abstract codes from padtbl; confirm = DOWN x2)." },
+        { "ALLOCATOR_FAMILY_COHERENT_G1","G1 GATE PASS: the C/C++ public allocator family (malloc/free/_malloc_r/_free_r/_calloc_r/operator new/delete) is uniformly runtime-backed (PS2Runtime::guest{Malloc,Free,Calloc,Realloc}); newlib internals (sbrk/_sbrk_r/malloc_extend_top) are DEAD; game mgCMemory pools self-manage BSS. Title + dungeon-0 floor-load each do 3 mallocs/1 free, 0 sbrk. => texture/CLUT/menu corruption is a GS/texture-layer bug, NOT heap. After any regen/TOML edit the WHOLE family must stay runtime-backed (no half-runtime/half-recompiled split) or silent alignment/CLUT corruption returns." },
+        { "DC2_KEY_GLOBALS","v11.3 absolute-address roster (not gp-relative): DngStatus@0x01E9F6E0 (0 free-roam/1,4 menu/2 event/3 event-edit/5 exit), MenuActionChara@0x01F0CAA0 ([0]=0xebf9c0 costume actor, model ptr +0x124), MenuCommonInfo ptr@0x003779E8 (+0x50 sel=0x14 costume), DAT_01ecd618@0x01ECD618 (costume selector=0x14), DAT_01ecd62c@0x01ECD62C (new-game trigger: 0xc=New Game), CRunScript event obj@0x01ECE3D0 (+0x38 vmcode/+0x3c done/+0x40 skip/+0x48 strbase), prog_adr@0x00334260 (VU1 microprogram packet table), CGamePad singleton@0x003D76E0 (raw scePad bit layout, +0x4 PAD_STATUS), header_buff@0x00382680 (DATA.HD3 archive table, header_num=6693)." },
+        // ===== v12: G27-G52 skinned-model render invariants (Rule 165/166/167/169) =====
+        { "VF0_HARDWIRED_FOR_INVERSE","G40 (THE 50-phase skinned-collapse): VU0/VU1 vf0 is HW-hardwired (0,0,0,1); recompiled COP2 macro ops read ctx->vu0_vf[0] as that constant. The runtime memsets the context to zero and nothing writes vf0 -> mgInversMatrix@0x1302d0 computes Q=vf0.w/det=0 then vmulq -> zero bone palette -> ALL skinned characters collapse. Plain mgMulMatrix and the VIF1-DIRECT map path don't read vf0 so they masked it. FIX: pin vu0_vf[0]=(0,0,0,1) after the context memset and re-assert after any context reset. Statically flagged VF0_DEPENDENT_INVERSE." },
+        { "RTT_FRAME_TEXTURE_ALIAS_GENERAL","G33-G50: DC2 renders the skinned model in-place to FRAME fbp=0x139 (= block 0x2720) and samples that page as a texture - a deliberate render-to-texture, faithful to HW. ANY FRAME writer whose page aliases a TEX0/BITBLTBUF upload page is an RTT; never stub it (G37/G44 had to hand-protect them). The model is drawn in ~8 interleaved 0x139 segments per frame, each bracketed by a draw to the display buffer (0x68/0x0). Statically: RTT_TARGET / vram_overlap_pairs(RTT_ALIAS)." },
+        { "COSTUME_Z_PRIVATE_BUFFER","G45/G47/G49: the costume model Z must NOT live in flat VRAM - its synthetic block 0x1a00 ALIASES menu-text/sprite VRAM, so per-frame text sprites stomp the model Z (GEQUAL rejects model tris -> shred) and vice-versa. Use a PRIVATE off-screen Z (aliases nothing). Clear it ONCE PER RENDERED FRAME on the display-buffer FLIP (not per 0x139 entry, which wipes Z between head sub-meshes -> cap/hair draws dark over the face). Statically: ZBUF_VRAM_ALIAS_RISK / DISPLAY_BUFFER_FLIP." },
+        { "RGBAQ_ZERO_HOLD_COSTUME","G52: the costume model packet emits an explicit fully-zero RGBAQ (lo=0 hi=0) for ~8.6% of skinned skin verts; HW never does (every model vertex alpha=0x80, color>=0x50). A fully-zero RGBAQ in the costume context (fbp=0x139 tristrip) must HOLD the last valid color, not clobber it. The all-zero write originates in the VU1/XGKICK path (deeper root not chased). RGBAQ writers feeding an RTT tristrip are vertex-color critical." },
+        // ===== v13: G53-G82 main-title 3D-background invariants (Rules 178-182) =====
+        { "TITLE_CAMERA_INIT_ON_GLOBAL","G81 (cost ~6 phases): TitleModeInit@0x2a1020's camera-setup block runs only `if (TitleCamera@0x00377E38 != 0)`. Headless the producer had not run so TitleCamera==0 -> the block was skipped -> mgCCameraFollow kept its CTOR defaults (distance=40,height=30,look-at origin) -> the rock cavern (look-at (-70,281,-493), dist ~1296) was OUT OF FRAME. Same shape as the empty CScene camera slots (AssignCamera returns -1 before CScene::Initialize@0x282ea0 sets count=8). FIX g81_fix_title_camera re-applies the init when the camera holds the ctor defaults. THE general lesson: an `if(global!=0){configure}` block silently no-ops headless when the global's producer runs later/never. Statically: CONDITIONAL_INIT_ON_GLOBAL / init_order_hazards." },
+        { "TITLE_RENDER_MODE_COPY_VS_TRANSFORM","G75-G80 (cost ~6 phases): each title map-part mesh selects a render mode in mgRENDER_INFO+0xfc4 - COPY (passthrough VU packer 0x1b68, carries tbp + per-vertex ADC) vs TRANSFORM (VU packers 0x1c50/0x1ff0/0x1dc0 whose +2048/ADC gate culls 100% on the runner AND on PCSX2). Every title mesh was flagged TRANSFORM -> all culled -> flat-blue bg. The discriminator is mgClipInBoxW@0x12f380 ret in Draw__8mgCFrame@0x137e10 (ret!=0 -> fc4=0 copy). The VU cull is CORRECT (PCSX2 _vuFMEQ identical); the bug is purely the wrong mode flag. Statically: RENDER_MODE_SELECTOR." },
+        { "TITLE_ROCK_VERTEX_RED_DEFICIT","G82: the framed title rock is GREEN where HW is brown. NOT fog (HW FGE=0), NOT texture (samples correct brown texel), NOT lighting globals (ambient/light/dir byte-identical to HW), NOT over-draw (uniform across regions). ROOT: per-vertex SHADE has RED ~half HW (runner R≈36 vs HW R≈66) -> MODULATEd brown goes green. HW directional light col0 (-0.894,0,0) modifies RED only and ends R ABOVE ambient; the runner ends R BELOW ambient -> prime suspect = the title map-part directional-light N·L sign / normal-transform (DrawSub__4CMap/Draw__9CMapParts; costume lighting matches HW so it is title-map-part-specific). Statically: VERTEX_LIGHTING_NORMAL_TERM. NOTE: GIF PACKED RGBAQ is a SPREAD layout (R=byte0,G=byte4,B=byte8,A=byte12); a contiguous decode gets (R,0,0,0)." },
+        { "MGFRAME_VTABLE_TAILCALL","G59: Draw__8mgCFrame@0x1387f0 is `a1=0; jr *(vtable+0x44)` - an inherited-virtual TAIL CALL. The recompiler mistranslated it into a return-to-dispatcher (`Function at address 0xN not found`) instead of completing the inherited call -> mgDraw@0x142f90 exited early with its frame still active -> the process fell through the startup _Exit path. FIX g59_frame_draw_tailcall_fix sets a1=0, calls the virtual slot synchronously, returns to mgDraw continuation 0x142fac. General PS2: a terminal `jr` through a loaded vtable slot (not ra/t9) needs explicit tail-call handling. Statically: VTABLE_TAILCALL_THUNK." },
+        { "TITLE_RESUME_STACK_FRAME","G58/G59: TitleMapDraw@0x2a2280 is preempted/resumed mid-body; the runner resumed interior labels 0x2a2548/0x2a2644 with sp one 0x830 frame too low -> the epilogue `ld $ra,0xA0($sp)` loaded garbage -> bad-PC 0x9f84a0. NOT a saved-$ra overwrite (refuted) and NOT a mistranslated store. FIX = title-scoped resume wrappers restoring sp=0x1fff760. General PS2: a large draw/frame function re-entered at an interior label must restore a consistent frame. Statically: FRAME_RESUME_RISK." },
+        { "COSTUME_RTT_STATE_LEAK_ON_ROUNDTRIP","G79: after Title->New Game->costume->back, the front-end runs TitleLoop (titleMode=2) and MenuCostumeDraw@0x2be040 (menuId 0x17) CONCURRENTLY - costume never tore down. The costume RTT GS-state (FRAME=fbp=0x139 / scissor) is left set, so TitleMapDraw's rock copy geom reaches the GS but is invisible (drawn into the RTT target, not the display buffer). FIX = restore the display FRAME / tear down the costume before the title draw. General PS2: an RTT writer that never restores the display-buffer FRAME leaks render-target scope. Statically: RTT_NO_RESTORE / LoopNo+menuId contradiction (loop_state_model)." },
     };
 
     // v9 Rule 134: pre-computed forward callgraphs to bullseye sinks. Each
@@ -1236,6 +1614,48 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             "GamePadStep","SwitchGamePadThread","RotateThreadReadyQueue",
             "TerminateThread","WaitForNextVSyncTick","sceGsSyncV","cooperativeGuestYield"
         }},
+        // v11.3: G21-G26 character/deform 3D-model render chain (active blocker, Known Issue #2).
+        // Builds a VU1 MSCAL packet, stages it in scratchpad, DMAs via fromSPR ch8 to mgVif1Packet.
+        { "character_model_vu1", new String[]{
+            "Draw__15CMenuCostumeSel","DrawDirect__12CActionChara","DrawDirect__11CCharacter2",
+            "SetDeformMesh","mgDrawDirect","Draw__8mgCFrame","Draw__12mgCVisualMDT",
+            "CreateRenderInfoPacket","mgClipBoxW","GetScrPad","SendDMA",
+            "mgFlushRenderInfo","mgSendVuProg","mgSendPacket","sceDmaSend"
+        }},
+        // v11.3: F63/F64 event-script VM (cutscene/door waits; stalls headless on audio).
+        { "event_script_vm", new String[]{
+            "RunMainEvent","EventLoop","resume__10CRunScript","exe__10CRunScript",
+            "run__10CRunScript","StreamOpenState","sceSifCheckStatRpc","_SND_LOAD_SOUND"
+        }},
+        // v11.3: G9-G13 front-end New-Game -> Select-Costume route (names/cursor/model).
+        { "costume_select", new String[]{
+            "TitleLoop","TitleModeKey","MenuMainInit","MenuMainKey","MenuMainDraw",
+            "__ct__15CMenuCostumeSel","MenuItemCharaDataLoad","GetCharaDataPtr","GetUserDataMan",
+            "Draw__15CMenuCostumeSel","GetName__13CGameDataUsed","MenuCursorDraw"
+        }},
+        // v13 Rule 183: G53-G82 main-title 3D-background render chain.
+        { "title_3d_background", new String[]{
+            "TitleLoop","TitleModeInit","TitleMapDraw","GetCamera__6CScene","Initialize__6CScene",
+            "mgCCameraFollow","GetLightInfo__4CMap","mgSetLight","mgSetAmbient",
+            "DrawSub__4CMap","Draw__9CMapParts","Draw__12mgCVisualMDT","CreateRenderInfoPacket",
+            "Draw__8mgCFrame","mgClipInBoxW","mgDraw","mgEndFrame"
+        }},
+    };
+
+    // v13 Rule 185: LOOP_STATE_MODEL. The front-end/dungeon program-state legend +
+    // the mutually-exclusive front-end sub-states (G79 illegal-concurrent leak).
+    // Format: {state, where, legend}.
+    private static final String[][] LOOP_STATE_MODEL = {
+        { "LoopNo", "*(gp-0x7524)=0x00376fcc via GetNowLoopNo@0x1909a0",
+          "0=boot, 2=dungeon/in-game loop (LoopDungeonMain), 3=front-end (title/menu/costume - all one loop, TitleLoop@0x29ffa0)" },
+        { "TitleInfo", "*TitleInfo (sub-state of LoopNo=3; probe DC2_TRACE_LOOP_TIMING)",
+          "0=intro movie, 1=press-START (TitleModeKey@0x2a1220), 2/7=New Game/Load menu (MenuMainKey@0x233ff0), 3=MC-check, 4=copyright. Boot auto-advances 3->1->2." },
+        { "DngStatus", "0x01E9F6E0 (lui at,0x1ea; lw -0x920(at))",
+          "0=free-roam, 1/4=menu (MenuMainDraw@0x234290 replaces 3D), 2=event, 3=event-edit, 5=exit. DngMainDraw@0x1cf090 runs for {0,2,3}." },
+        { "NewGameTrigger", "DAT_01ecd62c@0x01ECD62C (set by MenuMainKey on confirm)",
+          "0xc=New Game -> TitleLoop case 2 -> NextLoop(2); 0x10=Load Save; 0x13=HDD; else=load." },
+        { "ILLEGAL_CONCURRENT", "LoopNo=3 && titleMode=2 && menuId=0x17",
+          "G79 contradictory state: TitleLoop New-Game menu + MenuCostumeSel (Draw__15CMenuCostumeSel) both live; costume never tore down -> leaked RTT GS-state -> flat-blue title 3D bg. A draw reachable in this state is suspect." },
     };
 
     // v9 Rule 135: working DC2_PAD_INPUT scripts from F40/F42/F46 fix logs.
@@ -1250,6 +1670,11 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         { "F48.4_costume_confirm",    "30..39:R1;216..223:Cross;238..245:Cross;260..267:Cross;282..289:Cross;304..311:Down;326..333:Square;348..355:Down", "d62c=0xc@351; next=2@442", "row cursor 0->3, Down opens Yes/No, Square->Yes, Down confirms; TitleLoop NextLoop(2)" },
         // v10: F50.6+ built-in debug-menu dungeon-0 route (needs DC2_DEBUG_MENU=1).
         { "F50.6_debug_dungeon0",     "90..99:DebugDown;130..139:DebugDown;170..179:DebugConfirm", "InitDungeonMain enter", "with DC2_DEBUG_MENU=1: navigates MenuLoop@0x191C30 to 'dungeon 0' (map/d/d01/f01) and enters InitDungeonMain@0x1CC040" },
+        // v11.3: F64 debug-menu dungeon-entrance cutscene (validated 2026-06-14). Runner reads RAW CGamePad bits: Circle==DebugConfirm(0x20), Down==DebugDown(0x4000).
+        { "F64_dungeon_event",        "90..97:DebugConfirm;130..297:DebugDown;330..337:DebugConfirm;370..657:DebugDown;690..697:DebugConfirm", "DngStatus 0->2 @~700", "DC2_DEBUG_MENU=1: Select+Start->Circle->Down x5->Circle->Down x8->Circle; DngMainMap=0x103c2f0 mapIdx=0; parks the F63 stuck entrance event (vmcode=0x9261d4)" },
+        { "F64_opening_event",        "90..97:DebugConfirm;130..297:DebugDown;330..337:DebugConfirm;370..617:DebugDown;650..657:DebugConfirm", "DngStatus 0->2 (opening)", "same as F64_dungeon_event but Down x7 (not x8); parks a DIFFERENT script point (vmcode=0x8ec430, op=0x10 cond-jump wait, d504=0)" },
+        // v11.3: G9 Select-Costume headless entry (needs DC2_G9_COSTUME forcing TitleModeKey ret=5; Cross pulses dismiss the 'Select Max costume' prompt at phase 4).
+        { "G9_costume_select",        "30..39:R1;120..200:Cross", "MenuCommonInfo+0x50=0x14", "DC2_G9_COSTUME: forced New-Game path -> MenuMainInit case 0x14; pulse Cross at MenuCosutumeLoadPhase==4 to populate the costume list" },
     };
 
     // v9 Rule 124 / 125: IRX loader detection callees.
@@ -1435,6 +1860,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // below the render bullseyes - they mark wrong bindings, not wrong code.
         TAG_PRIORITY.put("NO_RUNTIME_HANDLER", 985);
         TAG_PRIORITY.put("STEP1_NAME_MISMATCH", 980);
+        TAG_PRIORITY.put("STEP1_TRUNCATED_NAME", 360);
         TAG_PRIORITY.put("OVERLAY_REGION", 975);
         TAG_PRIORITY.put("OUT_OF_TEXT_BINDING", 970);
         // v11 (General v15.5 Rule 161): runtime code linker/loader.
@@ -1473,6 +1899,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         TAG_PRIORITY.put("PSMT4HH_REFERENCE", 650);
         TAG_PRIORITY.put("DISPFB_WRITER", 640);
         TAG_PRIORITY.put("DISPFB_SDK_WRITER", 635);
+        // v13 Rules 178-188 (render/init-critical tier).
+        TAG_PRIORITY.put("CONDITIONAL_INIT_ON_GLOBAL", 938);
+        TAG_PRIORITY.put("RENDER_MODE_SELECTOR", 936);
+        TAG_PRIORITY.put("VERTEX_LIGHTING_NORMAL_TERM", 934);
+        TAG_PRIORITY.put("VTABLE_TAILCALL_THUNK", 932);
+        TAG_PRIORITY.put("RTT_NO_RESTORE", 930);
+        TAG_PRIORITY.put("FRAME_RESUME_RISK", 760);
+        TAG_PRIORITY.put("VU_FLAG_PIPELINE_UPLOADER", 705);
+        TAG_PRIORITY.put("PACKED_RGBAQ_BUILDER", 655);
         TAG_PRIORITY.put("INDIRECT_CALL_T9", 600);
         TAG_PRIORITY.put("TAIL_CALL_INDIRECT", 580);
         TAG_PRIORITY.put("MPEG_DECODER_TRAP", 560);
@@ -1496,6 +1931,17 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         TAG_PRIORITY.put("STEP1_BOUND_ROSTER_HANDLER", 310);
         TAG_PRIORITY.put("SYSCALL_TRAMPOLINE", 305);
         TAG_PRIORITY.put("SIF_PACKET_BUILDER", 300);
+        // v12 Rules 165-177 (render/present/io hazard tier).
+        TAG_PRIORITY.put("RTT_TARGET", 945);
+        TAG_PRIORITY.put("VF0_DEPENDENT_INVERSE", 935);
+        TAG_PRIORITY.put("ZBUF_VRAM_ALIAS_RISK", 745);
+        TAG_PRIORITY.put("DC2_AUDIO_GATED_STALL", 835);
+        TAG_PRIORITY.put("AUDIO_COMPLETION_GATE", 525);
+        TAG_PRIORITY.put("CLUT_CACHE_INVALIDATOR", 515);
+        TAG_PRIORITY.put("PRESENTATION_FIELD_STATE", 510);
+        TAG_PRIORITY.put("DISPLAY_BUFFER_FLIP", 505);
+        TAG_PRIORITY.put("MEMCARD_IO", 470);
+        TAG_PRIORITY.put("PERF_HOT_FRAME_PATH", 295);
     }
 
     // Rule 23: Archive I/O string patterns (Phase F6)
@@ -1954,6 +2400,28 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         boolean calledViaDirectJal = false;     // observed direct jal caller
         boolean calledViaJrT9 = false;          // observed jalr $t9 caller (indirect)
         String  ctorCallMode = "unobserved";    // direct_only | indirect_only | dual | unobserved
+        // ===== v11.3 detectors (DC2 F52-G26 retrospective) =====
+        // Rule 162 SPR_DMA_STAGER: writes a fromSPR(ch8 0x1000D000)/toSPR(ch9
+        // 0x1000D400) DMA channel reg. DC2 stages each VU1 model VIF packet in
+        // EE scratchpad then copies it into mgVif1Packet via a fromSPR DMA
+        // (SendDMA@0x13e3d0). A runtime whose IO dispatch only handles GIF/VIF1
+        // drops ch8/ch9 -> empty model slot -> no XGKICK (G26 root cause).
+        boolean programsSprDma=false;
+        Set<String> sprDmaChannels=new LinkedHashSet<>();   // "fromSPR" / "toSPR"
+        // Rule 162 SUBWORD_DMA_STR_KICK: sb/sh landing in a DMA CHCR word
+        // (slot 0..3). The STR bit is set via a sub-word store (G26: SendDMA
+        // kicks ch8 with `sb` to CHCR+1). A word-only writeIORegister misses it.
+        boolean subwordDmaStrKick=false;
+        Set<String> subwordKickChannels=new LinkedHashSet<>();
+        // Rule 163 VU1_DOUBLE_BUFFER_FRAMER: builds BASE+OFFSET VIFcodes (the
+        // TOPS double-buffer framing G23/G24 could not find). Derived from
+        // vifOpcodesBuilt at categorise time.
+        boolean isVu1DoubleBufferFramer=false;
+        // Rule 164 STALE_PTR_CACHE_CTOR: a ctor that caches a getter result into
+        // this+K (G12/G13/F50.4). If it runs before the source is funded it
+        // caches 0/stale and the downstream Draw silently skips. Derived.
+        boolean isStalePtrCacheCtor=false;
+        String  stalePtrCacheGetter=null;
         String  ctorRiskTier = "LOW";           // CRITICAL | HIGH | MEDIUM | LOW
         // Rule 94: virtual dispatch sites — entries [pcHex, slotOffsetHex, objReg].
         List<String[]> virtualDispatchSites = new ArrayList<>();
@@ -2141,6 +2609,104 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // LoadModuleBuffer ...). Static recompilers assume a flat address space;
         // overlay games reuse a region for multiple code banks.
         boolean isOverlayLoader = false;
+
+        // ===== v12 fields (DC2 G27-G52 retrospective + general RTT/present hazards) =====
+        // Rule 166: writes the GS FRAME reg (A+D id 0x4C/0x4D) — the render-target setter.
+        boolean writesFrameReg = false;
+        // Rule 165/166/167: labelled VRAM pages this func loads as constants
+        // (tbpConstantsLoaded ∩ KNOWN_DC2_TBP_LABELS), captured before the
+        // Rule 78 noise gate clears tbpConstantsLoaded.
+        Set<Long> vramKnownPagesHit = new LinkedHashSet<>();
+        // Rule 166: writesFrameReg + a known texture/CLUT page const → in-place RTT.
+        boolean isRttTarget = false;
+        // Rule 167: writesZbufReg + a known FRAME/texture page const → Z aliases live VRAM (G45).
+        boolean zbufVramAliasRisk = false;
+        // Rule 169: matrix-inverse helper that depends on the vf0.w==1 HW constant (G40).
+        boolean isVf0DependentInverse = false;
+        // Rule 170: backward-branch wait on an audio/stream completion signal (F63/F64).
+        boolean isAudioCompletionGate = false;
+        Set<String> audioGateSignals = new LinkedHashSet<>();
+        // Rule 171: sceMc*/libmc save-data callee.
+        boolean isMemcardIo = false;
+        Set<String> memcardCallees = new LinkedHashSet<>();
+        // Rule 173: writes an interlace/field GS privileged reg (SMODE/PMODE/CSR/SYNCV).
+        boolean writesPresentationFieldState = false;
+        Set<String> presentationRegs = new LinkedHashSet<>();
+        // Rule 174: DISPFB writer that signals the double-buffer/present flip.
+        boolean isDisplayBufferFlip = false;
+        // Rule 175: TEXFLUSH / CLUT-page cache op.
+        boolean isClutCacheInvalidator = false;
+        // Rule 176: derived frame-hot optimisation candidate.
+        boolean isPerfHotFramePath = false;
+
+        // ===== v13 fields (DC2 G53-G82 title-3D retrospective + general PS2 hazards) =====
+        // Rule 178: `lw $rX,<global>; beqz $rX; <stores>` guarded-config block (G58/G81).
+        boolean isConditionalInitOnGlobal = false;
+        Set<String> guardGlobals = new LinkedHashSet<>();   // gp-rel label or abs-hex of the guard
+        int conditionalInitSlots = 0;                        // stores inside the guarded block
+        // Rule 179: render-mode (copy vs transform) selector writer (G75-G80).
+        boolean isRenderModeSelector = false;
+        // Rule 180: per-vertex directional-light / N·L term (G82).
+        boolean isVertexLightingTerm = false;
+        Set<String> lightingSources = new LinkedHashSet<>();
+        // Rule 181: terminal `jr $rX` through a loaded vtable slot (G59 recompiler tail-call bug).
+        boolean isVtableTailcallThunk = false;
+        Set<Long> tailcallVtableSlots = new LinkedHashSet<>();
+        // Rule 182: RTT_TARGET that never writes a display-buffer FRAME back (G79 GS-state leak).
+        boolean isRttNoRestore = false;
+        // Rule 184: uploads VU microcode whose flag pipeline needs verifying (G71).
+        boolean isVuFlagPipelineUploader = false;
+        // Rule 187: GIF_TAG_INLINE_BUILDER that writes RGBAQ (PACKED spread-layout, G82).
+        boolean isPackedRgbaqBuilder = false;
+        // Rule 188: large draw/frame func re-enterable at an interior label (G58/G59 resume risk).
+        boolean isFrameResumeRisk = false;
+
+        // ===== v15 fields (DC2 G83-G115 retrospective + general PS2 ADC/packer/pacing) =====
+        // Rule 190: builds the VIF UNPACK selector qword a VU dispatcher reads to pick the
+        // PRIM-class packer (DC2 qword38 in CreateRenderInfoPacket@0x1404d0). G77-G115.
+        boolean isPrimClassSelector = false;
+        // Rule 192: const-tracked A+D store of GS reg 0x05 (XYZ2 draw-kick) / 0x0D (XYZ3 no-kick).
+        boolean writesXyz2Reg = false;     // 0x05 draw-kick vertex
+        boolean writesXyz3Reg = false;     // 0x0D no-kick / strip-restart vertex
+        boolean isKickModeWriter = false;
+        // Rule 191: the VU/EE per-vertex ADC strip-restart "+2048"/0x800 kick add (G65-G115).
+        int kickConstAddCount = 0;         // imm 0x800 in an add-family op
+        boolean isAdcKickVertexSource = false;
+        String  adcSource = null;          // input_driven_xyz3 | uniform_xyz2 | constant_kick
+        // Rule 193: per-block texture reload that de-interleaves TEX0 from geometry (G90-G97).
+        boolean isTextureReloadInterleave = false;
+        // Rule 195: game-step coupled to vsync/frame completion (G103 perf blocker).
+        boolean isVsyncCoupledGameStep = false;
+        // Rule 196: writes the shared view/projection (camera) matrix, not a world matrix (G98/G99).
+        boolean isViewProjectionMatrixWriter = false;
+        // Rule 197: ctor that constructs an array of objects whose elements need per-element vtables (G92).
+        boolean isObjectArrayCtor = false;
+        // Rule 184+: VU/COP2 interpreter-divergence hazards this func touches (manifest).
+        Set<String> vuExecHazards = new LinkedHashSet<>();
+
+        // ===== v15.1 fields (PCSX2-grounded cross-check, Rules 199-202) =====
+        // Rule 199: VIF unpack decompression-state commands this func programs
+        // (STMOD/STMASK/STROW/STCOL/STCYCL/ITOP/BASE/OFFSET). PCSX2 Vif_Unpack.cpp:
+        // mode 1 adds MaskRow, mode 2 difference-accumulates, mask nibble 3 skips the
+        // VU-mem write. A runtime VIF that ignores mode/mask/row/col/cycle decompresses
+        // the vertex/colour stream wrong.
+        Set<String> vifUnpackStateCmds = new LinkedHashSet<>();
+        boolean isVifUnpackDecompressState = false;
+        // Rule 200: writes GS XYOFFSET (A+D 0x18/0x19) — the ±2048 guard-band centre (G88).
+        boolean writesXyoffsetReg = false;
+        boolean isXyoffsetGuardWriter = false;
+        // Rule 201: writes GS TEX1 (A+D 0x14/0x15) — MMAG/MMIN texture filter mode (G8).
+        boolean writesTex1Reg = false;
+        boolean isTex1FilterWriter = false;
+
+        // ===== v15.2 fields (skill cross-check, Rules 203-206) =====
+        // Rule 203: EE MMI (128-bit SIMD integer) ops — a silent-wrong recompiler codegen class.
+        boolean usesMmi = false;
+        int mmiOpCount = 0;
+        Set<String> mmiFamilies = new LinkedHashSet<>();    // e.g. PEXT, PCPY, PMADD, PMFHL, PIPE1
+        // Rule 204: CFC2/CTC2 VU0 control-register access (control-reg map codegen class).
+        boolean usesCop2ControlReg = false;
+        Set<String> cop2ControlRegs = new LinkedHashSet<>();  // resolved index names (STATUS/MAC/CLIP/Q/...)
     }
 
     // =========================================================
@@ -2168,6 +2734,12 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // wrong-region input tomls (US vs EU/JP ELF address drift).
     private Map<Long,String> step1NameByAddr = new HashMap<>();
     private int step1NameMismatchCount = 0;
+    // v11.2: step1 tokens whose label is a TRUNCATED form of the real ELF
+    // symbol (v9-era mangled-name truncation, e.g. `__ct@0xADDR`). Counted
+    // separately so they never inflate step1_name_mismatches (which must
+    // mean genuine wrong-region/revision drift). The binding is valid (binds
+    // by address); the entry proceeds through the normal keep gate.
+    private int step1TruncatedNameCount = 0;
     // v11.1 LOCK: entries marked `# LOCKED` (trailing comment) or listed in a
     // `locked = [...]` array. Phase-era hand decisions: keep gate is BYPASSED
     // (a deliberate F-phase stub rarely carries host-boundary evidence - the
@@ -2346,6 +2918,74 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private int dmaTteRiskCount=0, iopRpcCount=0;
     private int archiveIoCount=0, padPollLoopCount=0;
     private int gameOverrideImportedCount=0;
+    // v11.3 detector counters (Rules 162-164).
+    private int sprDmaStagerCount=0, subwordDmaStrKickCount=0;
+    private int vu1DoubleBufferFramerCount=0, stalePtrCacheCtorCount=0;
+    // v12 Rules 165-177 counters + top-level collectors
+    private int rttTargetCount=0, zbufVramAliasCount=0, vf0DependentInverseCount=0;
+    private int audioCompletionGateCount=0, memcardIoCount=0;
+    private int presentationFieldStateCount=0, displayBufferFlipCount=0;
+    private int clutCacheInvalidatorCount=0, perfHotFramePathCount=0;
+    private int frameRegWriterCount=0;
+    // Rule 165: VRAM page -> {kind -> list of func names} for overlap pairing.
+    private final Map<Long,Map<String,List<String>>> vramPageWriters = new LinkedHashMap<>();
+    // Rule 165 output: [pageHex, label, kindA, funcA, kindB, funcB, classification]
+    private final List<String[]> vramOverlapPairs = new ArrayList<>();
+    // Rule 177: distinct labelled VRAM pages referenced statically.
+    private final Set<Long> gsLocalMemPagesReferenced = new LinkedHashSet<>();
+    // ===== v13 counters + top-level lists (Rules 178-189) =====
+    private int conditionalInitOnGlobalCount=0, renderModeSelectorCount=0;
+    private int vertexLightingTermCount=0, vtableTailcallThunkCount=0;
+    private int rttNoRestoreCount=0, packedRgbaqBuilderCount=0, frameResumeRiskCount=0;
+    private int vuFlagPipelineUploaderCount=0;
+    // Rule 179/180/182/184/187/188 top-level rosters: [name, addrHex, detail].
+    private final List<String[]> renderModeSelectors = new ArrayList<>();
+    private final List<String[]> vertexLightingTerms = new ArrayList<>();
+    private final List<String[]> vtableTailcallThunks = new ArrayList<>();
+    private final List<String[]> rttNoRestoreFuncs = new ArrayList<>();
+    private final List<String[]> packedRgbaqBuilders = new ArrayList<>();
+    private final List<String[]> frameResumeRiskFuncs = new ArrayList<>();
+    private final List<String[]> vuFlagPipelineUploaders = new ArrayList<>();
+    // Rule 186 INIT_ORDER_DEPENDENCY: global token -> writer/reader func-name lists.
+    private final Map<String,List<String>> initGlobalWriters = new LinkedHashMap<>();
+    private final Map<String,List<String>> initGlobalSinitWriters = new LinkedHashMap<>();
+    private final Map<String,List<String>> initGlobalReaders = new LinkedHashMap<>();
+    // Rule 186 output: [globalToken, readerFunc, writerFunc, writerKind].
+    private final List<String[]> initOrderHazards = new ArrayList<>();
+    // ===== v15 counters + top-level rosters (Rules 190-198) =====
+    private int primClassSelectorCount=0, adcKickVertexSourceCount=0, kickModeWriterCount=0;
+    private int textureReloadInterleaveCount=0, vsyncCoupledGameStepCount=0;
+    private int viewProjectionWriterCount=0, objectArrayCtorCount=0;
+    // [name, addrHex, detail] triads (reuse emitV13Roster).
+    private final List<String[]> primClassSelectors      = new ArrayList<>();
+    private final List<String[]> adcKickSources          = new ArrayList<>();
+    private final List<String[]> kickModeWriters         = new ArrayList<>();
+    private final List<String[]> textureReloadInterleave = new ArrayList<>();
+    private final List<String[]> framePacingDrivers      = new ArrayList<>();
+    private final List<String[]> viewProjectionWriters   = new ArrayList<>();
+    private final List<String[]> objectArrayCtors        = new ArrayList<>();
+    // Rule 194 ALLOCATOR_FAMILY_COHERENCE: [name, addrHex, disposition].
+    private final List<String[]> allocatorFamily = new ArrayList<>();
+    private boolean allocatorFamilySplit = false;
+    // Rule 184+ VU_EXEC_HAZARD_MANIFEST: [name, addrHex, hazard1|hazard2|...].
+    private final List<String[]> vuExecHazardManifest = new ArrayList<>();
+    // ===== v15.1 counters + rosters (PCSX2-grounded, Rules 199-202) =====
+    private int vifUnpackDecompressCount=0, xyoffsetGuardWriterCount=0, tex1FilterWriterCount=0;
+    private final List<String[]> vifUnpackDecompressState = new ArrayList<>();
+    private final List<String[]> xyoffsetGuardWriters     = new ArrayList<>();
+    private final List<String[]> tex1FilterWriters        = new ArrayList<>();
+    // ===== v15.2 counters + rosters (skill cross-check, Rules 203-205) =====
+    private int mmiCodegenRiskCount=0, cop2ControlRegCount=0;
+    private final List<String[]> mmiCodegenRisk      = new ArrayList<>();
+    private final List<String[]> cop2ControlRegAccess = new ArrayList<>();
+    // Rule 205 UNFUNDED_TEXTURE_PAGE: [pageHex, label, samplerFunc].
+    private final List<String[]> unfundedTexturePages = new ArrayList<>();
+    // v11.3: run mode. false => FIRST run (full pipeline: generate functions.csv
+    // + base config + assembly/decompiled/flowchart + unified TOML + JSON).
+    // true => INCREMENTAL (emit the new JSON, and MODIFY the existing live
+    // config_auto_recomp.toml in place only when the content actually changes;
+    // preserves # LOCKED and manual edits via the re-entrant + LOCK machinery).
+    private boolean incrementalMode=false;
     private int threadSyncCount=0; // Rule 25
 
     // v4 counters
@@ -2493,15 +3133,57 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         println("PS2Recomp TRIAGE ENRICHER v3 - DC2-aware (Rules 18-24)");
         println("=========================================================\n");
 
-        File csvFile = askFile("Select functions.csv from Step 1","Open");
-        if (csvFile==null||!csvFile.exists()){printerr("No CSV. Aborting.");return;}
+        // v11.3: run mode. FIRST run = full pipeline (generate functions.csv +
+        // base config via ExportPS2Functions, then enrich). INCREMENTAL = re-emit
+        // the JSON and MODIFY the existing live config in place, only on delta.
+        // If the ELF is unchanged since the last run, choose NO; the Rule 154
+        // elf_hash guard double-checks and warns on a real mismatch.
+        boolean firstRun = askYesNo("DC2 TriageEnricher - run mode",
+            "Is this the FIRST run for this ELF?\n\n"
+          + "YES = full pipeline: generate functions.csv + base config (via "
+          + "ExportPS2Functions) + assembly/decompiled/flowchart + unified TOML + JSON.\n\n"
+          + "NO = incremental: emit the new triage_map.json and MODIFY the existing "
+          + "config_auto_recomp.toml IN PLACE, only where needed (preserves # LOCKED "
+          + "and manual edits).");
+        incrementalMode = !firstRun;
 
-        File configToml = askFile("Select config.toml from Step 1","Open");
-        if (configToml==null||!configToml.exists()){printerr("No config.toml. Aborting.");return;}
-
-        File outputDir = csvFile.getParentFile();
-        File unifiedToml = new File(outputDir,"config_auto_recomp.toml");
-        File triageJson  = new File(outputDir,"triage_map.json");
+        File csvFile, configToml, outputDir;
+        if (firstRun) {
+            // Step-1 export is delegated to ExportPS2Functions so the recompiler's
+            // ghidra_output CSV + executable-label records stay authoritative (no
+            // duplicated classifier). Falls back to manual select if the script is
+            // not on Ghidra's script path.
+            println("[RUN-MODE] FIRST run - generating functions.csv + base config via ExportPS2Functions.");
+            try { runScript("ExportPS2Functions.java"); }
+            catch (Exception ex) {
+                printerr("[RUN-MODE] ExportPS2Functions not run automatically ("
+                    + ex.getMessage() + "); run it yourself, then select its outputs.");
+            }
+            csvFile = askFile("Select the functions.csv (from ExportPS2Functions)","Open");
+            if (csvFile==null||!csvFile.exists()){printerr("No CSV. Aborting.");return;}
+            configToml = askFile("Select the base config.toml (from ExportPS2Functions)","Open");
+            if (configToml==null||!configToml.exists()){printerr("No config.toml. Aborting.");return;}
+            outputDir = csvFile.getParentFile();
+        } else {
+            // Incremental: point at the LIVE project config to modify in place.
+            configToml = askFile("Select the LIVE config_auto_recomp.toml to modify in place","Open");
+            if (configToml==null||!configToml.exists()){printerr("No config. Aborting.");return;}
+            outputDir = configToml.getParentFile();
+            csvFile = new File(outputDir, "functions.csv"); // directory anchor only; never parsed
+            println("[RUN-MODE] INCREMENTAL - "+configToml.getName()
+                +" will be modified in place only if the content changes.");
+        }
+        File unifiedToml = incrementalMode ? configToml
+                                           : new File(outputDir,"config_auto_recomp.toml");
+        // v14: the monolithic triage_map.json is replaced by index/functions_index.json
+        // (full machine-readable map) + per-function Markdown docs in functions/.
+        File indexDir    = new File(outputDir,"index");
+        File functionsDir = new File(outputDir,"functions");
+        indexDir.mkdirs(); functionsDir.mkdirs();
+        if(!indexDir.isDirectory() || !functionsDir.isDirectory())
+            println("[WARN] could not pre-create index/ or functions/ under "
+                + outputDir.getAbsolutePath() + " - utf8Writer will retry per file.");
+        File triageJson  = new File(indexDir,"functions_index.json");
 
         // Rule 9: Parse step 1 config
         parseStep1Config(configToml);
@@ -2679,10 +3361,6 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         decomp.openProgram(currentProgram);
         BasicBlockModel blockModel = new BasicBlockModel(currentProgram);
 
-        PrintWriter asmWriter   = utf8Writer(new File(outputDir,"assembly.txt"));
-        PrintWriter decompWriter = utf8Writer(new File(outputDir,"decompiled.txt"));
-        PrintWriter flowWriter  = utf8Writer(new File(outputDir,"flowchart.txt"));
-
         long scanStart = System.currentTimeMillis();
         try {
             FunctionIterator allFuncs = funcManager.getFunctions(true);
@@ -2700,37 +3378,40 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 long offset = addr.getOffset();
                 String funcName = func.getName();
 
-                // Export text files
-                String header = "\n\n========================================\n"+
-                    "FUNCTION: "+funcName+"\n"+"ADDRESS: "+addr+"\n"+
-                    "========================================\n";
-                asmWriter.println(header);
+                // v14: capture listing text per function for the per-function
+                // Markdown docs (functions/<addr>_<name>.md), no longer streamed
+                // to monolithic assembly.txt / decompiled.txt / flowchart.txt.
+                StringBuilder sbAsm = new StringBuilder();
                 InstructionIterator instructions = currentProgram.getListing().getInstructions(func.getBody(),true);
                 while (instructions.hasNext()) {
                     Instruction instr = instructions.next();
-                    asmWriter.println(instr.getAddress()+" "+instr);
+                    sbAsm.append(instr.getAddress()).append("  ").append(instr).append('\n');
                 }
-                decompWriter.println(header);
+                String decompText;
                 DecompileResults decompResult = decomp.decompileFunction(func,30,monitor);
                 if (decompResult!=null&&decompResult.decompileCompleted())
-                    decompWriter.println(decompResult.getDecompiledFunction().getC());
+                    decompText = decompResult.getDecompiledFunction().getC();
                 else
-                    decompWriter.println("[decompile failed]");
-                flowWriter.println(header);
+                    decompText = "[decompile failed]";
+                StringBuilder sbFlow = new StringBuilder();
                 try {
                     CodeBlockIterator blocks = blockModel.getCodeBlocksContaining(func.getBody(),monitor);
                     while (blocks.hasNext()) {
                         CodeBlock block = blocks.next();
-                        flowWriter.println("  BLOCK: "+block.getFirstStartAddress());
+                        sbFlow.append("BLOCK: ").append(block.getFirstStartAddress()).append('\n');
                         CodeBlockReferenceIterator dests = block.getDestinations(monitor);
                         while (dests.hasNext()) {
                             CodeBlockReference ref = dests.next();
-                            flowWriter.println("    --> "+ref.getDestinationAddress()+" ["+ref.getFlowType().getName()+"]");
+                            sbFlow.append("  --> ").append(ref.getDestinationAddress())
+                                  .append(" [").append(ref.getFlowType().getName()).append("]\n");
                         }
                     }
                 } catch (Exception e) {
-                    flowWriter.println("  [flowchart failed: "+e.getMessage()+"]");
+                    sbFlow.append("[flowchart failed: ").append(e.getMessage()).append("]\n");
                 }
+                String capturedAsm = sbAsm.toString();
+                String capturedFlow = sbFlow.toString();
+                String capturedDecomp = decompText;
 
                 // Rule 9 (v11 REWRITE, ported from General v15): step1
                 // (DAC.toml) classified functions are no longer trusted
@@ -2815,7 +3496,22 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                                        // codegen path — keep real bodies for review.
                                        || !traits.cop2SpecialOps.isEmpty()
                                        // v11 Rule 161: runtime code linker/loader.
-                                       || traits.isDynamicCodeLoader;
+                                       || traits.isDynamicCodeLoader
+                                       // v13 Rule 178: a global-guarded init block must keep its
+                                       // real body (stubbing skips the configuration, G58/G81).
+                                       || traits.isConditionalInitOnGlobal
+                                       // v13 Rule 181: vtable tail-call thunk - stubbing breaks
+                                       // the recompiler's inherited-virtual dispatch (G59).
+                                       || traits.isVtableTailcallThunk
+                                       // v15 Rules 190/191/196/197: the PRIM-class selector,
+                                       // the per-vertex ADC/strip-restart geometry builder, the
+                                       // shared view/projection matrix writer, and the object-
+                                       // array ctor all carry render/init-critical state that a
+                                       // nop-stub silently destroys (G92/G98/G115).
+                                       || traits.isPrimClassSelector
+                                       || traits.isAdcKickVertexSource
+                                       || traits.isViewProjectionMatrixWriter
+                                       || traits.isObjectArrayCtor;
 
                 // --- Disposition decision ---
                 // v11 (ported from General v13 SF3-benchmark corrections - all
@@ -2848,6 +3544,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 String rescueReason = null;
                 boolean step1KeptHostBoundary = false;
                 boolean step1NameMismatchFlag = false;
+                boolean step1TruncatedFlag = false;
                 boolean step1LockedFlag = false;
                 if (overrideBound) {
                     // Already hand-bound in dc2_game_override.cpp - record for
@@ -2871,13 +3568,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                         step1LockedFlag = true;
                         // Rule 151 mismatch still surfaces for review (a
                         // locked binding on a wrong-region address is worth
-                        // a human look), but does not unbind.
+                        // a human look), but does not unbind. v11.2: a
+                        // truncated mangled label is not drift - skip it.
                         String expectedL = step1NameByAddr.get(offset);
                         if (expectedL != null && !expectedL.isEmpty()
                                 && !funcName.equals(expectedL)
                                 && !funcName.startsWith("FUN_") && !funcName.startsWith("sub_")
                                 && !funcName.startsWith("LAB_") && !funcName.startsWith("thunk_")) {
-                            step1NameMismatchCount++; step1NameMismatchFlag = true;
+                            if (isTruncatedNameOf(expectedL, funcName)) { step1TruncatedNameCount++; step1TruncatedFlag = true; }
+                            else { step1NameMismatchCount++; step1NameMismatchFlag = true; }
                         }
                         if (outOfTextBinding) outOfTextBindingCount++;
                     } else {
@@ -2889,10 +3588,18 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     // failure mode, so force RECOMPILE + review. Only fires
                     // when the Ghidra name is real (not FUN_/sub_ defaults).
                     String expected = step1NameByAddr.get(offset);
-                    boolean nameMismatch = expected != null && !expected.isEmpty()
+                    boolean nameDiffers = expected != null && !expected.isEmpty()
                             && !funcName.equals(expected)
                             && !funcName.startsWith("FUN_") && !funcName.startsWith("sub_")
                             && !funcName.startsWith("LAB_") && !funcName.startsWith("thunk_");
+                    // v11.2: a truncated mangled label (`__ct`, `SetStatus`)
+                    // is NOT region drift - the address binds correctly. Such
+                    // entries skip the Rule 151 veto and proceed through the
+                    // normal keep gate, decided on real trait evidence (ctors
+                    // hit the ctor firewall, etc.). Only a genuinely different
+                    // symbol is a mismatch.
+                    boolean truncatedName = nameDiffers && isTruncatedNameOf(expected, funcName);
+                    boolean nameMismatch = nameDiffers && !truncatedName;
                     String gateFail;
                     if (inOverlayBlock) {
                         // v11 Rule 158: hard veto - overlay address reuse.
@@ -2908,6 +3615,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                                                         isWhitelisted, forceRecompile);
                     }
                     if (nameMismatch) { step1NameMismatchCount++; step1NameMismatchFlag = true; }
+                    if (truncatedName) { step1TruncatedNameCount++; step1TruncatedFlag = true; }
                     if (outOfTextBinding) outOfTextBindingCount++;
                     if (gateFail == null) {
                         disposition = step1Disposition;   // binding survives the gate
@@ -3071,6 +3779,38 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 }
                 if (traits.usesCop1) tags.add("FPU_HEAVY");
                 if (traits.usesSPR)  tags.add("USES_SPR");
+                // ===== v11.3 Rules 162-164 (DC2 F52-G26 retrospective) =====
+                // Rule 162 SPR_DMA_STAGER / SUBWORD_DMA_STR_KICK — the G26
+                // delivery-bug class (scratchpad-staged VU1 model packet copied
+                // via fromSPR ch8, kicked by a sub-word CHCR store).
+                if (traits.programsSprDma)
+                    {tags.add("SPR_DMA_STAGER");sprDmaStagerCount++;}
+                if (traits.subwordDmaStrKick)
+                    {tags.add("SUBWORD_DMA_STR_KICK");subwordDmaStrKickCount++;}
+                // Rule 163 VU1_DOUBLE_BUFFER_FRAMER — builds BASE+OFFSET VIFcodes
+                // (TOPS double-buffer framing; the missing context in G23/G24).
+                if (traits.vifOpcodesBuilt.contains("BASE") &&
+                    traits.vifOpcodesBuilt.contains("OFFSET")) {
+                    traits.isVu1DoubleBufferFramer = true;
+                    tags.add("VU1_DOUBLE_BUFFER_FRAMER");vu1DoubleBufferFramerCount++;
+                }
+                // Rule 164 STALE_PTR_CACHE_CTOR — a ctor that caches a derived
+                // global pointer (Get*Ptr/Man/Data/Mgr) into this+K (G12/G13/
+                // F50.4). Caches 0/stale if it runs before the source is funded.
+                if (traits.isCtor && traits.ctorWritesA0Slot &&
+                    traits.stalePtrCacheGetter == null) {
+                    for (String cn : traits.calleeNames) {
+                        if (cn == null) continue;
+                        if (cn.startsWith("Get") && (cn.contains("Ptr") ||
+                            cn.contains("Man") || cn.contains("Data") || cn.contains("Mgr"))) {
+                            traits.isStalePtrCacheCtor = true;
+                            traits.stalePtrCacheGetter = cn;
+                            break;
+                        }
+                    }
+                }
+                if (traits.isStalePtrCacheCtor)
+                    {tags.add("STALE_PTR_CACHE_CTOR");stalePtrCacheCtorCount++;}
                 if (traits.writesToGlobal) tags.add("WRITES_GLOBAL");
                 if (traits.returnPaths>=3) tags.add("MULTI_RETURN");
                 if (!refManager.hasReferencesTo(addr)&&!isWhitelisted)
@@ -3398,6 +4138,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                             tags.add("STEP1_BOUND_ROSTER_HANDLER");
                     }
                     if (step1NameMismatchFlag) tags.add("STEP1_NAME_MISMATCH");
+                    if (step1TruncatedFlag) tags.add("STEP1_TRUNCATED_NAME");
                     if (outOfTextBinding) tags.add("OUT_OF_TEXT_BINDING");
                 }
                 if (inOverlayBlock) tags.add("OVERLAY_REGION");
@@ -3408,6 +4149,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 r.disposition=disposition; r.traits=traits; r.tags=tags;
                 r.origin=origin; r.step1Disposition=step1Disposition;
                 r.rescueReason=rescueReason;
+                r.asmText=capturedAsm; r.decompText=capturedDecomp; r.flowText=capturedFlow;
                 if(rescueReason!=null) r.rescuedBy="step1_keep_gate";
                 // v11.1: provenance detail - did this binding come from the
                 // step1 exporter or from a previous enricher run's additions?
@@ -3495,7 +4237,13 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             // and promoted out of STUB (never out of a hard step1 binding).
             // For DC2 this should find nothing - a hit is a project-level
             // red flag.
-            {
+            // v11.2 PRECISION GATE: only run the layered search when the ELF
+            // actually contains at least one overlay/exec callee anywhere
+            // (overlayLoaderCount>0). If nothing in the binary can execute
+            // loaded bytes (DC2: overlay_loaders=0), runtime code loading is
+            // impossible and the flush+file intersection is pure asset-loader
+            // noise (DC2 streams from DATA.DAT/HD2 and flushes per DMA).
+            if (overlayLoaderCount > 0) {
                 Set<Long> flushReach = new HashSet<>();
                 for (FuncResult r : results) {
                     if (r.traits == null) continue;
@@ -3655,6 +4403,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             buildNamePrefixModules(results);
             // Rule 134 tag DC2 call chain participants
             tagDc2CallChains(results);
+            // v12 Rules 165-177: RTT/Z VRAM-alias, audio/memcard/present hazards,
+            // perf-hot ranking. Runs after BFS depths + DC2-known tagging are final
+            // and BEFORE the Rule 78 noise gate clears tbpConstantsLoaded.
+            applyV12Rules(results);
+            // v13 Rules 178-188: render-mode/lighting/tailcall/RTT-leak + init-order.
+            applyV13Rules(results);
+            // v15 Rules 190-198: ADC/PRIM-class packer, allocator-family coherence,
+            // frame-pacing, view-matrix, object-array ctor, VU-exec hazard manifest.
+            applyV15Rules(results);
             println(String.format("  v9 post: GIF_INLINE=%d BITBLTBUF_MACRO=%d CHCR_KICK=%d DMA_SRC_CHAIN=%d MMIO_RECOVERED=%d SYSCALL_TR=%d SYNC_WAIT=%d INF_SPIN=%d INF_FAIL=%d IRX=%d REBOOT=%d RENDER_ENTRY=%d STRUCT_INIT=%d DISPATCH_TGT=%d TABLE_CALL=%d HOST_WAIT=%d DC2_KNOWN=%d DISC_SIDS=%d FPT_TABLES=%d MODULES=%d PREFIXES=%d",
                 gifTagInlineBuilderCount, bitbltbufMacroSeqCount, dmaChcrStartKickCount,
                 dmaSourceChainBuilderCount, compositeMmioRecoveryCount, syscallTrampolineCount,
@@ -3719,6 +4476,16 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                             t.isBitbltbufT4hhUploader || t.isCtorMultiFieldInit ||
                             t.isSceGifPkFamily || t.path3Initiator ||
                             t.writesGifFifo || t.writesVif1Fifo || t.hasVcallms ||
+                            // v12 Rule 166/169: in-place RTT writers and vf0-
+                            // dependent matrix inverses are render-critical
+                            // (G37/G44/G40); never leave them stubbed.
+                            t.isRttTarget || t.isVf0DependentInverse ||
+                            // v13 Rules 179/180/182: render-mode selectors, per-vertex
+                            // lighting terms, and RTT-no-restore writers are all
+                            // render-critical (G75-G82) - never leave them stubbed.
+                            t.isRenderModeSelector || t.isVertexLightingTerm ||
+                            t.isRttNoRestore || t.isConditionalInitOnGlobal ||
+                            t.isVtableTailcallThunk ||
                             // v11 Rule 155: GS-dump corroboration - this
                             // function's TBP/PSM signature was observed in an
                             // actual PCSX2 capture; stubbing it provably
@@ -3776,6 +4543,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 if(step1NameMismatchCount>0)
                     println("  v11 Rule 151: "+step1NameMismatchCount
                             +" step1 name/address mismatches (stale or wrong-region input?) - forced RECOMPILE + review.");
+                if(step1TruncatedNameCount>0)
+                    println("  v11.2 Rule 151: "+step1TruncatedNameCount
+                            +" truncated mangled labels (e.g. __ct@addr) - NOT drift, address binds correctly, sent through normal gate.");
             }
 
             // v11 Rule 153: handler-roster cross-check. Runs after every
@@ -3805,18 +4575,43 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 println("  v11 Rule 158: overlay vetoes="+overlayVetoCount
                         +", out-of-text bindings flagged="+outOfTextBindingCount+".");
 
-            writeUnifiedConfig(unifiedToml,configToml,newStubs,newSkips,results,resultsByAddr);
-            // v8 Rule 109: diff against prior triage_map.json if present.
-            // Renames the old file to triage_map.prev.json before overwriting.
-            File priorJson = new File(outputDir, "triage_map.json");
+            if (incrementalMode) {
+                // Modify the live config IN PLACE, only if the executable content
+                // (selectors/sections, ignoring comments + # TAG annotations)
+                // actually changed. Preserves the file untouched when there is no
+                // need; backs up the prior on a real delta.
+                File tmp = new File(outputDir, "config_auto_recomp.toml.new");
+                writeUnifiedConfig(tmp,configToml,newStubs,newSkips,results,resultsByAddr);
+                if (unifiedToml.exists() && configBodyEquals(tmp, unifiedToml)) {
+                    tmp.delete();
+                    println("[INCREMENTAL] "+unifiedToml.getName()
+                        +" unchanged - left in place (no modification needed).");
+                } else {
+                    File bak = new File(outputDir, "config_auto_recomp.prev.toml");
+                    if (bak.exists()) bak.delete();
+                    if (unifiedToml.exists()) unifiedToml.renameTo(bak);
+                    if (!tmp.renameTo(unifiedToml)) {
+                        java.nio.file.Files.copy(tmp.toPath(), unifiedToml.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                        tmp.delete();
+                    }
+                    println("[INCREMENTAL] "+unifiedToml.getName()
+                        +" MODIFIED (delta applied); prior saved as config_auto_recomp.prev.toml.");
+                }
+            } else {
+                writeUnifiedConfig(unifiedToml,configToml,newStubs,newSkips,results,resultsByAddr);
+            }
+            // v8 Rule 109: diff against prior index/functions_index.json if present.
+            // Renames the old file to functions_index.prev.json before overwriting.
+            File priorJson = new File(indexDir, "functions_index.json");
             Map<Long,String> priorCats = null;
             if (priorJson.exists()) {
                 try {
                     priorCats = loadPriorTriageMapCats(priorJson);
-                    File backup = new File(outputDir, "triage_map.prev.json");
+                    File backup = new File(indexDir, "functions_index.prev.json");
                     if (backup.exists()) backup.delete();
                     priorJson.renameTo(backup);
-                    println(String.format("[DIFF] Backed up prior triage_map.json (%d funcs).",
+                    println(String.format("[DIFF] Backed up prior functions_index.json (%d funcs).",
                         priorCats != null ? priorCats.size() : 0));
                 } catch (Exception ex) {
                     println("[DIFF] Failed to load prior map: "+ex.getMessage());
@@ -3825,16 +4620,24 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             }
             this.priorTriageMapCats = priorCats;
             writeTriageJson(triageJson,results,elfHash,gpValue,totalFuncs,uncategorized);
+            // v14: per-function Markdown docs + the focused lookup indexes.
+            writeFunctionDocs(functionsDir, results, elfHash, gpValue);
+            writeLookupIndexes(indexDir, results, elfHash, gpValue);
+
+            // v11.3: auto-generate the post-regen COP2 dest-mask patch from this
+            // run's COP2 model. CANNOT run inside this Ghidra pass (it rewrites
+            // recomp/*.cpp that only exist AFTER ps2_recomp.exe regenerates), so
+            // it ships next to the triage output with RECOMP pre-filled and is
+            // listed in post_regen_steps.md - so the F51.8 fix can't be forgotten.
+            emitCop2FixScript(outputDir, results);
 
             println("\n[SUCCESS] Unified TOML : "+unifiedToml.getAbsolutePath());
-            println("[SUCCESS] Triage JSON  : "+triageJson.getAbsolutePath());
-            println("[SUCCESS] Text logs    : assembly.txt, decompiled.txt, flowchart.txt");
-            println("All 5 files saved to: "+outputDir.getAbsolutePath());
+            println("[SUCCESS] Function docs: functions/<addr>_<name>.md ("+results.size()+" files)");
+            println("[SUCCESS] Indexes      : index/{functions_index,calls_index,xrefs_index,tags_index,globals_index}.json");
+            println("[SUCCESS] Post-regen   : fix_cop2_destmask.py + post_regen_steps.md");
+            println("All files saved to: "+outputDir.getAbsolutePath());
 
         } finally {
-            asmWriter.close();
-            decompWriter.close();
-            flowWriter.close();
             decomp.dispose();
         }
     }
@@ -4660,6 +5463,22 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if (addr >= 0 && !name.isEmpty()) step1NameByAddr.putIfAbsent(addr, name);
     }
 
+    /** v11.2: is `expected` a TRUNCATED form of the real ELF symbol rather
+     *  than a different function? step1 tokens bind by ADDRESS; the name is
+     *  only a label, and v9-era exporters truncated mangled C++ names
+     *  (`__ct@0xADDR` for `__ct__15mgCTexAnimeDataFv`, `SetStatus@0xADDR` for
+     *  `SetStatus__6CSceneFiii`). Such a token is NOT a wrong-region
+     *  mismatch - the address is correct. Detected when the real symbol
+     *  starts with the expected label and continues with the Itanium mangle
+     *  marker `__`. Genuine drift (different function) fails this and stays a
+     *  real Rule 151 mismatch. */
+    private static boolean isTruncatedNameOf(String expected, String actual) {
+        if (expected == null || actual == null) return false;
+        if (!actual.startsWith(expected)) return false;
+        if (actual.length() <= expected.length()) return false;
+        return actual.substring(expected.length()).startsWith("__");
+    }
+
     /** v11.1: record a locked binding ("name" or "name@0xADDR"). Locked
      *  entries bypass the keep gate and every rescue/promote pass. */
     private void addLockedEntry(String entry) {
@@ -4864,6 +5683,19 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                         look++;
                     }
                 } catch(Exception ignore) {}
+            }
+        }
+        // v11.3: generalize the jr-$t9 caller proxy to ALL functions so the
+        // emitted `override_hookable` is meaningful for non-ctors too.
+        // registerFunction overrides are consulted ONLY for indirect jalr/jr $t9;
+        // a function with any direct-jal caller is not fully hookable that way
+        // (the G11 ReloadTexture / F51.8 COP2 gotcha). Same proxy Pass B uses.
+        for(FuncResult r : results) {
+            if(r.traits == null || r.traits.calledViaJrT9) continue;
+            for(long[] c : r.traits.callers) {
+                FuncResult caller = byAddr.get(c[0] & 0xFFFFFFFFL);
+                if(caller == null || caller.traits == null) continue;
+                if(caller.traits.indirectCallT9Count > 0) { r.traits.calledViaJrT9 = true; break; }
             }
         }
         // -------- Pass B: ctor risk grading --------
@@ -5729,6 +6561,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                             if(reg==GS_PRIM_REG)   traits.writesGsPrimReg = true;
                             if(reg==GS_ZBUF_1||reg==GS_ZBUF_2) traits.writesZbufReg = true;
                             if(reg==GS_DISPFB1||reg==GS_DISPFB2) traits.writesDispfbReg = true;
+                            // v12 Rule 166: GS FRAME reg (render-target setter)
+                            if(reg==0x4CL||reg==0x4DL) traits.writesFrameReg = true;
                             // v5
                             if(reg==GS_TEX0_1||reg==0x07L) traits.writesTex0Reg = true;
                             if(reg==GS_RGBAQ_REG)  traits.writesRgbaqReg = true;
@@ -5745,6 +6579,20 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                             traits.dmaKickChannels.add(DMA_CHANNEL_NAMES[chIdx]);
                         else if((slot == 0x20 || slot == 0x30) && ref.getReferenceType().isWrite())
                             traits.dmaQwcTadrChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+                        // v11.3 Rule 162: sub-word STR kick — sb/sh into the CHCR
+                        // word (slot 0..3). A word-only IO dispatcher drops it
+                        // (G26: SendDMA kicks ch8 via `sb` to CHCR+1).
+                        if(slot <= 0x03 && ref.getReferenceType().isWrite() &&
+                           (ml.equals("sb")||ml.equals("sh"))) {
+                            traits.subwordDmaStrKick = true;
+                            traits.subwordKickChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+                        }
+                        // v11.3 Rule 162: fromSPR(8)/toSPR(9) scratchpad DMA
+                        // channel — the staged-packet copy path (G26).
+                        if((chIdx==8||chIdx==9) && ref.getReferenceType().isWrite()) {
+                            traits.programsSprDma = true;
+                            traits.sprDmaChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+                        }
                         break;
                     }
                     // v5 Rule 44: PATH3 initiator — any write to GIF CHCR range
@@ -6085,23 +6933,31 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // Rule 120 syscall trampoline — names anonymous syscall stubs
         if(traits.hasSyscall && traits.byteSize <= 64)
             detectSyscallTrampoline(func, traits);
-        // v11 Rule 161 (General v15.5): dynamic-code loader. Calls a
-        // cache-flush family callee AND shows file/archive input in the same
-        // body - the canonical "read code from disc, FlushCache, execute"
-        // overlay / runtime-linker idiom. Any hit means the ELF loads EE code
-        // at runtime, so a static recompile of this ELF alone does NOT cover
-        // the whole game. (DC2 expected: zero hits.)
+        // v11.2 Rule 161 (DC2-tuned precision): dynamic-code loader. The
+        // canonical idiom is "read code from disc, FlushCache the I-cache,
+        // then EXECUTE the loaded bytes". The General-script trigger
+        // (cache-flush + file/archive evidence) over-fired on DC2: the game
+        // streams every asset from DATA.DAT / DATA.HD2 and flushes the cache
+        // after each DMA, so 34 pure ASSET loaders were flagged as code
+        // loaders (DC2 is a single flat ELF with no runtime code loading -
+        // confirmed across 9 GS dumps; overlay_loaders=0). The fix: require
+        // EXECUTION evidence - an overlay/exec callee (LoadExecPS2 / ExecPS2
+        // / LoadModuleBuffer ...) in the SAME body. Asset loaders never call
+        // those, so DC2 -> 0; real overlay games (General use) still fire.
         {
-            boolean callsCacheFlush = false;
+            boolean callsCacheFlush = false, execsOverlay = false;
             for(String cn : traits.calleeNames) {
                 if(cn.equals("FlushCache") || cn.equals("iFlushCache")
                    || cn.equals("CacheFlush")
                    || cn.startsWith("FlushCache_0x") || cn.startsWith("iFlushCache_0x")
                    || cn.startsWith("CacheFlush_0x")) {
-                    callsCacheFlush = true; break;
+                    callsCacheFlush = true;
                 }
+                if(OVERLAY_LOADER_CALLEES.contains(cn)) execsOverlay = true;
             }
-            if(callsCacheFlush &&
+            // file/archive input still required - a flush+exec with no load is
+            // an in-place patcher, not a loader.
+            if(callsCacheFlush && execsOverlay &&
                (traits.callsFileOpen || traits.refsArchiveStrings))
                 traits.isDynamicCodeLoader = true;
         }
@@ -6147,8 +7003,249 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         for(String cn : traits.calleeNames)
             if(OVERLAY_LOADER_CALLEES.contains(cn)) { traits.isOverlayLoader = true; break; }
 
+        // ===== v13 detector pipeline (DC2 G53-G82) =====
+        // Rule 178: global-guarded configuration block (init-ordering gap).
+        detectConditionalInitOnGlobal(func, traits);
+        // Rule 181: terminal jr through a vtable slot (recompiler tail-call bug).
+        detectVtableTailcallThunk(func, traits);
+
+        // ===== v15 detector pipeline (DC2 G83-G115) =====
+        // Sets the firewalled scan-time booleans (190/191/196/197) that forceRecompile
+        // consults; the non-firewalled rosters/tags (192/193/195/194/184+) are derived
+        // later in applyV15Rules from these traits.
+        detectV15Signals(func, fname, traits);
+        // v15.1 Rule 199: VIF unpack decompression-state command bytes (PCSX2-grounded).
+        detectVifUnpackState(func, traits);
+        // v15.2 Rules 203/204: MMI SIMD ops + CFC2/CTC2 control-reg access (skill codegen classes).
+        detectCodegenClasses(func, traits);
+
         cache.put(key,traits);
         return traits;
+    }
+
+    // v15.2 macro control-reg indices (15-vu1-gs-debugging §2.1, confirmed vs PCSX2 VU.h).
+    private static final Map<Long,String> COP2_CONTROL_REGS = new HashMap<>();
+    static {
+        COP2_CONTROL_REGS.put(16L,"STATUS"); COP2_CONTROL_REGS.put(17L,"MAC");
+        COP2_CONTROL_REGS.put(18L,"CLIP");   COP2_CONTROL_REGS.put(20L,"R");
+        COP2_CONTROL_REGS.put(21L,"I");      COP2_CONTROL_REGS.put(22L,"Q");
+        COP2_CONTROL_REGS.put(23L,"P");      COP2_CONTROL_REGS.put(26L,"TPC");
+        COP2_CONTROL_REGS.put(27L,"CMSAR0"); COP2_CONTROL_REGS.put(28L,"FBRST");
+        COP2_CONTROL_REGS.put(29L,"VPU_STAT"); COP2_CONTROL_REGS.put(31L,"CMSAR1");
+    }
+
+    // v15.2 Rule 203/204: flag the two recompiler codegen classes the skill names but no
+    // rule covered - EE MMI (128-bit SIMD integer) ops and CFC2/CTC2 VU0 control-reg access.
+    // Both are emitted as wrong C++ for some operand shapes SILENTLY; the map flags the
+    // functions so the AI can audit the whole class (10-agent-guardrails §2 L64).
+    private void detectCodegenClasses(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext() && scanned < 6000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            // track small immediates so a ctc2 sourcing a const reg can name the index
+            if(m.equals("addiu")||m.equals("li")||m.equals("ori")||m.equals("daddiu")) {
+                String dr = regOf(inst.getOpObjects(0));
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            }
+            // --- Rule 203 MMI ---
+            String fam = mmiFamily(m);
+            if(fam != null) { traits.usesMmi = true; traits.mmiOpCount++; traits.mmiFamilies.add(fam); }
+            // --- Rule 204 CFC2/CTC2 ---
+            // Only indices 16-31 are the SPECIAL control regs (STATUS/MAC/CLIP/Q/...) the F51.8
+            // control-reg-map codegen class is about. Indices 0-15 are plain VI00-VI15 integer
+            // register copies (routine, not a codegen hazard) — they over-fired the rule, so
+            // skip them. An unresolved index stays flagged (could be a special reg).
+            if(m.equals("cfc2") || m.equals("ctc2")) {
+                long idx = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        long v = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                        if(v <= 31) idx = v;
+                    }
+                if(idx < 0) {  // ctc2 source may be a tracked const reg
+                    for(Object o : inst.getInputObjects())
+                        if(o instanceof ghidra.program.model.lang.Register) {
+                            Long c = regConsts.get(((ghidra.program.model.lang.Register)o).getName());
+                            if(c != null && c <= 31) idx = c;
+                        }
+                }
+                if(idx >= 16) {
+                    traits.usesCop2ControlReg = true;
+                    traits.cop2ControlRegs.add(COP2_CONTROL_REGS.getOrDefault(idx, "idx"+idx));
+                } else if(idx < 0) {
+                    traits.usesCop2ControlReg = true;
+                    traits.cop2ControlRegs.add("unresolved");
+                }
+                // idx 0-15 (VI00-VI15 read) is routine — not recorded.
+            }
+        }
+    }
+
+    // v15.2 Rule 203: classify an EE R5900 MMI mnemonic into a family (null if not MMI).
+    // The MMI opcode space is the p-prefixed 128-bit SIMD integer ops plus the pipeline-1
+    // HI1/LO1 ops. `pref` is the one p-prefixed NON-MMI op (cache prefetch) - excluded.
+    private static String mmiFamily(String m) {
+        if(m.equals("pref")) return null;
+        if(m.equals("mult1")||m.equals("multu1")||m.equals("div1")||m.equals("divu1")
+           ||m.equals("madd1")||m.equals("maddu1")||m.equals("mfhi1")||m.equals("mflo1")
+           ||m.equals("mthi1")||m.equals("mtlo1")) return "PIPE1";
+        if(!m.startsWith("p") && !m.equals("qfsrv")) return null;
+        if(m.equals("qfsrv")) return "QFSRV";
+        if(m.startsWith("pext")||m.startsWith("pexc")||m.startsWith("pexe")) return "PEXT";
+        if(m.startsWith("pcpy")) return "PCPY";
+        if(m.startsWith("ppac")||m.startsWith("ppacb")) return "PPAC";
+        if(m.startsWith("pmfhl")||m.startsWith("pmthl")) return "PMFHL";
+        if(m.startsWith("pmadd")||m.startsWith("pmsub")||m.startsWith("phmadh")||m.startsWith("phmsbh"))
+            return "PMADD";
+        if(m.startsWith("pmult")||m.startsWith("pmulth")||m.startsWith("pdiv")||m.startsWith("pdivbw"))
+            return "PMULT";
+        if(m.startsWith("padd")||m.startsWith("psub")||m.startsWith("padsbh")) return "PADD";
+        if(m.startsWith("pmax")||m.startsWith("pmin")) return "PMINMAX";
+        if(m.startsWith("psll")||m.startsWith("psrl")||m.startsWith("psra")) return "PSHIFT";
+        if(m.startsWith("pand")||m.startsWith("por")||m.startsWith("pxor")||m.startsWith("pnor"))
+            return "PLOGIC";
+        if(m.startsWith("pcgt")||m.startsWith("pceq")) return "PCMP";
+        if(m.startsWith("pmfh")||m.startsWith("pmth")||m.startsWith("pmfl")||m.startsWith("pmtl"))
+            return "PHILO";
+        if(m.startsWith("pabs")||m.startsWith("plzcw")||m.startsWith("prot3w")||m.startsWith("pinteh")
+           ||m.startsWith("prev")||m.startsWith("pmulth")) return "PMISC";
+        // any remaining p-prefixed op is still an MMI op (catch-all, excl. pref above)
+        return "PMISC";
+    }
+
+    // v15.1 Rule 199: VIF unpack decompression-state command builder. Const-scan for
+    // VIFcode command bytes (bits 24-31) that program the UNPACK decompression: STMOD
+    // (add-row / difference), STMASK (per-component write-mask incl. SKIP), STROW/STCOL
+    // (the row/col regs), STCYCL (fill-skip), and the ITOP/BASE/OFFSET double-buffer
+    // framing. Verified against pcsx2/Vif_Codes.cpp (vifCmdHandler) + Vif_Unpack.cpp
+    // (writeXYZW mode/mask). Recorded here; gated on independent VIF evidence + tagged
+    // in applyV15Rules (the v13 detector-gate philosophy avoids false positives on a
+    // bare 0x05000000-shaped constant).
+    private void detectVifUnpackState(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        while(it.hasNext() && scanned < 4000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            long v = -1;
+            if(m.equals("lui")) {
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        v = (((ghidra.program.model.scalar.Scalar)o).getUnsignedValue() & 0xFFFFL) << 16;
+            } else if(m.equals("ori") || m.equals("addiu") || m.equals("li") || m.equals("daddiu")) {
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        v = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue() & 0xFFFFFFFFL;
+            }
+            if(v < 0x01000000L) continue;
+            long cmd = (v >> 24) & 0xFFL;
+            String nm = null;
+            if(cmd == 0x01L) nm = "STCYCL";
+            else if(cmd == 0x02L) nm = "OFFSET";
+            else if(cmd == 0x03L) nm = "BASE";
+            else if(cmd == 0x04L) nm = "ITOP";
+            else if(cmd == 0x05L) nm = "STMOD";
+            else if(cmd == 0x06L) nm = "MSKPATH3";
+            else if(cmd == 0x20L) nm = "STMASK";
+            else if(cmd == 0x30L) nm = "STROW";
+            else if(cmd == 0x31L) nm = "STCOL";
+            if(nm != null) traits.vifUnpackStateCmds.add(nm);
+        }
+    }
+
+    // v15 name rosters for the structural detectors (Rules 190/196).
+    // Builder-specific tokens (NOT the bare class name "mgCVisualMDT", which also matched
+    // getters like Iam/GetMaterialNum/GetpMaterial — FP). These name the funcs that emit the
+    // selector packet: CreateRenderInfoPacket, the MDT builder, the visual-MDT Draw.
+    private static final String[] PRIM_SELECTOR_NAMES = {
+        "CreateRenderInfoPacket", "RenderInfoPacket", "MDTBuilder", "Draw__12mgCVisualMDT" };
+    private static final String[] VIEW_PROJ_NAMES = {
+        "Perspective", "LookAt", "SetView", "ViewMatrix", "ProjMatrix",
+        "Projection", "SetCamera", "CreateRenderInfoPacket" };
+    private static final java.util.Set<String> VIEW_PROJ_CALLEES = new java.util.HashSet<>(
+        java.util.Arrays.asList("mgPerspective", "mgLookAt", "mgSetView", "mgProjection",
+            "mgSetCamera", "sceVu0CameraMatrix", "mgSetProjection", "mgFrustum"));
+
+    // v15 Rule 190/191/196/197: per-function structural signals decoded over the
+    // course of G83-G115. One light instruction pass for the per-vertex kick add
+    // (0x800), the rest derived from already-collected traits + name rosters. Only
+    // the firewalled booleans are set here (so forceRecompile honours them); the
+    // tag/roster/counter work is done in applyV15Rules.
+    private void detectV15Signals(Function func, String fname, FuncTraits traits) {
+        long addr = func.getEntryPoint().getOffset() & 0xFFFFFFFFL;
+
+        // --- the per-vertex ADC strip-restart "+2048"/0x800 kick add (Rule 191) ---
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        while(it.hasNext() && scanned < 4000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            if(m.equals("addiu")||m.equals("addi")||m.equals("daddiu")||m.equals("ori")||
+               m.equals("addu")||m.equals("daddu")||m.equals("li")) {
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar &&
+                       (((ghidra.program.model.scalar.Scalar)o).getUnsignedValue() & 0xFFFFL) == 0x800L)
+                        traits.kickConstAddCount++;
+            }
+        }
+
+        // --- Rule 190 GIFTAG_PRIM_CLASS_SELECTOR ---
+        boolean primName = false;
+        for(String f : PRIM_SELECTOR_NAMES) if(fname.contains(f)) { primName = true; break; }
+        boolean buildsSelectorPacket = traits.gifTagInlineBuilder &&
+            (!traits.vifOpcodesBuilt.isEmpty() || !traits.storedVifOpcodes.isEmpty());
+        if(addr == 0x1404d0L || primName || (buildsSelectorPacket && traits.usesCop2))
+            traits.isPrimClassSelector = true;
+
+        // --- Rule 191 ADC_KICK_VERTEX_SOURCE ---
+        // An EE-side per-vertex geometry builder that controls the ADC/strip-restart bit.
+        // PRECISION: the bare 0x800/kick-const add is far too common (framebuffer width, page
+        // size) and over-fired on framebuffer/sound-init setters (sceGsSetDefDBuff, Init__6CSound,
+        // viBufReset). A real per-vertex ADC source either writes the XYZ2/XYZ3 register itself,
+        // OR emits a quadword vertex stream in a loop while building a GIF/PRIM packet. The
+        // kick-const add is kept only as the discriminator for the constant_kick sub-class.
+        boolean realVertexReg  = traits.writesXyz2Reg || traits.writesXyz3Reg;
+        boolean vertexEmitLoop = traits.hasBackwardBranch && traits.quadwordVU > 0
+            && traits.gifTagInlineBuilder && (traits.writesGsPrimReg || traits.writesRgbaqReg);
+        if(realVertexReg || vertexEmitLoop) {
+            traits.isAdcKickVertexSource = true;
+            if(traits.writesXyz2Reg && traits.writesXyz3Reg) traits.adcSource = "input_driven_xyz3";
+            else if(traits.writesXyz2Reg)                    traits.adcSource = "uniform_xyz2";
+            else if(traits.writesXyz3Reg)                    traits.adcSource = "no_kick_xyz3";
+            else                                              traits.adcSource =
+                traits.kickConstAddCount > 0 ? "constant_kick" : "vertex_emit_loop";
+        }
+
+        // --- Rule 196 VIEW_PROJECTION_MATRIX_WRITER ---
+        boolean vpName = false;
+        for(String f : VIEW_PROJ_NAMES) if(fname.contains(f)) { vpName = true; break; }
+        boolean vpCallee = false;
+        for(String cn : traits.calleeNames)
+            if(VIEW_PROJ_CALLEES.contains(cn) || cn.contains("MulMatrix")) { vpCallee = true; break; }
+        // A camera/view-matrix builder OFTEN calls matrix helpers (mgMulMatrix) rather than
+        // doing inline COP2 — requiring usesCop2 made this dead-fire (0 hits). G98/G99's
+        // CreateRenderInfoPacket builds the combined matrix via mgMulMatrix, no inline VU0.
+        if((vpName || vpCallee) &&
+           (traits.writesToGlobal || traits.isStructInitializer || traits.gifTagInlineBuilder || traits.usesCop2))
+            traits.isViewProjectionMatrixWriter = true;
+
+        // --- Rule 197 OBJECT_ARRAY_CTOR ---
+        boolean arrayCtorName = fname.contains("construct_new_array")
+            || (traits.allocatorKind != null && traits.allocatorKind.equals("array_ctor"));
+        boolean ctorLoopShape = (fname.contains("__ct__") || traits.isCtor || traits.isCtorMultiFieldInit)
+            && traits.hasBackwardBranch && (traits.readsEabiArgT0 || traits.callOps > 0);
+        if(arrayCtorName || ctorLoopShape)
+            traits.isObjectArrayCtor = true;
     }
 
     // v8 Rule 92: vtable install detector — looks for lui+addiu+sw $rN, 0($a0).
@@ -6213,6 +7310,118 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     traits.ctorVtableAddr = val;
                     break;
                 }
+            }
+        }
+    }
+
+    // v13 helpers: small operand extractors mirroring the existing detectors.
+    private static String regOf(Object[] ops) {
+        if(ops != null && ops.length > 0 && ops[0] instanceof ghidra.program.model.lang.Register)
+            return ((ghidra.program.model.lang.Register)ops[0]).getName();
+        return null;
+    }
+    private static String baseRegOf(Object[] memOps) {
+        if(memOps == null) return null;
+        for(Object o : memOps)
+            if(o instanceof ghidra.program.model.lang.Register)
+                return ((ghidra.program.model.lang.Register)o).getName();
+        return null;
+    }
+    private static long scalarOf(Object[] memOps) {
+        if(memOps == null) return 0;
+        for(Object o : memOps)
+            if(o instanceof ghidra.program.model.scalar.Scalar)
+                return ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+        return 0;
+    }
+    // gp-relative offset -> label (if a known DC2 global) else "gp"+hex token.
+    private String gpRelLabel(long signedOff) {
+        String lbl = KNOWN_DC2_GP_OFFSETS.get(signedOff & 0xFFFFFFFFL);
+        return lbl != null ? lbl : ("gp" + (signedOff < 0 ? "-" : "+") + Long.toHexString(Math.abs(signedOff)));
+    }
+
+    // v13 Rule 178: CONDITIONAL_INIT_ON_GLOBAL. Detect the G58/G81 shape
+    // `lw $rX, <global>; beq/beqz $rX,$zero,skip; <stores that configure an object>`.
+    // A global is loaded, branched-on-zero, and a block of >=2 config stores follows.
+    private void detectConditionalInitOnGlobal(Function func, FuncTraits traits) {
+        String fn = func.getName();
+        boolean nameGate = isLifecycleVerbName(fn)
+            || fn.contains("Init") || fn.contains("init") || fn.contains("Setup")
+            || fn.contains("Begin") || fn.contains("Assign") || fn.contains("Open")
+            || fn.contains("Create") || fn.contains("Reset");
+        if(!nameGate) return;
+        // regName -> guard token (set on a global load; cleared on overwrite).
+        Map<String,String> globalLoadReg = new HashMap<>();
+        Map<String,Long> luiHi = new HashMap<>();
+        String pendingGuard = null; int storeWindow = 0, slots = 0;
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        while(it.hasNext() && scanned < 600) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            String d0 = regOf(inst.getOpObjects(0));
+            if(m.equals("lui")) {
+                if(d0 != null) { luiHi.put(d0, (scalarOf(inst.getOpObjects(1)) & 0xFFFFL) << 16); globalLoadReg.remove(d0); }
+            } else if(m.equals("lw") || m.equals("lwu") || m.equals("ld")) {
+                Object[] mem = inst.getOpObjects(1);
+                String base = baseRegOf(mem); long off = scalarOf(mem);
+                if(d0 != null && base != null) {
+                    if(base.equalsIgnoreCase("gp")) globalLoadReg.put(d0, gpRelLabel(off));
+                    else if(luiHi.containsKey(base)) globalLoadReg.put(d0, "0x" + Long.toHexString((luiHi.get(base) + off) & 0xFFFFFFFFL));
+                    else globalLoadReg.remove(d0);
+                }
+            } else if(m.startsWith("beq") || m.startsWith("bne") || m.equals("beqz") || m.equals("bnez")) {
+                String token = null;
+                for(int oi=0; oi<2; oi++) { String r = regOf(inst.getOpObjects(oi)); if(r != null && globalLoadReg.containsKey(r)) token = globalLoadReg.get(r); }
+                if(token != null) { pendingGuard = token; storeWindow = 24; slots = 0; }
+            } else if(m.startsWith("sw") || m.startsWith("sd") || m.startsWith("sh") || m.startsWith("sb")) {
+                if(pendingGuard != null && storeWindow > 0) {
+                    String base = baseRegOf(inst.getOpObjects(1));
+                    if(base != null && !base.equalsIgnoreCase("sp")) slots++;
+                }
+            }
+            if(pendingGuard != null) {
+                if(--storeWindow <= 0) {
+                    if(slots >= 2) { traits.isConditionalInitOnGlobal = true; traits.guardGlobals.add(pendingGuard); traits.conditionalInitSlots += slots; }
+                    pendingGuard = null;
+                }
+            }
+            if(d0 != null && !m.equals("lui") && !m.equals("lw") && !m.equals("lwu") && !m.equals("ld"))
+                globalLoadReg.remove(d0); // reg redefined by a non-load
+        }
+        if(pendingGuard != null && slots >= 2) {
+            traits.isConditionalInitOnGlobal = true; traits.guardGlobals.add(pendingGuard); traits.conditionalInitSlots += slots;
+        }
+    }
+
+    // v13 Rule 181: VTABLE_TAILCALL_THUNK. Terminal `jr $rX` (rX != ra/t9) where $rX
+    // was loaded from `*(objptr + K)` (a vtable slot). G59 recompiler tail-call bug.
+    private void detectVtableTailcallThunk(Function func, FuncTraits traits) {
+        Map<String,Long> slotReg = new HashMap<>();   // reg -> small vtable slot offset
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        while(it.hasNext() && scanned < 4000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            String d0 = regOf(inst.getOpObjects(0));
+            if(m.equals("lw") || m.equals("lwu") || m.equals("ld")) {
+                Object[] mem = inst.getOpObjects(1);
+                String base = baseRegOf(mem); long off = scalarOf(mem);
+                if(d0 != null && base != null && !base.equalsIgnoreCase("sp")
+                   && !base.equalsIgnoreCase("gp") && off >= 0 && off < 0x400)
+                    slotReg.put(d0, off);
+                else if(d0 != null) slotReg.remove(d0);
+            } else if(m.equals("jr")) {
+                String r = d0;
+                if(r != null && !r.equalsIgnoreCase("ra") && !r.equalsIgnoreCase("t9")
+                   && slotReg.containsKey(r)) {
+                    traits.isVtableTailcallThunk = true;
+                    traits.tailcallVtableSlots.add(slotReg.get(r));
+                }
+            } else if(d0 != null) {
+                slotReg.remove(d0); // reg redefined
             }
         }
     }
@@ -6911,6 +8120,12 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 traits.dmaKickChannels.add(DMA_CHANNEL_NAMES[chIdx]);
             else if(slot == 0x20 || slot == 0x30)
                 traits.dmaQwcTadrChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+            // v11.3 Rule 162: fromSPR(8)/toSPR(9) DMA channel built via a tracked
+            // lui/ori constant (e.g. SendDMA@0x13e3d0 stores gp-cached 0x1000D000).
+            if(chIdx==8||chIdx==9) {
+                traits.programsSprDma = true;
+                traits.sprDmaChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+            }
             if(norm >= GIF_CHCR_BASE && norm <= GIF_CHCR_END)
                 traits.path3Initiator = true;
             traits.compositeMmioRangesHit.add("DMA_CHAN_" + DMA_CHANNEL_NAMES[chIdx]);
@@ -7207,6 +8422,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(adRegIdsStored.contains(0x4EL) || adRegIdsStored.contains(0x4FL)) traits.writesZbufReg = true;
             if(adRegIdsStored.contains(0x59L) || adRegIdsStored.contains(0x5BL)) traits.writesDispfbReg = true;
             if(adRegIdsStored.contains(0x50L)) traits.writesBitbltbufReg = true;
+            // v12 Rule 166: FRAME A+D reg ids
+            if(adRegIdsStored.contains(0x4CL) || adRegIdsStored.contains(0x4DL)) traits.writesFrameReg = true;
+            // v15 Rule 192: XYZ2 (0x05 draw-kick) / XYZ3 (0x0D no-kick / strip-restart).
+            if(adRegIdsStored.contains(0x05L)) traits.writesXyz2Reg = true;
+            if(adRegIdsStored.contains(0x0DL)) traits.writesXyz3Reg = true;
+            // v15.1 Rule 201: TEX1_1/TEX1_2 (0x14/0x15) texture filter (G8 point-sampling).
+            if(adRegIdsStored.contains(0x14L) || adRegIdsStored.contains(0x15L)) traits.writesTex1Reg = true;
+            // v15.1 Rule 200: XYOFFSET_1/2 (0x18/0x19) guard-band centre (G88).
+            if(adRegIdsStored.contains(0x18L) || adRegIdsStored.contains(0x19L)) traits.writesXyoffsetReg = true;
             for(Long v : adRegIdsStored) {
                 String nm = KNOWN_GS_REGS.get(v);
                 if(nm != null) traits.gsRegHits.add(nm);
@@ -7482,6 +8706,546 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
+    // =========================================================
+    // v12 Rules 165-177: RTT/Z VRAM-alias map, audio/memcard/present
+    // hazards, CLUT cache ops, perf-hot ranking. Derived from already-
+    // collected traits + BFS depths; appends tags, bumps counters, and
+    // builds the cross-function VRAM overlap pairs.
+    // =========================================================
+    private void applyV12Rules(List<FuncResult> results) {
+        // Pass 1: per-function derivations + collect VRAM page writers by kind.
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits;
+            if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // VRAM pages this func references (labelled subset only).
+            for(Long c : t.tbpConstantsLoaded) {
+                if(KNOWN_DC2_TBP_LABELS.containsKey(c)) {
+                    t.vramKnownPagesHit.add(c);
+                    gsLocalMemPagesReferenced.add(c);
+                }
+            }
+            // Writer kinds for the overlap map.
+            List<String> kinds = new ArrayList<>();
+            if(t.writesFrameReg)     { kinds.add("FRAME"); frameRegWriterCount++; }
+            if(t.writesZbufReg)        kinds.add("ZBUF");
+            if(t.writesTex0Reg)        kinds.add("TEX0");
+            if(t.writesBitbltbufReg)   kinds.add("BITBLTBUF");
+            if(t.writesDispfbReg)      kinds.add("DISPFB");
+            for(Long page : t.vramKnownPagesHit) {
+                Map<String,List<String>> byKind =
+                    vramPageWriters.computeIfAbsent(page, k -> new LinkedHashMap<>());
+                for(String kind : kinds)
+                    byKind.computeIfAbsent(kind, k -> new ArrayList<>()).add(nm);
+            }
+
+            // Rule 166 RTT_TARGET: FRAME writer that references a labelled tex/CLUT/RTT page.
+            if(t.writesFrameReg && !t.vramKnownPagesHit.isEmpty()) {
+                t.isRttTarget = true;
+                if(!r.tags.contains("RTT_TARGET")) { r.tags.add("RTT_TARGET"); rttTargetCount++; }
+            }
+            // Rule 167 ZBUF_VRAM_ALIAS_RISK: ZBUF writer referencing a labelled live VRAM page.
+            if(t.writesZbufReg && !t.vramKnownPagesHit.isEmpty()) {
+                t.zbufVramAliasRisk = true;
+                if(!r.tags.contains("ZBUF_VRAM_ALIAS_RISK")) {
+                    r.tags.add("ZBUF_VRAM_ALIAS_RISK"); zbufVramAliasCount++;
+                }
+            }
+            // Rule 169 VF0_DEPENDENT_INVERSE: matrix-inverse helper using COP2 + EFU Q latency.
+            boolean efuQ = t.cop2SpecialOps.contains("EFU_Q_LATENCY") || t.usesFpuDivSqrt;
+            if(nm.contains("Invers") && t.usesCop2 && efuQ) {
+                t.isVf0DependentInverse = true;
+                if(!r.tags.contains("VF0_DEPENDENT_INVERSE")) {
+                    r.tags.add("VF0_DEPENDENT_INVERSE"); vf0DependentInverseCount++;
+                }
+            }
+            // Rule 170 AUDIO_COMPLETION_GATE: wait loop polling an audio/stream completion signal.
+            for(String cn : t.calleeNames) {
+                String lc = cn.toLowerCase();
+                if(cn.contains("sceSifCheckStatRpc") || lc.contains("streamopenstate")
+                   || lc.contains("voice") || lc.contains("streamstat")
+                   || cn.startsWith("sceSd") || cn.startsWith("sceSpu2"))
+                    t.audioGateSignals.add(cn);
+            }
+            if(t.isAudioRpcHandler) t.audioGateSignals.add("audio_rpc_handler");
+            boolean waitShape = t.isSyncWaitLoop || t.dc2HostWaitCandidate
+                    || (t.hasBackwardBranch && t.byteSize < 400);
+            if(!t.audioGateSignals.isEmpty() && waitShape) {
+                t.isAudioCompletionGate = true;
+                if(!r.tags.contains("AUDIO_COMPLETION_GATE")) {
+                    r.tags.add("AUDIO_COMPLETION_GATE"); audioCompletionGateCount++;
+                }
+                if(t.dc2HostWaitCandidate && !r.tags.contains("DC2_AUDIO_GATED_STALL"))
+                    r.tags.add("DC2_AUDIO_GATED_STALL");
+            }
+            // Rule 171 MEMCARD_IO: sceMc*/libmc save-data callee.
+            for(String cn : t.calleeNames) {
+                String lc = cn.toLowerCase();
+                if(cn.startsWith("sceMc") || lc.contains("libmc")
+                   || lc.startsWith("mclib") || lc.contains("memcard")
+                   || lc.contains("mccard") || lc.contains("savedata"))
+                    t.memcardCallees.add(cn);
+            }
+            if(!t.memcardCallees.isEmpty()) {
+                t.isMemcardIo = true;
+                if(!r.tags.contains("MEMCARD_IO")) { r.tags.add("MEMCARD_IO"); memcardIoCount++; }
+            }
+            // Rule 173 PRESENTATION_FIELD_STATE: interlace/field GS privileged reg.
+            for(String pr : t.gsPrivRegHits) {
+                if(pr.equals("PMODE") || pr.equals("SMODE1") || pr.equals("SMODE2")
+                   || pr.equals("CSR") || pr.equals("SYNCV"))
+                    t.presentationRegs.add(pr);
+            }
+            if(!t.presentationRegs.isEmpty()) {
+                t.writesPresentationFieldState = true;
+                if(!r.tags.contains("PRESENTATION_FIELD_STATE")) {
+                    r.tags.add("PRESENTATION_FIELD_STATE"); presentationFieldStateCount++;
+                }
+            }
+            // Rule 174 DISPLAY_BUFFER_FLIP: DISPFB writer that drives the present boundary.
+            if(t.writesDispfbReg && (t.isFrameClockDriver || t.isRenderFrameEntry)) {
+                t.isDisplayBufferFlip = true;
+                if(!r.tags.contains("DISPLAY_BUFFER_FLIP")) {
+                    r.tags.add("DISPLAY_BUFFER_FLIP"); displayBufferFlipCount++;
+                }
+            }
+            // Rule 175 CLUT_CACHE_INVALIDATOR: TEXFLUSH or TEX0 write touching a CLUT page.
+            boolean clutPage = false;
+            for(Long page : t.vramKnownPagesHit) {
+                String lbl = KNOWN_DC2_TBP_LABELS.get(page);
+                if(lbl != null && lbl.toUpperCase().contains("CLUT")) { clutPage = true; break; }
+            }
+            if(t.gsRegHits.contains("TEXFLUSH") || (t.writesTex0Reg && clutPage)) {
+                t.isClutCacheInvalidator = true;
+                if(!r.tags.contains("CLUT_CACHE_INVALIDATOR")) {
+                    r.tags.add("CLUT_CACHE_INVALIDATOR"); clutCacheInvalidatorCount++;
+                }
+            }
+            // Rule 176 PERF_HOT_FRAME_PATH: shallow mainloop reach + inner loop + fan-out.
+            if(t.mainLoopDepth >= 0 && t.mainLoopDepth <= 3
+               && t.hasBackwardBranch && t.calleeCount >= 8) {
+                t.isPerfHotFramePath = true;
+                if(!r.tags.contains("PERF_HOT_FRAME_PATH")) {
+                    r.tags.add("PERF_HOT_FRAME_PATH"); perfHotFramePathCount++;
+                }
+            }
+        }
+
+        // Pass 2: Rule 165 VRAM_OVERLAP_MAP — pages targeted by >=2 differing kinds.
+        for(Map.Entry<Long,Map<String,List<String>>> e : vramPageWriters.entrySet()) {
+            long page = e.getKey();
+            Map<String,List<String>> byKind = e.getValue();
+            if(byKind.size() < 2) continue;
+            String label = KNOWN_DC2_TBP_LABELS.getOrDefault(page, "");
+            List<String> kindList = new ArrayList<>(byKind.keySet());
+            for(int i=0;i<kindList.size();i++) {
+                for(int j=i+1;j<kindList.size();j++) {
+                    String ka = kindList.get(i), kb = kindList.get(j);
+                    String cls;
+                    boolean aTarget = ka.equals("FRAME")||ka.equals("ZBUF")||ka.equals("DISPFB");
+                    boolean bUpload = kb.equals("TEX0")||kb.equals("BITBLTBUF");
+                    boolean bTarget = kb.equals("FRAME")||kb.equals("ZBUF")||kb.equals("DISPFB");
+                    boolean aUpload = ka.equals("TEX0")||ka.equals("BITBLTBUF");
+                    if(ka.equals("ZBUF")||kb.equals("ZBUF")) cls = "Z_ALIAS";
+                    else if((aTarget&&bUpload)||(bTarget&&aUpload)) cls = "RTT_ALIAS";
+                    else cls = "TIMESHARE";
+                    String fa = byKind.get(ka).get(0);
+                    String fb = byKind.get(kb).get(0);
+                    vramOverlapPairs.add(new String[]{
+                        hex(page), label, ka, fa, kb, fb, cls });
+                }
+            }
+        }
+        println(String.format(
+            "  v12: RTT_TARGET=%d ZBUF_ALIAS=%d VRAM_OVERLAP=%d VF0_INV=%d AUDIO_GATE=%d "
+          + "MEMCARD=%d PRESENT_FIELD=%d DBUF_FLIP=%d CLUT_CACHE=%d PERF_HOT=%d FRAME_W=%d GSMEM_PAGES=%d",
+            rttTargetCount, zbufVramAliasCount, vramOverlapPairs.size(), vf0DependentInverseCount,
+            audioCompletionGateCount, memcardIoCount, presentationFieldStateCount,
+            displayBufferFlipCount, clutCacheInvalidatorCount, perfHotFramePathCount,
+            frameRegWriterCount, gsLocalMemPagesReferenced.size()));
+    }
+
+    // =========================================================
+    // v13 Rules 178-188: DC2 G53-G82 title-3D retrospective.
+    // Render-mode selectors, per-vertex lighting terms, vtable
+    // tail-call thunks, RTT-no-restore leaks, VU-flag uploaders,
+    // PACKED-RGBAQ builders, frame-resume risk, and the
+    // cross-function init-order hazard graph. Derived from traits
+    // already collected (Rules 178/181 are filled in the scan).
+    // =========================================================
+    private void applyV13Rules(List<FuncResult> results) {
+        // Name fragments anchoring the G75-G82 render-mode + lighting paths.
+        final String[] CLIP_CALLEES   = { "ClipInBox", "ClipBox", "mgClip" };
+        final String[] RMODE_NAMES    = { "CreateRenderInfoPacket", "mgFlushRenderInfo",
+            "Draw__12mgCVisualMDT", "Draw__8mgCFrame", "Draw__9CMapParts", "DrawSub__4CMap", "Draw__4CMap" };
+        final String[] LIGHT_CALLEES  = { "GetLightInfo", "mgSetLight", "mgSetAmbient",
+            "mgSetFogParam", "SetFogParam", "LightColorMatrix", "SetLight", "SetAmbient" };
+        final String[] LIGHT_NAMES    = { "DrawSub__4CMap", "Draw__9CMapParts", "Draw__4CMap" };
+
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // Rule 178 (set in scan): tag + counter + feed init-order readers.
+            if(t.isConditionalInitOnGlobal) {
+                if(!r.tags.contains("CONDITIONAL_INIT_ON_GLOBAL")) {
+                    r.tags.add("CONDITIONAL_INIT_ON_GLOBAL"); conditionalInitOnGlobalCount++;
+                }
+                for(String g : t.guardGlobals)
+                    initGlobalReaders.computeIfAbsent(g, k -> new ArrayList<>()).add(nm);
+            }
+            // Rule 181 (set in scan): tag + counter + roster.
+            if(t.isVtableTailcallThunk) {
+                if(!r.tags.contains("VTABLE_TAILCALL_THUNK")) {
+                    r.tags.add("VTABLE_TAILCALL_THUNK"); vtableTailcallThunkCount++;
+                }
+                StringBuilder sl = new StringBuilder();
+                for(Long s : t.tailcallVtableSlots) { if(sl.length()>0) sl.append("|"); sl.append(hex(s)); }
+                vtableTailcallThunks.add(new String[]{ nm, hex(r.address), sl.toString() });
+            }
+            // Rule 179 RENDER_MODE_SELECTOR: calls a clip-test discriminator (and stores),
+            // or is one of the known render-mode submit functions.
+            boolean callsClip = false;
+            for(String cn : t.calleeNames) for(String f : CLIP_CALLEES) if(cn.contains(f)) callsClip = true;
+            boolean rmodeName = false; for(String f : RMODE_NAMES) if(nm.contains(f)) rmodeName = true;
+            if((callsClip && (t.writesToGlobal || t.isStructInitializer || t.gifTagInlineBuilder)) || rmodeName) {
+                t.isRenderModeSelector = true;
+                if(!r.tags.contains("RENDER_MODE_SELECTOR")) {
+                    r.tags.add("RENDER_MODE_SELECTOR"); renderModeSelectorCount++;
+                }
+                renderModeSelectors.add(new String[]{ nm, hex(r.address), callsClip ? "clip_test" : "submit" });
+            }
+            // Rule 180 VERTEX_LIGHTING_NORMAL_TERM: lighting-setup callee, or a COP2
+            // outer-product/dot feeding a vertex-colour writer, in a draw context.
+            boolean callsLight = false;
+            for(String cn : t.calleeNames) for(String f : LIGHT_CALLEES) if(cn.contains(f)) { callsLight = true; t.lightingSources.add(cn); }
+            boolean cop2Dot = t.usesCop2 && (t.cop2SpecialOps.contains("OUTER_PRODUCT") || t.writesRgbaqReg);
+            boolean lightName = false; for(String f : LIGHT_NAMES) if(nm.contains(f)) lightName = true;
+            if(callsLight || (cop2Dot && (t.writesRgbaqReg || lightName)) || (lightName && t.usesCop2)) {
+                t.isVertexLightingTerm = true;
+                if(!r.tags.contains("VERTEX_LIGHTING_NORMAL_TERM")) {
+                    r.tags.add("VERTEX_LIGHTING_NORMAL_TERM"); vertexLightingTermCount++;
+                }
+                String src = t.lightingSources.isEmpty() ? (cop2Dot ? "cop2_dot" : "draw_chain")
+                                                          : String.join("|", t.lightingSources);
+                vertexLightingTerms.add(new String[]{ nm, hex(r.address), src });
+            }
+            // Rule 182 RTT_NO_RESTORE: an RTT writer that targets an RTT/texture page but
+            // never writes a display-buffer FRAME (0x0/0x68) back in the same body.
+            if(t.isRttTarget) {
+                boolean writesDisplayPage = false;
+                for(Long p : t.vramKnownPagesHit) {
+                    String lbl = KNOWN_DC2_TBP_LABELS.get(p);
+                    if(p == 0x68L || p == 0x0L || (lbl != null && lbl.contains("DBuff"))) writesDisplayPage = true;
+                }
+                if(!writesDisplayPage) {
+                    t.isRttNoRestore = true;
+                    if(!r.tags.contains("RTT_NO_RESTORE")) {
+                        r.tags.add("RTT_NO_RESTORE"); rttNoRestoreCount++;
+                    }
+                    rttNoRestoreFuncs.add(new String[]{ nm, hex(r.address), "rtt_target_no_display_fbp" });
+                }
+            }
+            // Rule 184 VU_FLAG_PIPELINE_UPLOADER: VU microcode upload site (advisory).
+            if(t.isMicrocodeUploader || nm.contains("SendVuProg") || nm.contains("VuProg")
+               || t.vifOpcodesBuilt.contains("MPG")) {
+                t.isVuFlagPipelineUploader = true;
+                if(!r.tags.contains("VU_FLAG_PIPELINE_UPLOADER")) {
+                    r.tags.add("VU_FLAG_PIPELINE_UPLOADER"); vuFlagPipelineUploaderCount++;
+                }
+                vuFlagPipelineUploaders.add(new String[]{ nm, hex(r.address),
+                    t.isMicrocodeUploader ? "microcode_uploader" : "vuprog_name" });
+            }
+            // Rule 187 PACKED_RGBAQ_BUILDER: inline GIFtag builder that writes RGBAQ.
+            if(t.gifTagInlineBuilder && t.writesRgbaqReg) {
+                t.isPackedRgbaqBuilder = true;
+                if(!r.tags.contains("PACKED_RGBAQ_BUILDER")) {
+                    r.tags.add("PACKED_RGBAQ_BUILDER"); packedRgbaqBuilderCount++;
+                }
+                packedRgbaqBuilders.add(new String[]{ nm, hex(r.address), "verify_spread_layout" });
+            }
+            // Rule 188 FRAME_RESUME_RISK: large draw/frame func with terminal indirect flow.
+            if(t.byteSize > 1500 && (t.isRenderFrameEntry
+                    || (t.drawingChainDepth >= 0 && t.drawingChainDepth <= 6))
+                    && (t.tailCallIndirect || t.isVtableTailcallThunk)) {
+                t.isFrameResumeRisk = true;
+                if(!r.tags.contains("FRAME_RESUME_RISK")) {
+                    r.tags.add("FRAME_RESUME_RISK"); frameResumeRiskCount++;
+                }
+                frameResumeRiskFuncs.add(new String[]{ nm, hex(r.address), "large_resumable_draw" });
+            }
+
+            // Rule 186: collect init-order writers (normal vs __sinit) by global token.
+            boolean isSinit = t.isStaticInitializer || t.isUncalledStaticInit;
+            Set<String> writeTokens = new LinkedHashSet<>();
+            for(Long a : t.returnWrittenToGlobals) writeTokens.add("0x" + Long.toHexString(a & 0xFFFFFFFFL));
+            for(Long a : t.ctorGlobalAddresses)    writeTokens.add("0x" + Long.toHexString(a & 0xFFFFFFFFL));
+            for(long[] inst : t.staticInitInstalls) writeTokens.add("0x" + Long.toHexString(inst[1] & 0xFFFFFFFFL));
+            if(t.isStructInitializer || t.isCtor || isSinit)
+                for(String lbl : t.dc2GlobalsTouched) writeTokens.add(lbl);
+            for(String tok : writeTokens)
+                (isSinit ? initGlobalSinitWriters : initGlobalWriters)
+                    .computeIfAbsent(tok, k -> new ArrayList<>()).add(nm);
+        }
+
+        // Rule 186 pass 2: a guard-read global whose only writer is a __sinit (or which has
+        // no normal writer at all) is an init-ordering hazard (G58/G81 headless gap).
+        for(Map.Entry<String,List<String>> e : initGlobalReaders.entrySet()) {
+            String tok = e.getKey();
+            List<String> normal = initGlobalWriters.get(tok);
+            List<String> sinit  = initGlobalSinitWriters.get(tok);
+            boolean hasNormal = normal != null && !normal.isEmpty();
+            if(sinit != null && !sinit.isEmpty()) {
+                for(String reader : e.getValue())
+                    initOrderHazards.add(new String[]{ tok, reader, sinit.get(0), "__sinit" });
+            } else if(!hasNormal) {
+                for(String reader : e.getValue())
+                    initOrderHazards.add(new String[]{ tok, reader, "(none-found)", "no_static_writer" });
+            }
+        }
+
+        println(String.format(
+            "  v13: COND_INIT=%d RENDER_MODE=%d VTX_LIGHT=%d VTABLE_TAILCALL=%d RTT_NO_RESTORE=%d "
+          + "VU_FLAG_UP=%d PACKED_RGBAQ=%d FRAME_RESUME=%d INIT_ORDER_HAZARD=%d",
+            conditionalInitOnGlobalCount, renderModeSelectorCount, vertexLightingTermCount,
+            vtableTailcallThunkCount, rttNoRestoreCount, vuFlagPipelineUploaderCount,
+            packedRgbaqBuilderCount, frameResumeRiskCount, initOrderHazards.size()));
+    }
+
+    // =========================================================
+    // v15 Rules 190-198: DC2 G83-G115 retrospective + general PS2
+    // ADC/PRIM-class packer, allocator-family coherence, frame-pacing,
+    // view-matrix, object-array ctor, VU-exec hazard manifest. The
+    // firewalled per-func booleans (190/191/196/197) were set in the
+    // scan (detectV15Signals); this pass adds tags/counters/rosters and
+    // derives the non-firewalled rules (192/193/195/194/184+).
+    // =========================================================
+    private void applyV15Rules(List<FuncResult> results) {
+        // Texture-manager name fragments anchoring the G90-G97 reload-interleave path.
+        final String[] TEXMGR_NAMES = { "TextureManager", "TexCache", "Reload", "BindTex",
+            "SetTexture", "mgCTexture", "LoadTexture", "TexReload" };
+        // Allocator-family member names (Rule 194). Match by exact-equals on the symbol.
+        final java.util.Set<String> ALLOC_FAMILY = new java.util.HashSet<>(java.util.Arrays.asList(
+            "malloc", "_malloc_r", "_malloc", "free", "_free_r", "_free",
+            "realloc", "_realloc_r", "_realloc", "reallocf", "calloc", "_calloc_r", "_calloc",
+            "memalign", "_memalign_r", "valloc", "_valloc_r",
+            "__nw__FUi", "__nwa__FUi", "__dl__FPv", "__dla__FPv", "__nw__", "__dl__"));
+
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // Rule 190 GIFTAG_PRIM_CLASS_SELECTOR (set in scan): tag + roster.
+            if(t.isPrimClassSelector) {
+                if(!r.tags.contains("GIFTAG_PRIM_CLASS_SELECTOR")) {
+                    r.tags.add("GIFTAG_PRIM_CLASS_SELECTOR"); primClassSelectorCount++;
+                }
+                // DC2 anchor carries the decoded bit formula; others carry the VU selector addr.
+                String detail = ((r.address & 0xFFFFFFFFL) == 0x1404d0L)
+                    ? "qword38: bit0=fc0||fc4,bit1=fc4,bit2=desc+0x2c,bit3=desc+0x40&1,bit4=fc8"
+                    : "vu_selector_qword";
+                primClassSelectors.add(new String[]{ nm, hex(r.address), detail });
+            }
+            // Rule 191 ADC_KICK_VERTEX_SOURCE (set in scan): tag + roster.
+            if(t.isAdcKickVertexSource) {
+                adcKickVertexSourceCount++;
+                if(!r.tags.contains("ADC_KICK_VERTEX_SOURCE")) r.tags.add("ADC_KICK_VERTEX_SOURCE");
+                adcKickSources.add(new String[]{ nm, hex(r.address),
+                    t.adcSource == null ? "constant_kick" : t.adcSource });
+            }
+            // Rule 192 XYZ2_VS_XYZ3_KICK_WRITER: a per-vertex draw-kick / no-kick writer.
+            if(t.writesXyz3Reg || (t.writesXyz2Reg && (t.gifTagInlineBuilder || t.writesXyz3Reg))) {
+                t.isKickModeWriter = true;
+                if(!r.tags.contains("XYZ2_VS_XYZ3_KICK_WRITER")) {
+                    r.tags.add("XYZ2_VS_XYZ3_KICK_WRITER"); kickModeWriterCount++;
+                }
+                String mode = (t.writesXyz2Reg && t.writesXyz3Reg) ? "xyz2+xyz3(restart_control)"
+                            : t.writesXyz3Reg ? "xyz3(no_kick)" : "xyz2(draw_kick)";
+                kickModeWriters.add(new String[]{ nm, hex(r.address), mode });
+            }
+            // Rule 193 TEXTURE_RELOAD_INTERLEAVE_HAZARD: bind-many-then-draw-many shape.
+            boolean texmgrName = false;
+            for(String f : TEXMGR_NAMES) if(nm.contains(f)) { texmgrName = true; break; }
+            boolean drawKickEvidence = t.gifTagInlineBuilder || t.path3Initiator
+                || t.path3KickViaDmaApi || t.indirectCallT9Count > 0 || !t.dmaKickChannels.isEmpty();
+            if(t.writesTex0Reg && t.hasBackwardBranch && (drawKickEvidence || texmgrName)) {
+                t.isTextureReloadInterleave = true;
+                if(!r.tags.contains("TEXTURE_RELOAD_INTERLEAVE_HAZARD")) {
+                    r.tags.add("TEXTURE_RELOAD_INTERLEAVE_HAZARD"); textureReloadInterleaveCount++;
+                }
+                textureReloadInterleave.add(new String[]{ nm, hex(r.address),
+                    texmgrName ? "texmgr_per_block_reload" : "tex0_loop_with_draws" });
+            }
+            // Rule 195 VSYNC_COUPLED_GAME_STEP: game-state advance + frame-completion wait.
+            boolean waitsFrame = t.isFrameClockDriver || t.isRenderFrameEntry;
+            if(!waitsFrame) for(String cn : t.calleeNames) {
+                if(cn.contains("sceGsSyncV") || cn.contains("WaitVSync") || cn.contains("mgEndFrame")
+                   || cn.contains("FlipDrawEnv") || cn.contains("SwapDBuff")) { waitsFrame = true; break; }
+            }
+            boolean advancesState = t.writesToGlobal && (t.calleeCount >= 4 || t.hasBackwardBranch);
+            if(waitsFrame && advancesState && t.mainLoopDepth >= 0 && t.mainLoopDepth <= 4) {
+                t.isVsyncCoupledGameStep = true;
+                if(!r.tags.contains("VSYNC_COUPLED_GAME_STEP")) {
+                    r.tags.add("VSYNC_COUPLED_GAME_STEP"); vsyncCoupledGameStepCount++;
+                }
+                framePacingDrivers.add(new String[]{ nm, hex(r.address),
+                    "depth=" + t.mainLoopDepth + " callees=" + t.calleeCount });
+            }
+            // Rule 196 VIEW_PROJECTION_MATRIX_WRITER (set in scan): tag + roster.
+            if(t.isViewProjectionMatrixWriter) {
+                if(!r.tags.contains("VIEW_PROJECTION_MATRIX_WRITER")) {
+                    r.tags.add("VIEW_PROJECTION_MATRIX_WRITER"); viewProjectionWriterCount++;
+                }
+                viewProjectionWriters.add(new String[]{ nm, hex(r.address),
+                    "shared_view_proj(not_world)" });
+            }
+            // Rule 197 OBJECT_ARRAY_CTOR (set in scan): tag + roster.
+            if(t.isObjectArrayCtor) {
+                if(!r.tags.contains("OBJECT_ARRAY_CTOR")) {
+                    r.tags.add("OBJECT_ARRAY_CTOR"); objectArrayCtorCount++;
+                }
+                objectArrayCtors.add(new String[]{ nm, hex(r.address),
+                    t.readsEabiArgT0 ? "array_ctor_count_in_t0" : "ctor_loop" });
+            }
+            // Rule 184+ VU_EXEC_HAZARD_MANIFEST: per-func interpreter-divergence checklist.
+            if(t.cop2SpecialOps.contains("EFU_Q_LATENCY")) t.vuExecHazards.add("Q_LATENCY");
+            if(t.isVuFlagPipelineUploader) {
+                t.vuExecHazards.add("MAC_STATUS_FLAGS");
+                // v15.1: an uploaded VU program the EE script cannot scan may use either
+                // EFU pipeline. PCSX2 VUops.cpp: Q (div/sqrt/rsqrt) and P (ESADD/ELENG/
+                // ESIN/EEXP/ERSQRT...) both latch late; reading before WAITQ/WAITP gives a
+                // stale value (the G87 class). Flag both for verification.
+                t.vuExecHazards.add("Q_LATENCY");
+                t.vuExecHazards.add("P_LATENCY");
+            }
+            if(t.isVf0DependentInverse)                    t.vuExecHazards.add("VF0_W_ONE");
+            if(t.cop2DestMaskVerify)                       t.vuExecHazards.add("DESTMASK_LANE_ORDER");
+            if(t.usesFpuDivSqrt || !t.cop2SpecialOps.isEmpty()) t.vuExecHazards.add("FLOAT_CLAMP");
+            // v15.2 Rule 204: CFC2/CTC2 control-reg map is the F51.8 silent-wrong class.
+            if(t.usesCop2ControlReg)                       t.vuExecHazards.add("CONTROL_REG_MAP");
+            if(!t.vuExecHazards.isEmpty())
+                vuExecHazardManifest.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.vuExecHazards) });
+
+            // Rule 199 VIF_UNPACK_DECOMPRESS_STATE (PCSX2 Vif_Unpack.cpp): gated on
+            // independent VIF evidence, the decompression-critical commands (STMOD/STMASK/
+            // STROW/STCOL) mean the runtime VIF must honour mode+mask+row+col or the
+            // unpacked vertex/colour stream is corrupt.
+            boolean vifEvidence = !t.vifOpcodesBuilt.isEmpty() || !t.storedVifOpcodes.isEmpty()
+                || t.accessesVif1MMIO || t.isMicrocodeUploader || t.isVu1DoubleBufferFramer;
+            boolean decompressCritical = t.vifUnpackStateCmds.contains("STMOD")
+                || t.vifUnpackStateCmds.contains("STMASK")
+                || t.vifUnpackStateCmds.contains("STROW")
+                || t.vifUnpackStateCmds.contains("STCOL");
+            if(vifEvidence && decompressCritical) {
+                t.isVifUnpackDecompressState = true;
+                if(!r.tags.contains("VIF_UNPACK_DECOMPRESS_STATE")) {
+                    r.tags.add("VIF_UNPACK_DECOMPRESS_STATE"); vifUnpackDecompressCount++;
+                }
+                vifUnpackDecompressState.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.vifUnpackStateCmds) });
+            }
+            // Rule 200 GS_XYOFFSET_GUARD_BAND (PCSX2 GSRegs.h XYOFFSET): guard-band centre (G88).
+            if(t.writesXyoffsetReg) {
+                t.isXyoffsetGuardWriter = true;
+                if(!r.tags.contains("GS_XYOFFSET_GUARD_BAND")) {
+                    r.tags.add("GS_XYOFFSET_GUARD_BAND"); xyoffsetGuardWriterCount++;
+                }
+                xyoffsetGuardWriters.add(new String[]{ nm, hex(r.address),
+                    t.kickConstAddCount > 0 ? "with_kick_const_add" : "guard_band_offset" });
+            }
+            // Rule 201 GS_TEX1_FILTER_WRITER (PCSX2 GSRegs.h TEX1): MMAG/MMIN filter (G8).
+            if(t.writesTex1Reg) {
+                t.isTex1FilterWriter = true;
+                if(!r.tags.contains("GS_TEX1_FILTER_WRITER")) {
+                    r.tags.add("GS_TEX1_FILTER_WRITER"); tex1FilterWriterCount++;
+                }
+                tex1FilterWriters.add(new String[]{ nm, hex(r.address), "mmag_mmin_filter_mode" });
+            }
+            // Rule 203 MMI_SIMD_OP (skill silent-wrong codegen class): roster for whole-class audit.
+            if(t.usesMmi) {
+                if(!r.tags.contains("MMI_SIMD_OP")) { r.tags.add("MMI_SIMD_OP"); mmiCodegenRiskCount++; }
+                mmiCodegenRisk.add(new String[]{ nm, hex(r.address),
+                    t.mmiOpCount + " ops: " + String.join("|", t.mmiFamilies) });
+            }
+            // Rule 204 COP2_CONTROL_REG_ACCESS (CFC2/CTC2): tag + roster (the manifest already
+            // carries CONTROL_REG_MAP from the block above).
+            if(t.usesCop2ControlReg) {
+                if(!r.tags.contains("COP2_CONTROL_REG_ACCESS")) {
+                    r.tags.add("COP2_CONTROL_REG_ACCESS"); cop2ControlRegCount++;
+                }
+                cop2ControlRegAccess.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.cop2ControlRegs) });
+            }
+
+            // Rule 194: collect allocator-family members + their dispositions.
+            if(ALLOC_FAMILY.contains(nm) || isAllocFamilyName(nm)) {
+                String disp = r.disposition == null ? "RECOMPILE" : r.disposition;
+                allocatorFamily.add(new String[]{ nm, hex(r.address), disp });
+            }
+        }
+
+        // Rule 194: a SPLIT family (some recompiled, some stubbed/skipped) = the
+        // PROJECT_STATE regen-caveat corruption hazard. Raise the flag.
+        java.util.Set<String> dispKinds = new java.util.LinkedHashSet<>();
+        for(String[] e : allocatorFamily) {
+            String d = e[2];
+            boolean nativeSide = d.equals("STUB") || d.equals("SKIP") || d.equals("OVERRIDE");
+            dispKinds.add(nativeSide ? "native" : "recompiled");
+        }
+        allocatorFamilySplit = dispKinds.size() > 1;
+
+        // Rule 205 UNFUNDED_TEXTURE_PAGE (advisory): a labelled VRAM page SAMPLED (TEX0 writer)
+        // but with NO BITBLTBUF uploader in the static set. The 15-vu1-gs-debugging §4.1
+        // decisive black-texture probe (upload-dest vs draw-ref divergence). vramPageWriters
+        // was built in applyV12Rules. Static can miss composite/computed uploads → advisory.
+        for(Map.Entry<Long,Map<String,List<String>>> e : vramPageWriters.entrySet()) {
+            Map<String,List<String>> byKind = e.getValue();
+            boolean sampled  = byKind.containsKey("TEX0");
+            boolean uploaded = byKind.containsKey("BITBLTBUF");
+            if(sampled && !uploaded) {
+                long page = e.getKey();
+                String sampler = byKind.get("TEX0").get(0);
+                unfundedTexturePages.add(new String[]{
+                    hex(page), KNOWN_DC2_TBP_LABELS.getOrDefault(page,""), sampler });
+            }
+        }
+
+        println(String.format(
+            "  v15: PRIM_SELECTOR=%d ADC_KICK=%d KICK_MODE=%d TEX_INTERLEAVE=%d VSYNC_STEP=%d "
+          + "VIEW_PROJ=%d OBJ_ARRAY_CTOR=%d ALLOC_FAMILY=%d(split=%b) VU_HAZARD=%d",
+            primClassSelectorCount, adcKickVertexSourceCount, kickModeWriterCount,
+            textureReloadInterleaveCount, vsyncCoupledGameStepCount, viewProjectionWriterCount,
+            objectArrayCtorCount, allocatorFamily.size(), allocatorFamilySplit,
+            vuExecHazardManifest.size()));
+        println(String.format(
+            "  v15.1 (PCSX2): VIF_UNPACK_DECOMPRESS=%d XYOFFSET_GUARD=%d TEX1_FILTER=%d",
+            vifUnpackDecompressCount, xyoffsetGuardWriterCount, tex1FilterWriterCount));
+        println(String.format(
+            "  v15.2 (skill): MMI_CODEGEN=%d COP2_CONTROL_REG=%d UNFUNDED_TEX_PAGE=%d",
+            mmiCodegenRiskCount, cop2ControlRegCount, unfundedTexturePages.size()));
+    }
+
+    // v15 Rule 194: fuzzy allocator-family membership for demangled/underscore variants
+    // (operator new/delete, _r reentrant forms) not in the exact-name set.
+    private static boolean isAllocFamilyName(String nm) {
+        if(nm == null) return false;
+        String n = nm;
+        if(n.equals("malloc") || n.equals("free") || n.equals("calloc") || n.equals("realloc")
+            || n.equals("memalign") || n.equals("valloc")
+            || n.matches("_(malloc|free|calloc|realloc|memalign|valloc)_r"))
+            return true;
+        // operator delete (incl. array) always frees the heap.
+        if(n.startsWith("__dl__") || n.startsWith("__dla__")) return true;
+        // operator new (incl. array): HEAP new only. PLACEMENT new — operator new(size, void*)
+        // mangled `__nw__FUiPv` / `__nw__FUiP1` — constructs in place, does NOT allocate, and is
+        // legitimately bound separately (OVERRIDE). Excluding it stops a spurious family "split".
+        if(n.startsWith("__nw__") || n.startsWith("__nwa__"))
+            return !n.matches("__nwa?__FU.*P.*");
+        return false;
+    }
+
     // v9 Rule 130: name-prefix module index. Length 2-6, occur >= 5 times.
     private void buildNamePrefixModules(List<FuncResult> results) {
         Map<String, List<Long>> byPrefix = new HashMap<>();
@@ -7608,6 +9372,115 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // Their logic now populates traits.hasSyscall and traits.hasCOP0 fields.
     // isKernelInternal replaced with inline traits.hasSyscall||traits.hasCOP0.
     // referencesIopModule replaced with traits.refsIopModuleString.
+
+    // =========================================================
+    // v11.3: POST-REGEN COP2 PATCH GENERATION
+    // The COP2 dest-mask fix (F51.8) patches recomp/*.cpp, which only exist
+    // AFTER ps2_recomp.exe runs - so it cannot run inside this Ghidra pass.
+    // Instead we EMIT it (RECOMP path pre-filled) next to the triage output and
+    // list it in post_regen_steps.md, derived from this run's COP2 model, so it
+    // ships with the map and can't be forgotten or drift.
+    // =========================================================
+    private void emitCop2FixScript(File outputDir, List<FuncResult> results) {
+        int riskFns = 0;
+        for (FuncResult r : results)
+            if (r.traits != null && r.traits.cop2DestMaskVerify) riskFns++;
+        String recompDir = "D:/ps2r/dc2/recomp";
+        try (PrintWriter w = utf8Writer(new File(outputDir, "fix_cop2_destmask.py"))) {
+            w.println("#!/usr/bin/env python3");
+            w.println("# AUTO-GENERATED by the DC2 TriageEnricher (v11.3). Do not hand-edit; regenerate.");
+            w.println("# F51.8: reverse the recompiler COP2 dest-component-mask lane order in generated");
+            w.println("# recomp files. The generator emits `__m128i mask = _mm_set_epi32(X,Y,Z,W)` mapping");
+            w.println("# VU dest X->lane3 .. W->lane0, but lqc2/sqc2/broadcast use X=lane0 .. W=lane3, so the");
+            w.println("# 4 args are reversed. Full-dest masks (-1,-1,-1,-1) are symmetric -> no-op.");
+            w.println("# >>> RUN THIS AFTER ps2_recomp.exe regenerates recomp/*.cpp (post-regen stage). <<<");
+            w.println("# This run flagged " + riskFns + " COP2 partial-dest-risk fn(s) (triage_map.json cop2_partial_dest_risk).");
+            w.println("import re, sys, glob, os");
+            w.println("");
+            w.println("RECOMP = r\"" + recompDir + "\"");
+            w.println("pat = re.compile(r\"(__m128i mask = _mm_set_epi32\\()\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*(\\))\")");
+            w.println("");
+            w.println("def fix_text(text):");
+            w.println("    n = [0]");
+            w.println("    def repl(m):");
+            w.println("        a, b, c, d = m.group(2), m.group(3), m.group(4), m.group(5)");
+            w.println("        if a == d and b == c:");
+            w.println("            return m.group(0)  # symmetric -> unchanged");
+            w.println("        n[0] += 1");
+            w.println("        return f\"{m.group(1)}{d}, {c}, {b}, {a}{m.group(6)}\"");
+            w.println("    out = pat.sub(repl, text)");
+            w.println("    return out, n[0]");
+            w.println("");
+            w.println("def main():");
+            w.println("    files = sys.argv[1:]");
+            w.println("    if not files:");
+            w.println("        files = []");
+            w.println("        for f in glob.glob(os.path.join(RECOMP, \"*.cpp\")):");
+            w.println("            with open(f, \"r\", encoding=\"utf-8\", errors=\"replace\") as fh:");
+            w.println("                t = fh.read()");
+            w.println("            if \"_mm_blendv_ps(ctx->vu0_vf\" in t or \"PS2_VBLEND(ctx->vu0_vf\" in t:");
+            w.println("                files.append(f)");
+            w.println("    total_files = 0");
+            w.println("    total_swaps = 0");
+            w.println("    for f in files:");
+            w.println("        with open(f, \"r\", encoding=\"utf-8\", errors=\"replace\") as fh:");
+            w.println("            t = fh.read()");
+            w.println("        nt, n = fix_text(t)");
+            w.println("        if n > 0:");
+            w.println("            with open(f, \"w\", encoding=\"utf-8\", newline=\"\") as fh:");
+            w.println("                fh.write(nt)");
+            w.println("            total_files += 1");
+            w.println("            total_swaps += n");
+            w.println("            print(f\"  {os.path.basename(f)}: {n} partial-mask(s) reversed\")");
+            w.println("    print(f\"DONE: {total_files} files changed, {total_swaps} partial dest-masks reversed\")");
+            w.println("");
+            w.println("if __name__ == \"__main__\":");
+            w.println("    main()");
+        } catch (Exception e) {
+            printerr("[COP2] Failed to emit fix_cop2_destmask.py: " + e.getMessage());
+        }
+        try (PrintWriter w = utf8Writer(new File(outputDir, "post_regen_steps.md"))) {
+            w.println("# Post-regen steps (auto-generated by the DC2 TriageEnricher v11.3)");
+            w.println("");
+            w.println("Run these AFTER `ps2_recomp.exe` regenerates `recomp/*.cpp`, in order:");
+            w.println("");
+            w.println("1. **COP2 dest-mask reversal (F51.8) - MANDATORY.** `python fix_cop2_destmask.py`");
+            w.println("   (emitted beside this file, RECOMP path pre-filled). " + riskFns + " partial-dest-risk");
+            w.println("   function(s) flagged this run. Skipping it regresses ALL VU0-macro 3D transforms.");
+            w.println("2. **VU0 helper collision audit.** Any `sceVu0*` rescued to RECOMPILE that the runtime");
+            w.println("   also implements (Kernel/Stubs/VU.cpp) collides under /FORCE:MULTIPLE - verify the");
+            w.println("   winner per function, or lock the runtime-backed ones in the config.");
+            w.println("3. **Allocator-family coherence.** malloc/free/_malloc_r/memalign/operator new must all");
+            w.println("   route to the runtime (G1) - no half-runtime/half-recompiled split.");
+            w.println("4. **Smoke test.** `tools/run_30s_diagnose.ps1` - title must stay golden before promoting.");
+        } catch (Exception e) {
+            printerr("[COP2] Failed to emit post_regen_steps.md: " + e.getMessage());
+        }
+        println("[COP2] Emitted fix_cop2_destmask.py + post_regen_steps.md (" + riskFns + " risk fns).");
+    }
+
+    // v11.3: compare two configs by EXECUTABLE content only - each line is cut at
+    // its first '#' (drops the header block, the advisory pointer, and inline
+    // # TAG annotations) then trimmed; blank results are dropped. Lets the
+    // incremental mode leave the live config untouched when only comments/tags
+    // would have churned, and rewrite only on a real selector/section delta.
+    private boolean configBodyEquals(File a, File b) {
+        try { return semanticConfigLines(a).equals(semanticConfigLines(b)); }
+        catch (Exception e) { return false; }
+    }
+    private List<String> semanticConfigLines(File f) throws IOException {
+        List<String> out = new ArrayList<>();
+        try (BufferedReader r = utf8Reader(f)) {
+            String ln;
+            while ((ln = r.readLine()) != null) {
+                int h = ln.indexOf('#');
+                if (h >= 0) ln = ln.substring(0, h);
+                ln = ln.trim();
+                if (!ln.isEmpty()) out.add(ln);
+            }
+        }
+        return out;
+    }
 
     // =========================================================
     // UNIFIED CONFIG OUTPUT
@@ -8142,6 +10015,440 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             || t.dmaChcrStartKick;
     }
 
+    // v14: filename-safe slug for a function name.
+    private static String slug(String s) {
+        if(s == null || s.isEmpty()) return "anon";
+        StringBuilder b = new StringBuilder(s.length());
+        for(int i=0;i<s.length() && b.length()<80;i++){
+            char c = s.charAt(i);
+            b.append((Character.isLetterOrDigit(c)||c=='.'||c=='_'||c=='-') ? c : '_');
+        }
+        return b.length()==0 ? "anon" : b.toString();
+    }
+    // v14.1: stable grep token - keep symbol chars, collapse the rest to '_'.
+    private static String tok(String s) {
+        if(s == null || s.isEmpty()) return "anon";
+        StringBuilder b = new StringBuilder(s.length());
+        for(int i=0;i<s.length();i++){
+            char c = s.charAt(i);
+            b.append((Character.isLetterOrDigit(c)||c=='_'||c=='.'||c=='$') ? c : '_');
+        }
+        return b.toString();
+    }
+    // v14.1: derived per-function Markdown filename (matches writeFunctionDocs).
+    private static String mdNameFor(long addr, String name) {
+        String f = (name==null||name.isEmpty()) ? ("sub_"+hex(addr)) : name;
+        return hex(addr)+"_"+slug(f)+".md";
+    }
+    // v14: append "- LABEL\n" for each true boolean signal (compact, readable).
+    private static void sig(StringBuilder b, boolean on, String label) {
+        if(on) b.append("- ").append(label).append('\n');
+    }
+    private static void sigList(StringBuilder b, Collection<String> c, String label) {
+        if(c != null && !c.isEmpty()) b.append("- ").append(label).append(": `")
+            .append(String.join("`, `", c)).append("`\n");
+    }
+
+    // v14: per-function Markdown docs. One functions/<addr>_<name>.md per ELF
+    // function, with the full triage signal set + assembly + decompiled C +
+    // control-flow, for an AI working on the recompilation.
+    private void writeFunctionDocs(File functionsDir, List<FuncResult> results,
+                                   String elfHash, long gpValue) throws IOException {
+        Map<Long,String> nameByAddr = new HashMap<>();
+        Map<String,Long> nameToAddr = new HashMap<>();
+        for(FuncResult r : results) {
+            nameByAddr.put(r.address & 0xFFFFFFFFL, r.name);
+            if(r.name != null && !r.name.isEmpty()) nameToAddr.putIfAbsent(r.name, r.address & 0xFFFFFFFFL);
+        }
+        String exportTs  = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date());
+        String exportVer = "DC2 enricher v15.2 (schema 14.2)";
+        int n = 0;
+        for(FuncResult r : results) {
+            if(monitor.isCancelled()) break;
+            FuncTraits t = r.traits;
+            AiRec rec = buildFunctionRecommendation(r);
+            String fname = (r.name==null||r.name.isEmpty()) ? ("sub_"+hex(r.address)) : r.name;
+            File md = new File(functionsDir, hex(r.address)+"_"+slug(fname)+".md");
+            try (PrintWriter w = utf8Writer(md)) {
+                w.println("# "+fname);
+                w.println();
+                w.println("`"+hex(r.address)+"` · **"+r.category+"** · disposition **"+r.disposition
+                    +"** · origin `"+r.origin+"`");
+                w.println();
+                // --- Export metadata (stale-export protection) ---
+                w.println("> schema_version `14.2` · elf_hash `"+elfHash+"` · global_pointer `"+hex(gpValue)
+                    +"` · exported `"+exportTs+"` · enricher `"+exportVer+"`");
+                w.println(">");
+                w.println("> _If elf_hash / global_pointer differ from the current ELF, this doc is stale — re-run the enricher._");
+                w.println();
+                // --- Summary table ---
+                w.println("## Summary");
+                w.println();
+                w.println("| field | value |");
+                w.println("|---|---|");
+                w.println("| address | `"+hex(r.address)+"` |");
+                w.println("| name | `"+fname+"` |");
+                w.println("| category | "+r.category+" |");
+                w.println("| disposition | "+r.disposition+(r.rescueReason!=null?(" (rescued: "+r.rescueReason+")"):"")+" |");
+                w.println("| origin | "+r.origin+(r.step1Disposition!=null?(" / step1="+r.step1Disposition):"")+" |");
+                if(t != null) {
+                    w.println("| size (bytes) | "+t.byteSize+" |");
+                    w.println("| mainloop_depth | "+t.mainLoopDepth+" |");
+                    w.println("| init_chain_depth | "+t.initChainDepth+" |");
+                    w.println("| drawing_chain_depth | "+t.drawingChainDepth+" |");
+                    w.println("| module_id | "+t.moduleId+" |");
+                    if(t.dc2KnownRole!=null)
+                        w.println("| dc2_known_role | "+t.dc2KnownRole+" ("+t.dc2KnownPhase+", "+t.dc2KnownCriticality+") |");
+                }
+                w.println("| subsystem (AI) | "+rec.subsystem+" |");
+                w.println("| role (AI) | "+rec.role+" |");
+                w.println();
+                // --- AI recommendation ---
+                w.println("## Recommendation (AI)");
+                w.println();
+                w.println("- **action**: "+rec.action+"  (confidence "+rec.confidence+", risk "+rec.risk+")");
+                if(rec.reason!=null && !rec.reason.isEmpty())          w.println("- **reason**: "+rec.reason);
+                if(rec.suggestedNextStep!=null && !rec.suggestedNextStep.isEmpty()) w.println("- **next step**: "+rec.suggestedNextStep);
+                if(rec.riskIfStubbed!=null && !rec.riskIfStubbed.isEmpty())     w.println("- **risk if stubbed**: "+rec.riskIfStubbed);
+                if(rec.riskIfRecompiled!=null && !rec.riskIfRecompiled.isEmpty()) w.println("- **risk if recompiled**: "+rec.riskIfRecompiled);
+                if(rec.gateway) w.println("- **gateway function** (subsystem entry point)");
+                w.println();
+                // --- Tags ---
+                w.println("## Tags");
+                w.println();
+                if(r.tags.isEmpty()) w.println("_(none)_");
+                else { StringBuilder tb=new StringBuilder(); for(String tg:r.tags) tb.append("`").append(tg).append("` "); w.println(tb.toString().trim()); }
+                w.println();
+                // --- Signals (every true trait / non-empty list) ---
+                if(t != null) {
+                    StringBuilder s = new StringBuilder();
+                    sig(s,t.usesCop1,"uses COP1 (FPU)"); sig(s,t.usesCop2,"uses COP2 / VU0 macro");
+                    sig(s,t.usesSPR,"uses scratchpad (SPR)"); sig(s,t.writesToGlobal,"writes a global");
+                    sig(s,t.hasVcallms,"VU0 microcode (vcallms)"); sig(s,t.hasJumpTable,"jump table");
+                    sig(s,t.accessesMMIO,"accesses MMIO"); sig(s,t.accessesVif1MMIO,"VIF1 MMIO");
+                    sig(s,t.callsDmaSend,"calls DMA send"); sig(s,t.callsSifRpc,"SIF RPC");
+                    sig(s,t.hasBackwardBranch,"backward branch (loop)"); sig(s,t.hasSyscall,"syscall");
+                    sig(s,t.isLargeInitFunc,"large init func"); sig(s,t.isMemoryAllocator,"memory allocator ("+t.allocatorKind+")");
+                    sig(s,t.isCtor,"C++ ctor ("+t.ctorClassName+")"); sig(s,t.isDtor,"C++ dtor");
+                    sig(s,t.ctorInstallsVtable,"installs vtable @"+hex(t.ctorVtableAddr));
+                    sig(s,t.isStaticInitializer,"__sinit static initializer"); sig(s,t.isUncalledStaticInit,"UNCALLED __sinit (init-order risk)");
+                    sig(s,t.staticInitInstallsVtable,"sinit installs vtable");
+                    sig(s,t.isProcessTerminator,"process terminator"); sig(s,t.isLibgccIntrinsic,"libgcc intrinsic");
+                    sig(s,t.readsEabiArgT0,"reads EABI 5th arg in $t0");
+                    sig(s,t.writesFrameReg,"writes GS FRAME"); sig(s,t.writesZbufReg,"writes GS ZBUF");
+                    sig(s,t.writesTex0Reg,"writes GS TEX0"); sig(s,t.writesBitbltbufReg,"writes BITBLTBUF");
+                    sig(s,t.writesDispfbReg,"writes DISPFB"); sig(s,t.writesRgbaqReg,"writes RGBAQ");
+                    sig(s,t.isRttTarget,"RTT_TARGET (renders to a texture page)");
+                    sig(s,t.zbufVramAliasRisk,"ZBUF aliases live VRAM"); sig(s,t.isVf0DependentInverse,"vf0-dependent matrix inverse");
+                    sig(s,t.cop2DestMaskVerify,"COP2 partial-dest (verify lane order, F51.8)");
+                    sig(s,t.isAudioCompletionGate,"audio/stream completion gate"); sig(s,t.isMemcardIo,"memcard I/O");
+                    sig(s,t.writesPresentationFieldState,"interlace/field GS reg"); sig(s,t.isDisplayBufferFlip,"display-buffer flip");
+                    sig(s,t.isClutCacheInvalidator,"CLUT cache invalidator / TEXFLUSH"); sig(s,t.isPerfHotFramePath,"perf-hot frame path");
+                    sig(s,t.programsSprDma,"programs fromSPR/toSPR DMA"); sig(s,t.subwordDmaStrKick,"sub-word DMA STR kick");
+                    // v13
+                    sig(s,t.isConditionalInitOnGlobal,"CONDITIONAL_INIT_ON_GLOBAL (init-order gap, G58/G81)");
+                    sig(s,t.isRenderModeSelector,"RENDER_MODE_SELECTOR (copy vs transform, G75-G80)");
+                    sig(s,t.isVertexLightingTerm,"VERTEX_LIGHTING_NORMAL_TERM (N·L / shade, G82)");
+                    sig(s,t.isVtableTailcallThunk,"VTABLE_TAILCALL_THUNK (G59 recompiler dispatch)");
+                    sig(s,t.isRttNoRestore,"RTT_NO_RESTORE (GS-state leak, G79)");
+                    sig(s,t.isVuFlagPipelineUploader,"VU_FLAG_PIPELINE_UPLOADER (G71)");
+                    sig(s,t.isPackedRgbaqBuilder,"PACKED_RGBAQ_BUILDER (spread layout, G82)");
+                    sig(s,t.isFrameResumeRisk,"FRAME_RESUME_RISK (mid-body resume, G58/G59)");
+                    // v15
+                    sig(s,t.isPrimClassSelector,"GIFTAG_PRIM_CLASS_SELECTOR (qword38 PRIM route, G77-G115)");
+                    sig(s,t.isAdcKickVertexSource,"ADC_KICK_VERTEX_SOURCE ("+(t.adcSource==null?"":t.adcSource)+", G65-G115)");
+                    sig(s,t.isKickModeWriter,"XYZ2_VS_XYZ3_KICK_WRITER (per-vertex draw-kick)");
+                    sig(s,t.isTextureReloadInterleave,"TEXTURE_RELOAD_INTERLEAVE_HAZARD (G90-G97)");
+                    sig(s,t.isVsyncCoupledGameStep,"VSYNC_COUPLED_GAME_STEP (perf, G103)");
+                    sig(s,t.isViewProjectionMatrixWriter,"VIEW_PROJECTION_MATRIX_WRITER (shared camera, G98/G99)");
+                    sig(s,t.isObjectArrayCtor,"OBJECT_ARRAY_CTOR (per-element vtables, G92)");
+                    sigList(s,new ArrayList<>(t.vuExecHazards),"VU exec hazards (manifest)");
+                    // v15.1 (PCSX2-grounded)
+                    sig(s,t.isVifUnpackDecompressState,"VIF_UNPACK_DECOMPRESS_STATE (STMOD/STMASK/STROW/STCOL)");
+                    sig(s,t.isXyoffsetGuardWriter,"GS_XYOFFSET_GUARD_BAND (guard-band centre, G88)");
+                    sig(s,t.isTex1FilterWriter,"GS_TEX1_FILTER_WRITER (MMAG/MMIN, G8)");
+                    sigList(s,new ArrayList<>(t.vifUnpackStateCmds),"VIF unpack state cmds");
+                    // v15.2 (skill codegen classes)
+                    sig(s,t.usesMmi,"MMI_SIMD_OP ("+t.mmiOpCount+" ops — verify recompiler lane/pack codegen)");
+                    sig(s,t.usesCop2ControlReg,"COP2_CONTROL_REG_ACCESS (CFC2/CTC2 — verify control-reg map)");
+                    sigList(s,new ArrayList<>(t.mmiFamilies),"MMI families");
+                    sigList(s,new ArrayList<>(t.cop2ControlRegs),"COP2 control regs");
+                    sigList(s,t.guardGlobals,"guard globals");
+                    sigList(s,t.lightingSources,"lighting sources");
+                    sigList(s,t.cop2SpecialOps,"COP2 special ops");
+                    sigList(s,t.dc2GlobalsTouched,"DC2 globals touched");
+                    sigList(s,new ArrayList<>(t.audioGateSignals),"audio gate signals");
+                    sigList(s,new ArrayList<>(t.presentationRegs),"presentation regs");
+                    sigList(s,new ArrayList<>(t.vifOpcodesBuilt),"VIF opcodes built");
+                    if(!t.vramKnownPagesHit.isEmpty()){
+                        StringBuilder pg=new StringBuilder();
+                        for(Long p:t.vramKnownPagesHit){ if(pg.length()>0)pg.append(", ");
+                            pg.append(hex(p)).append("=").append(KNOWN_DC2_TBP_LABELS.getOrDefault(p,"")); }
+                        s.append("- VRAM pages: ").append(pg).append('\n');
+                    }
+                    if(!t.tailcallVtableSlots.isEmpty()){
+                        StringBuilder sl=new StringBuilder(); for(Long x:t.tailcallVtableSlots){ if(sl.length()>0)sl.append(", "); sl.append(hex(x)); }
+                        s.append("- vtable tail-call slots: ").append(sl).append('\n');
+                    }
+                    if(s.length()>0){ w.println("## Signals"); w.println(); w.print(s.toString()); w.println(); }
+                }
+                // --- Memory / Globals (gp-relative refs recovered from assembly) ---
+                w.println("## Memory / Globals");
+                w.println();
+                if(t != null && !t.literalRefs.isEmpty()) {
+                    // signed gp offset -> [readBit, writeBit]; preserve first-seen order.
+                    Map<Long,boolean[]> gpModes = new LinkedHashMap<>();
+                    for(String[] lr : t.literalRefs) {
+                        if(lr.length < 4 || !"gp".equalsIgnoreCase(lr[2])) continue;
+                        String oh = lr[3]; boolean neg = oh.startsWith("-");
+                        String hp = oh.replace("-","").replace("0x","").replace("0X","");
+                        long mag; try { mag = Long.parseLong(hp, 16); } catch(Exception e){ continue; }
+                        long signed = neg ? -mag : mag;
+                        boolean[] m = gpModes.computeIfAbsent(signed, k -> new boolean[2]);
+                        if(lr[1]!=null && lr[1].toLowerCase().startsWith("s")) m[1]=true; else m[0]=true;
+                    }
+                    if(gpModes.isEmpty()) w.println("_(no gp-relative references)_");
+                    else for(Map.Entry<Long,boolean[]> e : gpModes.entrySet()) {
+                        long signed = e.getKey();
+                        long absAddr = (gpValue + signed) & 0xFFFFFFFFL;
+                        boolean[] m = e.getValue();
+                        String mode = m[0] && m[1] ? "read/write" : (m[1] ? "write" : "read");
+                        String gpTok = "gp" + (signed<0?"-":"+") + "0x" + Long.toHexString(Math.abs(signed));
+                        String sym = KNOWN_DC2_GP_OFFSETS.get(signed & 0xFFFFFFFFL);
+                        w.println("- `"+gpTok+"` = `"+hex(absAddr)+"` — "+mode
+                            + (sym!=null ? (" — `"+sym+"`") : ""));
+                    }
+                } else {
+                    w.println("_(no gp-relative references)_");
+                }
+                w.println();
+                // --- Calls ---
+                w.println("## Calls");
+                w.println();
+                if(t != null) {
+                    w.println("**Callees ("+t.calleeNames.size()+"):** "
+                        + (t.calleeNames.isEmpty() ? "_(none)_" : "`"+String.join("`, `", t.calleeNames)+"`"));
+                    w.println();
+                    StringBuilder cb = new StringBuilder();
+                    for(long[] c : t.callers){
+                        String cn = nameByAddr.getOrDefault(c[0]&0xFFFFFFFFL, "");
+                        if(cb.length()>0) cb.append(", ");
+                        cb.append(cn).append("(").append(hex(c[0])).append("@").append(hex(c[1])).append(")");
+                    }
+                    w.println("**Callers ("+t.callers.size()+"):** "+(t.callers.isEmpty()?"_(none)_":cb.toString()));
+                    w.println();
+                }
+                // --- Related Function Files (direct edges only, with derived filenames) ---
+                w.println("## Related Function Files");
+                w.println();
+                if(t != null) {
+                    w.println("### Callees");
+                    boolean anyCallee=false;
+                    java.util.LinkedHashSet<String> seenCallee = new java.util.LinkedHashSet<>();
+                    for(String cn : t.calleeNames){
+                        if(cn==null || !seenCallee.add(cn)) continue;
+                        Long ca = nameToAddr.get(cn);
+                        if(ca != null) { w.println("- `"+hex(ca)+"` — `"+cn+"` — `"+mdNameFor(ca,cn)+"`"); anyCallee=true; }
+                        else           { w.println("- `"+cn+"` — _(address not resolved; external/SDK or stripped)_"); anyCallee=true; }
+                    }
+                    if(!anyCallee) w.println("_(none)_");
+                    w.println();
+                    w.println("### Callers");
+                    if(t.callers.isEmpty()) w.println("_(none)_");
+                    else for(long[] c : t.callers){
+                        long ca = c[0]&0xFFFFFFFFL; String cn = nameByAddr.getOrDefault(ca, "");
+                        w.println("- `"+hex(ca)+"` — `"+(cn.isEmpty()?("sub_"+hex(ca)):cn)+"` @ `"+hex(c[1])
+                            +"` — `"+mdNameFor(ca,cn)+"`");
+                    }
+                    w.println();
+                }
+                // --- Search Anchors (grep-friendly tokens) ---
+                w.println("## Search Anchors");
+                w.println();
+                {
+                    StringBuilder a = new StringBuilder();
+                    a.append("`FUNC_").append(hex(r.address)).append("`\n");
+                    a.append("`NAME_").append(tok(fname)).append("`\n");
+                    a.append("`CATEGORY_").append(tok(r.category)).append("`\n");
+                    a.append("`DISPOSITION_").append(tok(r.disposition)).append("`\n");
+                    for(String tg : r.tags) a.append("`TAG_").append(tok(tg)).append("`\n");
+                    if(t != null){
+                        java.util.LinkedHashSet<String> cs = new java.util.LinkedHashSet<>();
+                        for(String cn : t.calleeNames){ if(cn!=null && cs.add(cn)) a.append("`CALLS_").append(tok(cn)).append("`\n"); }
+                        java.util.LinkedHashSet<String> cb2 = new java.util.LinkedHashSet<>();
+                        for(long[] c : t.callers){ String cn=nameByAddr.getOrDefault(c[0]&0xFFFFFFFFL,""); if(!cn.isEmpty() && cb2.add(cn)) a.append("`CALLED_BY_").append(tok(cn)).append("`\n"); }
+                    }
+                    w.print(a.toString());
+                }
+                w.println();
+                // --- Code ---
+                w.println("## Assembly");
+                w.println();
+                w.println("```asm");
+                w.println(r.asmText==null?"":r.asmText.trim());
+                w.println("```");
+                w.println();
+                w.println("## Decompiled");
+                w.println();
+                w.println("```c");
+                w.println(r.decompText==null?"":r.decompText.trim());
+                w.println("```");
+                w.println();
+                w.println("## Control flow");
+                w.println();
+                w.println("```");
+                w.println(r.flowText==null?"":r.flowText.trim());
+                w.println("```");
+                w.println();
+                w.println("---");
+                w.println("_Full machine-readable record: `index/functions_index.json` (address `"+hex(r.address)+"`)._");
+            }
+            n++;
+            if(n%500==0) monitor.setMessage("Writing function doc "+n+"...");
+        }
+        println("[DOCS] Wrote "+n+" function Markdown files to functions/");
+    }
+
+    // v14: the four focused lookup indexes (functions_index.json is written by
+    // writeTriageJson). Small, queryable, cross-cutting views for the AI.
+    private void writeLookupIndexes(File indexDir, List<FuncResult> results,
+                                    String elfHash, long gpValue) throws IOException {
+        Map<Long,String> nameByAddr = new HashMap<>();
+        for(FuncResult r : results) nameByAddr.put(r.address & 0xFFFFFFFFL, r.name);
+        // Stale-export metadata stamped into every index header.
+        final String idxMeta = "  \"elf_hash\": \""+elfHash+"\",\n"
+            + "  \"global_pointer\": \""+hex(gpValue)+"\",\n"
+            + "  \"export_timestamp\": \""
+            + new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date())+"\",";
+
+        // --- calls_index.json ---
+        try (PrintWriter w = utf8Writer(new File(indexDir,"calls_index.json"))) {
+            w.println("{");
+            w.println("  \"schema_version\": \"1.0\",");
+            w.println(idxMeta);
+            w.println("  \"purpose\": \"forward + reverse call graph (jal edges) per function\",");
+            w.println("  \"functions\": [");
+            for(int i=0;i<results.size();i++){
+                FuncResult r = results.get(i); FuncTraits t = r.traits;
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"callees\": "+(t==null?"[]":jsonStrArray(t.calleeNames))
+                    +", \"callers\": [");
+                if(t != null) for(int j=0;j<t.callers.size();j++){
+                    if(j>0) w.print(", ");
+                    long[] c = t.callers.get(j);
+                    w.print("{\"address\": \""+hex(c[0])+"\", \"name\": "
+                        +jsonString(nameByAddr.getOrDefault(c[0]&0xFFFFFFFFL,""))
+                        +", \"call_site\": \""+hex(c[1])+"\"}");
+                }
+                w.print("]}");
+                w.println(i<results.size()-1?",":"");
+            }
+            w.println("  ]");
+            w.println("}");
+        }
+
+        // --- xrefs_index.json ---
+        try (PrintWriter w = utf8Writer(new File(indexDir,"xrefs_index.json"))) {
+            w.println("{");
+            w.println("  \"schema_version\": \"1.0\",");
+            w.println(idxMeta);
+            w.println("  \"purpose\": \"xref counts + incoming references + referenced globals per function\",");
+            w.println("  \"functions\": [");
+            for(int i=0;i<results.size();i++){
+                FuncResult r = results.get(i); FuncTraits t = r.traits;
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"xref_to_count\": "+(t==null?0:t.xrefToCount)
+                    +", \"caller_count\": "+(t==null?0:t.callers.size())
+                    +", \"referenced_globals\": "+(t==null?"[]":jsonStrArray(new ArrayList<>(t.dc2GlobalsTouched)))
+                    +", \"literal_refs\": [");
+                if(t != null) for(int j=0;j<t.literalRefs.size();j++){
+                    if(j>0) w.print(", ");
+                    String[] lr = t.literalRefs.get(j);
+                    w.print("{\"pc\": "+jsonString(lr[0])+", \"mnem\": "+jsonString(lr[1])
+                        +", \"base_reg\": "+jsonString(lr[2])+", \"offset\": "+jsonString(lr[3])
+                        +", \"dest_reg\": "+jsonString(lr[4])+"}");
+                }
+                w.print("]}");
+                w.println(i<results.size()-1?",":"");
+            }
+            w.println("  ]");
+            w.println("}");
+        }
+
+        // --- tags_index.json ---
+        try (PrintWriter w = utf8Writer(new File(indexDir,"tags_index.json"))) {
+            Map<String,List<FuncResult>> byTag = new TreeMap<>();
+            for(FuncResult r : results) for(String tg : r.tags)
+                byTag.computeIfAbsent(tg, k -> new ArrayList<>()).add(r);
+            w.println("{");
+            w.println("  \"schema_version\": \"1.0\",");
+            w.println(idxMeta);
+            w.println("  \"purpose\": \"tag -> functions carrying it (priority-ranked triage buckets)\",");
+            w.println("  \"tags\": {");
+            int ti=0;
+            for(Map.Entry<String,List<FuncResult>> e : byTag.entrySet()){
+                w.print("    "+jsonString(e.getKey())+": {\"count\": "+e.getValue().size()
+                    +", \"priority\": "+TAG_PRIORITY.getOrDefault(e.getKey(),0)+", \"functions\": [");
+                List<FuncResult> fs = e.getValue();
+                for(int j=0;j<fs.size();j++){
+                    if(j>0) w.print(", ");
+                    w.print("{\"address\": \""+hex(fs.get(j).address)+"\", \"name\": "+jsonString(fs.get(j).name)+"}");
+                }
+                w.print("]}");
+                w.println(++ti<byTag.size()?",":"");
+            }
+            w.println("  }");
+            w.println("}");
+        }
+
+        // --- globals_index.json ---
+        try (PrintWriter w = utf8Writer(new File(indexDir,"globals_index.json"))) {
+            // token -> readers / writers / sinit-writers / touchers.
+            Map<String,Set<String>> readers = new TreeMap<>();
+            Map<String,Set<String>> writers = new TreeMap<>();
+            Map<String,Set<String>> sinitWriters = new TreeMap<>();
+            Map<String,Set<String>> touchers = new TreeMap<>();
+            for(FuncResult r : results){
+                FuncTraits t = r.traits; if(t==null) continue;
+                String nm = r.name==null?"":r.name;
+                boolean isSinit = t.isStaticInitializer || t.isUncalledStaticInit;
+                for(String g : t.guardGlobals) readers.computeIfAbsent(g,k->new LinkedHashSet<>()).add(nm);
+                for(String lbl : t.dc2GlobalsTouched) touchers.computeIfAbsent(lbl,k->new LinkedHashSet<>()).add(nm);
+                Set<String> wts = new LinkedHashSet<>();
+                for(Long a : t.returnWrittenToGlobals) wts.add("0x"+Long.toHexString(a & 0xFFFFFFFFL));
+                for(Long a : t.ctorGlobalAddresses)    wts.add("0x"+Long.toHexString(a & 0xFFFFFFFFL));
+                for(long[] inst : t.staticInitInstalls) wts.add("0x"+Long.toHexString(inst[1] & 0xFFFFFFFFL));
+                for(String tok : wts)
+                    (isSinit?sinitWriters:writers).computeIfAbsent(tok,k->new LinkedHashSet<>()).add(nm);
+            }
+            Set<String> all = new TreeSet<>();
+            all.addAll(readers.keySet()); all.addAll(writers.keySet());
+            all.addAll(sinitWriters.keySet()); all.addAll(touchers.keySet());
+            w.println("{");
+            w.println("  \"schema_version\": \"1.0\",");
+            w.println(idxMeta);
+            w.println("  \"purpose\": \"global token -> readers / writers / __sinit-writers / touchers; init-order hazard support (Rule 186)\",");
+            w.println("  \"globals\": {");
+            int gi=0;
+            for(String tok : all){
+                Set<String> rd=readers.getOrDefault(tok,Collections.emptySet());
+                Set<String> wr=writers.getOrDefault(tok,Collections.emptySet());
+                Set<String> si=sinitWriters.getOrDefault(tok,Collections.emptySet());
+                Set<String> tc=touchers.getOrDefault(tok,Collections.emptySet());
+                boolean hazard = !rd.isEmpty() && wr.isEmpty();
+                w.print("    "+jsonString(tok)+": {\"readers\": "+jsonStrArray(new ArrayList<>(rd))
+                    +", \"writers\": "+jsonStrArray(new ArrayList<>(wr))
+                    +", \"sinit_writers\": "+jsonStrArray(new ArrayList<>(si))
+                    +", \"touchers\": "+jsonStrArray(new ArrayList<>(tc))
+                    +", \"init_order_hazard\": "+hazard+"}");
+                w.println(++gi<all.size()?",":"");
+            }
+            w.println("  }");
+            w.println("}");
+        }
+        println("[INDEX] Wrote calls_index, xrefs_index, tags_index, globals_index to index/");
+    }
+
     private void writeTriageJson(File outFile,List<FuncResult> results,
                                  String elfHash,long gpValue,
                                  int totalFuncs,int uncategorized) throws IOException {
@@ -8158,7 +10465,10 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
         PrintWriter w=utf8Writer(outFile);
         w.println("{");
-        w.println("  \"schema_version\": 11.0,");
+        w.println("  \"schema_version\": 14.2,");
+        w.println("  \"enricher_version\": \"DC2 enricher v15.2 (schema 14.2)\",");
+        w.println("  \"export_timestamp\": \""
+            +new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date())+"\",");
         w.println("  \"elf_hash\": \""+elfHash+"\",");
         if(gpValue!=0)w.println("  \"global_pointer\": \""+hex(gpValue)+"\",");
         w.println("  \"text_range\": { \"start\": \""+hex(textStart)+"\", \"end\": \""+hex(textEnd)+"\" },");
@@ -8180,6 +10490,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.println("    \"step1_rescued_to_recompile\": "+s1rescued+",");
             w.println("    \"step1_locked_kept\": "+step1LockedKeptCount+",");
             w.println("    \"step1_name_mismatches\": "+step1NameMismatchCount+",");
+            w.println("    \"step1_truncated_names\": "+step1TruncatedNameCount+",");
             w.println("    \"step1_elf_hash\": \""+step1ElfHashStatus+"\",");
             w.println("    \"runtime_handler_roster_size\": "
                 +(runtimeRosterLoaded ? runtimeHandlerNames.size() : 0)+",");
@@ -8208,6 +10519,52 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"archive_io\": "+archiveIoCount+",");
         w.println("    \"pad_poll_loop\": "+padPollLoopCount+",");
         w.println("    \"thread_sync_point\": "+threadSyncCount+",");
+        // v11.3 Rules 162-164
+        w.println("    \"spr_dma_stager\": "+sprDmaStagerCount+",");
+        w.println("    \"subword_dma_str_kick\": "+subwordDmaStrKickCount+",");
+        w.println("    \"vu1_double_buffer_framer\": "+vu1DoubleBufferFramerCount+",");
+        w.println("    \"stale_ptr_cache_ctor\": "+stalePtrCacheCtorCount+",");
+        // v12 Rules 165-177
+        w.println("    \"frame_reg_writer\": "+frameRegWriterCount+",");
+        w.println("    \"rtt_target\": "+rttTargetCount+",");
+        w.println("    \"zbuf_vram_alias_risk\": "+zbufVramAliasCount+",");
+        w.println("    \"vram_overlap_pairs\": "+vramOverlapPairs.size()+",");
+        w.println("    \"vf0_dependent_inverse\": "+vf0DependentInverseCount+",");
+        w.println("    \"audio_completion_gate\": "+audioCompletionGateCount+",");
+        w.println("    \"memcard_io\": "+memcardIoCount+",");
+        w.println("    \"presentation_field_state\": "+presentationFieldStateCount+",");
+        w.println("    \"display_buffer_flip\": "+displayBufferFlipCount+",");
+        w.println("    \"clut_cache_invalidator\": "+clutCacheInvalidatorCount+",");
+        w.println("    \"perf_hot_frame_path\": "+perfHotFramePathCount+",");
+        w.println("    \"gs_local_mem_pages_referenced\": "+gsLocalMemPagesReferenced.size()+",");
+        // v13 Rules 178-188
+        w.println("    \"conditional_init_on_global\": "+conditionalInitOnGlobalCount+",");
+        w.println("    \"render_mode_selector\": "+renderModeSelectorCount+",");
+        w.println("    \"vertex_lighting_normal_term\": "+vertexLightingTermCount+",");
+        w.println("    \"vtable_tailcall_thunk\": "+vtableTailcallThunkCount+",");
+        w.println("    \"rtt_no_restore\": "+rttNoRestoreCount+",");
+        w.println("    \"vu_flag_pipeline_uploader\": "+vuFlagPipelineUploaderCount+",");
+        w.println("    \"packed_rgbaq_builder\": "+packedRgbaqBuilderCount+",");
+        w.println("    \"frame_resume_risk\": "+frameResumeRiskCount+",");
+        w.println("    \"init_order_hazards\": "+initOrderHazards.size()+",");
+        // v15 Rules 190-198 (G83-G115 ADC/packer/pacing) — surfaced for the boot dashboard.
+        w.println("    \"prim_class_selector\": "+primClassSelectorCount+",");
+        w.println("    \"adc_kick_vertex_source\": "+adcKickVertexSourceCount+",");
+        w.println("    \"kick_mode_writer\": "+kickModeWriterCount+",");
+        w.println("    \"texture_reload_interleave\": "+textureReloadInterleaveCount+",");
+        w.println("    \"vsync_coupled_game_step\": "+vsyncCoupledGameStepCount+",");
+        w.println("    \"view_projection_writer\": "+viewProjectionWriterCount+",");
+        w.println("    \"object_array_ctor\": "+objectArrayCtorCount+",");
+        w.println("    \"allocator_family_split\": "+allocatorFamilySplit+",");
+        w.println("    \"vu_exec_hazard_manifest\": "+vuExecHazardManifest.size()+",");
+        // v15.1 Rules 199-202 (PCSX2 cross-check)
+        w.println("    \"vif_unpack_decompress_state\": "+vifUnpackDecompressCount+",");
+        w.println("    \"xyoffset_guard_writer\": "+xyoffsetGuardWriterCount+",");
+        w.println("    \"tex1_filter_writer\": "+tex1FilterWriterCount+",");
+        // v15.2 Rules 203-206 (skill cross-check)
+        w.println("    \"mmi_codegen_risk\": "+mmiCodegenRiskCount+",");
+        w.println("    \"cop2_control_reg_access\": "+cop2ControlRegCount+",");
+        w.println("    \"unfunded_texture_pages\": "+unfundedTexturePages.size()+",");
         w.println("    \"ctor_field_writer\": "+ctorFieldWriterCount+",");
         w.println("    \"vtable_setter\": "+vtableSetterCount+",");
         w.println("    \"a0_passthrough_returner\": "+a0PassthroughCount+",");
@@ -8443,6 +10800,193 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
         w.println("  ],");
 
+        // ===== v12 Rules 165-177 top-level sections =====
+        // Rule 165 VRAM_OVERLAP_MAP: functions targeting the SAME labelled VRAM
+        // page with DIFFERING GS reg kinds → RTT_ALIAS / Z_ALIAS / TIMESHARE.
+        // The G33-G50 / G45 page-alias bug class, surfaced statically.
+        w.println("  \"vram_overlap_pairs\": [");
+        for(int i=0;i<vramOverlapPairs.size();i++){
+            String[] p = vramOverlapPairs.get(i);
+            w.print("    {\"page\": \""+p[0]+"\", \"label\": "+jsonString(p[1])
+                +", \"kind_a\": \""+p[2]+"\", \"func_a\": "+jsonString(p[3])
+                +", \"kind_b\": \""+p[4]+"\", \"func_b\": "+jsonString(p[5])
+                +", \"classification\": \""+p[6]+"\"}");
+            w.println(i<vramOverlapPairs.size()-1?",":"");
+        }
+        w.println("  ],");
+
+        // Rule 171 MEMCARD_IO roster (#4 active blocker: save/load).
+        w.println("  \"memcard_io_roster\": [");
+        {
+            List<FuncResult> mc = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isMemcardIo) mc.add(r);
+            for(int i=0;i<mc.size();i++){
+                FuncResult r = mc.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"memcard_callees\": "+jsonStrArray(new ArrayList<>(r.traits.memcardCallees))+"}");
+                w.println(i<mc.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 170 AUDIO_COMPLETION_GATE (#3 active blocker: audio/event signals).
+        w.println("  \"audio_completion_gates\": [");
+        {
+            List<FuncResult> ag = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isAudioCompletionGate) ag.add(r);
+            for(int i=0;i<ag.size();i++){
+                FuncResult r = ag.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"signals\": "+jsonStrArray(new ArrayList<>(r.traits.audioGateSignals))
+                    +", \"dc2_audio_gated_stall\": "+r.tags.contains("DC2_AUDIO_GATED_STALL")+"}");
+                w.println(i<ag.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 173 PRESENTATION_FIELD_STATE (#5 active blocker: interlace jitter).
+        w.println("  \"presentation_field_writers\": [");
+        {
+            List<FuncResult> pf = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.writesPresentationFieldState) pf.add(r);
+            for(int i=0;i<pf.size();i++){
+                FuncResult r = pf.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"regs\": "+jsonStrArray(new ArrayList<>(r.traits.presentationRegs))
+                    +", \"display_buffer_flip\": "+r.traits.isDisplayBufferFlip+"}");
+                w.println(i<pf.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 175 CLUT_CACHE_INVALIDATOR (TEXFLUSH / CLUT-page cache ops).
+        w.println("  \"clut_cache_ops\": [");
+        {
+            List<FuncResult> cc = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isClutCacheInvalidator) cc.add(r);
+            for(int i=0;i<cc.size();i++){
+                FuncResult r = cc.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+"}");
+                w.println(i<cc.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 176 PERF_HOT_FRAME_PATH (#7 active blocker: frame pacing). Ranked
+        // by callee fan-out (shallow mainloop reach + inner loop = hot suspect).
+        w.println("  \"perf_hot_candidates\": [");
+        {
+            List<FuncResult> ph = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isPerfHotFramePath) ph.add(r);
+            ph.sort((a,b)->Integer.compare(b.traits.calleeCount, a.traits.calleeCount));
+            for(int i=0;i<ph.size();i++){
+                FuncResult r = ph.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"mainloop_depth\": "+r.traits.mainLoopDepth
+                    +", \"callee_count\": "+r.traits.calleeCount+"}");
+                w.println(i<ph.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 177 GS_LOCAL_MEM_BUDGET: distinct labelled VRAM pages seen
+        // statically. >4MB worth → bank-switched VRAM the flat recomp model breaks.
+        w.println("  \"gs_local_mem_budget\": {");
+        w.println("    \"distinct_labelled_pages\": "+gsLocalMemPagesReferenced.size()+",");
+        w.print("    \"pages\": [");
+        {
+            boolean f=true;
+            for(Long p : gsLocalMemPagesReferenced){ if(!f)w.print(", "); f=false;
+                w.print("{\"page\": \""+hex(p)+"\", \"label\": "
+                    +jsonString(KNOWN_DC2_TBP_LABELS.getOrDefault(p,""))+"}"); }
+        }
+        w.println("]");
+        w.println("  },");
+
+        // ===== v13 Rules 178-188 top-level rosters (DC2 G53-G82) =====
+        // Rule 179 RENDER_MODE_SELECTOR (G75-G80 copy-vs-transform routing).
+        emitV13Roster(w, "render_mode_selectors", renderModeSelectors, "kind");
+        // Rule 180 VERTEX_LIGHTING_NORMAL_TERM (G82 per-vertex N·L / shade-RED deficit).
+        emitV13Roster(w, "vertex_lighting_terms", vertexLightingTerms, "source");
+        // Rule 181 VTABLE_TAILCALL_THUNK (G59 recompiler inherited-virtual tail-call bug).
+        emitV13Roster(w, "vtable_tailcall_thunks", vtableTailcallThunks, "slots");
+        // Rule 182 RTT_NO_RESTORE (G79 GS render-target / scissor leak across scenes).
+        emitV13Roster(w, "rtt_no_restore", rttNoRestoreFuncs, "reason");
+        // Rule 184 VU_FLAG_PIPELINE_UPLOADER (G71 VU MAC/STATUS flag pipeline advisory).
+        emitV13Roster(w, "vu_flag_pipeline_uploaders", vuFlagPipelineUploaders, "kind");
+        // Rule 187 PACKED_RGBAQ_BUILDER (G82 GIF PACKED RGBAQ spread-layout advisory).
+        emitV13Roster(w, "packed_rgbaq_builders", packedRgbaqBuilders, "note");
+        // Rule 188 FRAME_RESUME_RISK (G58/G59 mid-body preempt/resume risk).
+        emitV13Roster(w, "frame_resume_risk", frameResumeRiskFuncs, "reason");
+        // Rule 186 INIT_ORDER_DEPENDENCY: globals read-guarded but only __sinit-written (G58/G81).
+        w.println("  \"init_order_hazards\": [");
+        for(int i=0;i<initOrderHazards.size();i++){
+            String[] h = initOrderHazards.get(i);
+            w.print("    {\"global\": "+jsonString(h[0])+", \"reader\": "+jsonString(h[1])
+                +", \"writer\": "+jsonString(h[2])+", \"writer_kind\": "+jsonString(h[3])+"}");
+            w.println(i<initOrderHazards.size()-1?",":"");
+        }
+        w.println("  ],");
+
+        // ===== v15 Rules 190-198 top-level rosters (DC2 G83-G115) =====
+        // Rule 190 GIFTAG_PRIM_CLASS_SELECTOR (the qword38 PRIM-class route decode, G77-G115).
+        emitV13Roster(w, "prim_class_selectors", primClassSelectors, "selector");
+        // Rule 191 ADC_KICK_VERTEX_SOURCE (the per-vertex strip-restart ADC source, G65-G115).
+        emitV13Roster(w, "adc_kick_sources", adcKickSources, "adc_source");
+        // Rule 192 XYZ2_VS_XYZ3_KICK_WRITER (per-vertex draw-kick vs no-kick writers).
+        emitV13Roster(w, "kick_mode_writers", kickModeWriters, "mode");
+        // Rule 193 TEXTURE_RELOAD_INTERLEAVE_HAZARD (per-block TEX0 de-interleave, G90-G97).
+        emitV13Roster(w, "texture_reload_interleave", textureReloadInterleave, "reason");
+        // Rule 195 VSYNC_COUPLED_GAME_STEP (game-step coupled to render, G103 perf blocker).
+        emitV13Roster(w, "frame_pacing_drivers", framePacingDrivers, "detail");
+        // Rule 196 VIEW_PROJECTION_MATRIX_WRITER (shared camera/view matrix, G98/G99).
+        emitV13Roster(w, "view_projection_writers", viewProjectionWriters, "kind");
+        // Rule 197 OBJECT_ARRAY_CTOR (array-of-objects ctor needing per-element vtables, G92).
+        emitV13Roster(w, "object_array_ctors", objectArrayCtors, "shape");
+        // Rule 184+ VU_EXEC_HAZARD_MANIFEST (consolidated VU/COP2 interpreter divergences).
+        emitV13Roster(w, "vu_exec_hazard_manifest", vuExecHazardManifest, "hazards");
+        // ===== v15.1 PCSX2-grounded rosters (Rules 199-201) =====
+        // Rule 199 VIF_UNPACK_DECOMPRESS_STATE (STMOD/STMASK/STROW/STCOL decompression).
+        emitV13Roster(w, "vif_unpack_decompress_state", vifUnpackDecompressState, "commands");
+        // Rule 200 GS_XYOFFSET_GUARD_BAND (guard-band centre, G88).
+        emitV13Roster(w, "xyoffset_guard_writers", xyoffsetGuardWriters, "detail");
+        // Rule 201 GS_TEX1_FILTER_WRITER (MMAG/MMIN texture filter, G8).
+        emitV13Roster(w, "tex1_filter_writers", tex1FilterWriters, "detail");
+        // ===== v15.2 skill-grounded rosters (Rules 203-205) =====
+        // Rule 203 MMI_SIMD_OP (EE MMI codegen class - audit the whole class).
+        emitV13Roster(w, "mmi_codegen_risk", mmiCodegenRisk, "detail");
+        // Rule 204 COP2_CONTROL_REG_ACCESS (CFC2/CTC2 control-reg map codegen class).
+        emitV13Roster(w, "cop2_control_reg_access", cop2ControlRegAccess, "regs");
+        // Rule 205 UNFUNDED_TEXTURE_PAGE (sampled page with no static BITBLTBUF upload, advisory).
+        w.println("  \"unfunded_texture_pages\": [");
+        for(int i=0;i<unfundedTexturePages.size();i++){
+            String[] e = unfundedTexturePages.get(i);
+            w.print("    {\"page\": "+jsonString(e[0])+", \"label\": "+jsonString(e[1])
+                +", \"sampler\": "+jsonString(e[2])+", \"note\": \"confirm with runtime BITBLTBUF-dbp counter\"}");
+            w.println(i<unfundedTexturePages.size()-1?",":"");
+        }
+        w.println("  ],");
+        // Rule 194 ALLOCATOR_FAMILY_COHERENCE: the family + the split flag (regen-caveat #1).
+        w.println("  \"allocator_family_split\": "+allocatorFamilySplit+",");
+        w.println("  \"allocator_family\": [");
+        for(int i=0;i<allocatorFamily.size();i++){
+            String[] e = allocatorFamily.get(i);
+            w.print("    {\"name\": "+jsonString(e[0])+", \"address\": "+jsonString(e[1])
+                +", \"disposition\": "+jsonString(e[2])+"}");
+            w.println(i<allocatorFamily.size()-1?",":"");
+        }
+        w.println("  ],");
+
+        // Rule 185 LOOP_STATE_MODEL: program-state legend + illegal-concurrent states (G79).
+        w.println("  \"loop_state_model\": [");
+        for(int i=0;i<LOOP_STATE_MODEL.length;i++){
+            String[] s = LOOP_STATE_MODEL[i];
+            w.print("    {\"state\": "+jsonString(s[0])+", \"where\": "+jsonString(s[1])
+                +", \"legend\": "+jsonString(s[2])+"}");
+            w.println(i<LOOP_STATE_MODEL.length-1?",":"");
+        }
+        w.println("  ],");
+
         // Rule 140: COP2 partial-dest transform risk set (F51.8). Every function
         // here uses VU0-macro ops with a PARTIAL dest field; its generated COP2
         // dest-mask lane order must be verified against READ128/WRITE128 (X=lane0).
@@ -8465,6 +11009,37 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 for(String s:r.traits.cop2DestFields){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
                 w.print("]}");
                 w.println(i<risk.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // v11.3 Rule 162: SPR/scratchpad DMA stagers — the G26 delivery-bug
+        // class. Each func programs a fromSPR/toSPR (ch8/9) DMA and/or kicks a
+        // transfer via a sub-word CHCR store. A runtime whose writeIORegister
+        // only handles GIF/VIF1 word writes drops these, so a scratchpad-staged
+        // VU1 model packet never reaches VIF1 (no XGKICK). override_hookable
+        // tells the fix strategy (registerFunction vs wrap-the-jal/runtime IO).
+        w.println("  \"spr_dma_stagers\": [");
+        {
+            List<FuncResult> sp = new ArrayList<>();
+            for(FuncResult r : results)
+                if(r.traits != null && (r.traits.programsSprDma || r.traits.subwordDmaStrKick))
+                    sp.add(r);
+            for(int i=0;i<sp.size();i++){
+                FuncResult r = sp.get(i);
+                FuncTraits t = r.traits;
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+
+                        ", \"programs_spr_dma\": "+t.programsSprDma+
+                        ", \"subword_dma_str_kick\": "+t.subwordDmaStrKick+
+                        ", \"override_hookable\": "+(t.calledViaJrT9 && !t.calledViaDirectJal)+
+                        ", \"spr_channels\": [");
+                boolean f=true;
+                for(String s:t.sprDmaChannels){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+                w.print("], \"subword_kick_channels\": [");
+                f=true;
+                for(String s:t.subwordKickChannels){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+                w.print("]}");
+                w.println(i<sp.size()-1?",":"");
             }
         }
         w.println("  ],");
@@ -9085,6 +11660,20 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"ctor_risk_tier\": "+jsonString(t.ctorRiskTier)+", ");
             w.print("\"called_via_direct_jal\": "+t.calledViaDirectJal+", ");
             w.print("\"called_via_jr_t9\": "+t.calledViaJrT9+", ");
+            // v11.3: registerFunction overrides are consulted ONLY for indirect jalr/jr $t9.
+            // A function reached via direct jal at any site is NOT fully hookable that way -
+            // fix it by wrapping the jal TARGET or in codegen (the G11 ReloadTexture / F51.8
+            // COP2 gotcha). hookable=true => every observed caller is indirect (safe to override);
+            // partial => mixed (some direct jal sites bypass the override).
+            w.print("\"override_hookable\": "+(t.calledViaJrT9 && !t.calledViaDirectJal)+", ");
+            w.print("\"override_hookable_partial\": "+(t.calledViaJrT9 && t.calledViaDirectJal)+", ");
+            // v11.3 Rules 162-164
+            w.print("\"programs_spr_dma\": "+t.programsSprDma+", ");
+            w.print("\"subword_dma_str_kick\": "+t.subwordDmaStrKick+", ");
+            w.print("\"is_vu1_double_buffer_framer\": "+t.isVu1DoubleBufferFramer+", ");
+            w.print("\"is_stale_ptr_cache_ctor\": "+t.isStalePtrCacheCtor+", ");
+            if(t.stalePtrCacheGetter!=null)
+                w.print("\"stale_ptr_cache_getter\": "+jsonString(t.stalePtrCacheGetter)+", ");
             w.print("\"is_pad_button_mask_consumer\": "+t.isPadButtonMaskConsumer+", ");
             w.print("\"calls_gif_packet_open\": "+t.callsGifPacketOpen+", ");
             w.print("\"calls_gif_packet_close\": "+t.callsGifPacketClose+", ");
@@ -9185,6 +11774,63 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"writes_fpu_control\": "+t.writesFpuControl+", ");
             w.print("\"uses_fpu_div_sqrt\": "+t.usesFpuDivSqrt+", ");
             w.print("\"is_overlay_loader\": "+t.isOverlayLoader+", ");
+            // ===== v12 fields (Rules 165-177) =====
+            w.print("\"writes_frame_reg\": "+t.writesFrameReg+", ");
+            w.print("\"is_rtt_target\": "+t.isRttTarget+", ");
+            w.print("\"zbuf_vram_alias_risk\": "+t.zbufVramAliasRisk+", ");
+            w.print("\"vram_known_pages_hit\": [");
+            { boolean f=true; for(Long p : t.vramKnownPagesHit){ if(!f)w.print(", "); f=false;
+                w.print("{\"page\": \""+hex(p)+"\", \"label\": "
+                    +jsonString(KNOWN_DC2_TBP_LABELS.getOrDefault(p,""))+"}"); } }
+            w.print("], ");
+            w.print("\"is_vf0_dependent_inverse\": "+t.isVf0DependentInverse+", ");
+            w.print("\"is_audio_completion_gate\": "+t.isAudioCompletionGate+", ");
+            w.print("\"audio_gate_signals\": "+jsonStrArray(new ArrayList<>(t.audioGateSignals))+", ");
+            w.print("\"is_memcard_io\": "+t.isMemcardIo+", ");
+            w.print("\"memcard_callees\": "+jsonStrArray(new ArrayList<>(t.memcardCallees))+", ");
+            w.print("\"writes_presentation_field_state\": "+t.writesPresentationFieldState+", ");
+            w.print("\"presentation_regs\": "+jsonStrArray(new ArrayList<>(t.presentationRegs))+", ");
+            w.print("\"is_display_buffer_flip\": "+t.isDisplayBufferFlip+", ");
+            w.print("\"is_clut_cache_invalidator\": "+t.isClutCacheInvalidator+", ");
+            w.print("\"is_perf_hot_frame_path\": "+t.isPerfHotFramePath+", ");
+            // ===== v13 fields (Rules 178-188) =====
+            w.print("\"is_conditional_init_on_global\": "+t.isConditionalInitOnGlobal+", ");
+            w.print("\"guard_globals\": "+jsonStrArray(new ArrayList<>(t.guardGlobals))+", ");
+            w.print("\"is_render_mode_selector\": "+t.isRenderModeSelector+", ");
+            w.print("\"is_vertex_lighting_term\": "+t.isVertexLightingTerm+", ");
+            w.print("\"lighting_sources\": "+jsonStrArray(new ArrayList<>(t.lightingSources))+", ");
+            w.print("\"is_vtable_tailcall_thunk\": "+t.isVtableTailcallThunk+", ");
+            w.print("\"tailcall_vtable_slots\": [");
+            { boolean f=true; for(Long s : t.tailcallVtableSlots){ if(!f)w.print(", "); f=false; w.print("\""+hex(s)+"\""); } }
+            w.print("], ");
+            w.print("\"is_rtt_no_restore\": "+t.isRttNoRestore+", ");
+            w.print("\"is_vu_flag_pipeline_uploader\": "+t.isVuFlagPipelineUploader+", ");
+            w.print("\"is_packed_rgbaq_builder\": "+t.isPackedRgbaqBuilder+", ");
+            w.print("\"is_frame_resume_risk\": "+t.isFrameResumeRisk+", ");
+            // ===== v15 fields (Rules 190-198) =====
+            w.print("\"is_prim_class_selector\": "+t.isPrimClassSelector+", ");
+            w.print("\"is_adc_kick_vertex_source\": "+t.isAdcKickVertexSource+", ");
+            w.print("\"adc_source\": "+jsonString(t.adcSource==null?"":t.adcSource)+", ");
+            w.print("\"writes_xyz2_reg\": "+t.writesXyz2Reg+", ");
+            w.print("\"writes_xyz3_reg\": "+t.writesXyz3Reg+", ");
+            w.print("\"is_kick_mode_writer\": "+t.isKickModeWriter+", ");
+            w.print("\"kick_const_add_count\": "+t.kickConstAddCount+", ");
+            w.print("\"is_texture_reload_interleave\": "+t.isTextureReloadInterleave+", ");
+            w.print("\"is_vsync_coupled_game_step\": "+t.isVsyncCoupledGameStep+", ");
+            w.print("\"is_view_projection_matrix_writer\": "+t.isViewProjectionMatrixWriter+", ");
+            w.print("\"is_object_array_ctor\": "+t.isObjectArrayCtor+", ");
+            w.print("\"vu_exec_hazards\": "+jsonStrArray(new ArrayList<>(t.vuExecHazards))+", ");
+            // ===== v15.1 fields (PCSX2-grounded, Rules 199-201) =====
+            w.print("\"is_vif_unpack_decompress_state\": "+t.isVifUnpackDecompressState+", ");
+            w.print("\"vif_unpack_state_cmds\": "+jsonStrArray(new ArrayList<>(t.vifUnpackStateCmds))+", ");
+            w.print("\"writes_xyoffset_reg\": "+t.writesXyoffsetReg+", ");
+            w.print("\"writes_tex1_reg\": "+t.writesTex1Reg+", ");
+            // ===== v15.2 fields (skill codegen classes, Rules 203-204) =====
+            w.print("\"uses_mmi\": "+t.usesMmi+", ");
+            w.print("\"mmi_op_count\": "+t.mmiOpCount+", ");
+            w.print("\"mmi_families\": "+jsonStrArray(new ArrayList<>(t.mmiFamilies))+", ");
+            w.print("\"uses_cop2_control_reg\": "+t.usesCop2ControlReg+", ");
+            w.print("\"cop2_control_regs\": "+jsonStrArray(new ArrayList<>(t.cop2ControlRegs))+", ");
             w.print("\"computed_jump_sites\": [");
             {
                 Map<Long,List<Long>> byPc = new LinkedHashMap<>();
@@ -9646,6 +12292,18 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         for(String s : c){ if(n >= cap) break; if(!f) sb.append(", "); f = false; sb.append(jsonString(s)); n++; }
         if(c.size() > cap){ if(!f) sb.append(", "); sb.append(jsonString("+" + (c.size()-cap) + " more")); }
         return sb.append("]").toString();
+    }
+    // v13: emit a [name, addrHex, detail] roster as a JSON array of objects.
+    private static void emitV13Roster(java.io.PrintWriter w, String key,
+                                      List<String[]> rows, String detailKey){
+        w.println("  \""+key+"\": [");
+        for(int i=0;i<rows.size();i++){
+            String[] e = rows.get(i);
+            w.print("    {\"name\": "+jsonString(e[0])+", \"address\": "+jsonString(e[1])
+                +", \""+detailKey+"\": "+jsonString(e[2])+"}");
+            w.println(i<rows.size()-1?",":"");
+        }
+        w.println("  ],");
     }
     private static boolean hasAnyTag(FuncResult r, String[] tags){
         if(r.tags == null) return false;
@@ -10534,7 +13192,10 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         String rescuedBy=null;
         // v11.1: for origin="step1", whether the entry came from the step1
         // exporter ("exporter") or a previous enricher run ("enricher_prev").
-        String step1Source=null;}
+        String step1Source=null;
+        // v14: captured listing text for the per-function Markdown docs
+        // (functions/<addr>_<name>.md). Streamed once during the scan.
+        String asmText=null, decompText=null, flowText=null;}
     private static String hex(long v){return String.format("0x%08X",v&0xFFFFFFFFL);}
     private static String jsonString(String v){
         if(v==null)return "\"\"";
