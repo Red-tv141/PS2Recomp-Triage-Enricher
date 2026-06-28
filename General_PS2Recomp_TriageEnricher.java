@@ -1,439 +1,790 @@
-// PS2Recomp Triage Enricher v15.5 - Ghidra Script (Step 2 of Pipeline)
-//
-// WHAT'S NEW IN v15.5 (Jak 1/2/3 tri-game benchmark retrospective):
-//   Bugfix R  class_registry trailing comma     On stripped binaries (empty
-//             registry, Jak3) the unconditional comma after "_note" made the
-//             whole triage_map.json INVALID JSON. Comma now prefixes entries.
-//   Bugfix S  UTF-8 everywhere                  All readers/writers were
-//             platform-default charset; on Windows (cp125x) every em dash in
-//             an emitted string became mojibake/U+FFFD inside the JSON.
-//             utf8Writer()/utf8Reader() + the source itself is pure ASCII +
-//             jsonString() now escapes all control chars per RFC 8259.
-//             schema_version bumped to 12.3.
-//   Rule 159  SYSCALL_TRAMPOLINE policy         A <=32-byte 0-call body with
-//             a syscall is the kernel boundary itself:
-//              - the old auto-SKIP compiled to a TODO_NAMED placeholder that
-//                returns -1, silently losing live kernel calls (Jak3
-//                GetThreadId, Jak1/2 alarm helpers setup/Copy/GetEntryAddress);
-//              - the old whitelist ("handler"/"callback" substring) and the
-//                PROCESS_TERMINATOR/allocator trait firewalls blocked or
-//                mis-rescued trampolines (_exit "trait firewall" reason; Jak3
-//                AddIntcHandler left unbound).
-//             New order: trampoline shape decided FIRST. STUB when the
-//             runtime roster implements the handler by name AND the name is
-//             a known boundary family; SKIP only when xref count is 0 (dead
-//             bootstrap); otherwise RECOMPILE - the recompiler translates
-//             `syscall` to runtime->handleSyscall() ($v1/numeric dispatch),
-//             which is always semantically correct. Same ordering applied in
-//             the step1 keep gate with an accurate rescue reason. New tag
-//             SYSCALL_TRAMPOLINE + "syscall_trampolines" statistic.
-//   Bugfix T  Single-line TOML arrays           `stubs = ["a@0x1"]` /
-//             `skip = []` inline arrays were silently dropped by both the
-//             step1 parser and the unified-config rewriter (entries lost,
-//             array state leaked onto following lines). Both now expand or
-//             consume inline arrays; missing arrays are created under
-//             [general] when the enricher has additions to place.
-//   Bugfix U  Rule 78 TBP noise gate            tbp_constants_loaded had
-//             collected EVERY immediate in (0,0x3FFF] from every function
-//             (16-byte trampolines "loaded TBP constants"). The list is now
-//             emitted only for functions with GS-side static evidence or a
-//             runtime-confirmed TBP match.
-//   Rule 160  STRIPPED TRAMPOLINE NAME RECOVERY  The syscall immediate
-//             decoded from a trampoline body is ground truth; when
-//             EE_SYSCALL_NAMES[N] names a handler the runtime roster
-//             implements, the ADDRESS is bound via the recompiler's
-//             documented "Handler@0xADDR" stub selector - recovers correct
-//             stubs on stripped ELFs (FUN_*/RFU* symbols).
-//   Bugfix V  detectSyscallTrampoline $v1 override  A spurious scalar in the
-//             syscall instruction's input objects overwrote the $v1 constant:
-//             on Jak1, li v1,0x74/0x5a/0x5b ALL reported imm 0x02/"SetGsCrt".
-//             $v1 now always wins; the encoded code field is only a fallback.
-//   Bugfix W  EE_SYSCALL_NAMES rebuilt against pcsx2 R5900OpcodeImpl.cpp +
-//             ps2xRuntime Dispatcher.cpp. Old map had 0x66/0x67 as
-//             GsGetIMR/GsPutIMR (really CpuConfig/iGetCop0), 0x68 as
-//             SetVSyncFlag (really iFlushCache; SetVSyncFlag=0x73), 0x73 as
-//             SetSyscall (really 0x74). Names now use the runtime's spelling
-//             so Rule 160 roster lookups succeed; contested numbers
-//             (0x5A/0x5B) omitted; negative-encoded i-variants added.
-//   Rule 161  DYNAMIC_CODE_LOADER               Calls FlushCache/iFlushCache/
-//             CacheFlush AND reads files/archives in the same body - the
-//             "read code from disc, flush I-cache, execute" overlay/linker
-//             idiom (Jak klink). Never stubbed (firewalled); statistic
-//             "dynamic_code_loaders" > 0 warns that the ELF loads EE code at
-//             runtime, so recompiling the ELF alone cannot cover the game.
-//   Plus      BIOS_FIREWALL_PREFIXES extended with kernel wrappers observed
-//             unmatched on the Jak ELFs (GetThreadId, TerminateThread,
-//             ExitDeleteThread, SetVTLBRefillHandler, SetVCommonHandler,
-//             SetVInterruptHandler, AddSbusIntcHandler, DelayThread, ...).
-//
-// Pre-v15.5 history retained below for archival reference.
-// ==================================================================
-// PS2Recomp Triage Enricher v11 - Ghidra Script (Step 2 of Pipeline)
-//
-// WHAT'S NEW IN v11 (FF1 Himuro retrospective + cross-game bug sweep):
-//   Bugfix A  Broken A+D reg detection            Removed MMIO-offset==RegID
-//             match (was misreading PMODE@0x12000000 as PRIM A+D reg 0x00).
-//             Replaced with detectAdRegImmediateStores() which scans qword
-//             A+D-mode payload-imm pairs and sets writesGsPrimReg/Tex0/Rgbaq/
-//             Zbuf/DispfbReg/BitbltbufReg via real payload evidence.
-//   Bugfix B  VIF_OPCODE_BUILDER NOP flood        Guard highByte=0 (matches VIF
-//             NOP). On FF1 dropped 2361 false positives to a small precise set.
-//   Bugfix C  MainLoop autodetect missed bare main + low-callee mainloops.
-//             Added "main" to mlNames. Relaxed behavioral fallback: callees>=6
-//             OR (callees>=4 AND isFrameClockDriver). Frame-clock bonus *=4.
-//   Rule  D  RPC SID/FID extraction extended to lui+ori composite into $a1
-//             before sceSifBindRpc (SID) and sceSifCallRpc (FID). Captures
-//             raw immediates independent of KNOWN_IOP_SIDS whitelist.
-//   Rule  E  Peripheral reg ranges expanded per PCSX2 EEMemoryMap: RCNT0-3
-//             (timers), VIF0/VIF1 CONTROL block (distinct from VIF DMA chan),
-//             DMAC global block (CTRL/STAT/PCR/...), INTC_STAT/MASK, SIO,
-//             DMAC ext (D_ENABLEW/R), SBUS_MSFLG/SMFLG. New tags:
-//             RCNT_ACCESS, VIF_CONTROL_REG, DMAC_GLOBAL_REG, WRITES_INTC_MASK,
-//             READS_INTC_STAT, SIO_ACCESS, WRITES_DMAC_ENABLE,
-//             SBUS_FLAG_TOUCHER.
-//   Rule  F  DMA_SOURCE_CHAIN_TAG_BUILDER         2-store qword pattern with
-//             tag-id high nibble (REF/CNT/CALL/RET/END/REFS/NEXT) at +0.
-//             Catches the canonical `size | 0x30000000` PS2 idiom.
-//   Rule  G  Cross-instruction const tracker hoisted into a dedicated helper
-//             (used by F and the existing R1/R4 GIF builders).
-//   Rule  H  FORMAT_MAGIC_PARSER                  Catches TIM2/CLT2/ELF/PSS/
-//             SW01/imp2 magics in const_loads.
-//   Rule  I  IRX_LOADER (>=2 sceSifLoadModule calls) + IOP_REBOOT_HANDLER
-//             (sceSifRebootIop callee). Captures inline IRX paths.
-//   Rule  J  BACKWARD_BRANCH_SYNC_WAIT            backward branch + Sync/Stat
-//             callee. INFINITE_FAIL_LOOP for the `while(1){}` after
-//             sceSif*Bind/Reboot/Sync/Load error idiom.
-//   Rule  K  name_prefix_modules                  Secondary subsystem index
-//             - prefixes occurring >=5 times across the binary (Scene*, Mc*,
-//             scePad*, Tim2*, Movie*, Sg*, sce*). Complements call-graph
-//             clustering on symbol-rich (non-stripped) builds.
-//   Rule  L  Function-pointer-table edges feed BFS forward adjacency before
-//             mainloop/init-chain depth computation. Recovers depth on
-//             switch-dispatched callees that direct-jal BFS missed.
-//   Polish M  runtime_corroboration block omitted when no GS dumps loaded.
-//   Polish N  Trailing tag comments preserved on nop/patch/force_recompile
-//             TOML emit so engineers see WHY without cross-checking JSON.
-//   Polish P  literal_refs JSON array capped at 32 + truncated flag.
-//   Polish Q  Header doc rewritten (was stuck on "v9 Rules 1-17").
-//
-// Pre-v11 history retained below for archival reference.
-// ==================================================================
-// PS2Recomp Triage Enricher v9 - Ghidra Script (Step 2 of Pipeline)
+// PS2Recomp Triage Enricher v17 (Generalised from the game) - Ghidra Script (Step 2 of Pipeline)
 // ==================================================================
 // Run AFTER ExportPS2Functions.java on the same Ghidra project.
 //
+// RULES (1-164) - organized numerically for AI readability
+// ================================================================
+//
+// Rule 1  No DANGEROUS_KEYWORDS (removed - was killing game logic)
+// Rule 2  IOP_MODULE_STRINGS: only .IRX/.irx + specific module names (no .BIN/.DAT)
+// Rule 3  referencesIopModule: size cap 800 bytes (larger = game logic)
+// Rule 4  accessesHardware: DATA references only (not CALL/FLOW)
+// Rule 5  accessesHardware - ACCESSES_MMIO tag only (not disposition)
+// Rule 6  KSEG1 masking in all address checks (addr & 0x1FFFFFFF)
+// Rule 7  isKernelInternal replaces isRadarBehaviorallyDangerous (syscall+COP0 only)
+// Rule 8  IOP refs - STUB, kernel internals - SKIP
+// Rule 9  TOML parser: handles name-only AND name@address entries
+// Rule 10 Whitelist: entry/_start exempt from all firewalls; BUSY_WAIT_HAZARD with backward branch + jal to syscall stub
+// Rule 11 MainLoop shield: ML + depth-1 callees exempt (manual or auto-detect)
+// Rule 12 $gp fallback: lui+addiu scan in entry point for stripped binaries
+// Rule 13 SMC detection: function boundaries + instruction-at-target check
+// Rule 14 No lui scanner for VIF (didn't work, removed)
+// Rule 15 No VIF_DMA_UPLOAD tag (ACCESSES_MMIO covers it)
+// Rule 16 vcallms - VU0_MICROCODE - forced STUB
+// Rule 17 jr $reg (reg!=ra) - COMPLEX_CONTROL_FLOW tag; ORPHAN_CODE tag for zero-xref functions; Unified config output
+//
+// Rule 18 the game_GAME_OVERRIDE_PARSER: Reads game_override.cpp (or any *_game_override.cpp)
+//        and imports every bindAddressHandler / registerFunction address as already-classified.
+//        Prevents re-stubbing functions that the runtime has already manually bound.
+//
+// Rule 19 CONVENTION_VIOLATION tag: Detects functions where Ghidra's decompiler reports a0/a1
+//        arg aliasing or where the function writes to $a1 as if it were a return buffer
+//        (pattern from GetFullPath__FPcPc bug in Phase F5).
+//
+// Rule 20 INIT_LARGE_FUNC guard: Functions named *init* / *Init* / *__ct__* / *__sinit_*
+//        that have calleeCount > 10 OR byteSize > 2000 are tagged INIT_LARGE_FUNC and
+//        forced to RECOMPILE (not nop-stubbed). Prevents the Phase F4 bug where init__Fv
+//        (large, spawns threads) was silently nop'd.
+//
+// Rule 21 DMA_CHAIN_TTE_RISK tag: Functions that call both a DMA Send variant AND touch
+//        VIF1-range MMIO (0x10009000) are tagged DMA_CHAIN_TTE_RISK. Flags potential
+//        TTE=0 + embedded VIFcodes patterns (Phase F7 root cause).
+//
+// Rule 22 IOP_RPC_DISPATCH tag: Detects the sceSifCallRpc / sceSifBindRpc pattern + sid
+//        constant scan. Extracts the SID literal if found, emits it into JSON for
+//        cross-referencing with ps2_iop.cpp known SIDs.
+//
+// Rule 23 ARCHIVE_IO tag: Detects DATA.DAT / DATA.HD2 string references inside I/O wrapper
+//        functions (from Phase F6). Tags for human review; these are game-specific archive
+//        stubs that need real implementations, not nop returns.
+//
+// Rule 24 PAD_POLL_LOOP tag: Detects the busy-wait pattern: small function, calls
+//        scePadGetState (or has a loop branch + jal), byteSize < 200. Phase F3.5 lesson:
+//        always flag pad-state polling loops early.
+//
+// Rule 25 (reserved/skipped)
+//
+// Rule 26 CTOR_FIELD_WRITER: __ct__ that writes *(this+K); never nop-stub
+// Rule 27 VTABLE_SETTER: CTOR + lui+addiu constant -> *(this+K) (vtable)
+// Rule 28 POLL_RETURN_CONSUMER: Tiny returner polled by a backward-branching caller
+// Rule 29 A0_PASSTHROUGH_RETURNER: move $v0,$a0/$a1 — auto-stub returning 0 breaks chains
+// Rule 30 PROCESS_TERMINATOR: _Exit/abort/TerminateLibrary — never nop_stub
+// Rule 31 LIBGCC_INTRINSIC: __[u]div/mod/mul/fix/floatXXdiYY libgcc helpers
+// Rule 32 GIF_PATH3_HAZARD: Touches GIF CTRL/CHCR or GS PRIM offset (0x00)
+// Rule 33 Z_BUFFER_ALIAS_RISK: ZBUF reg + dsll32/dsrl32 shift-24 pattern (4HH font)
+// Rule 34 MPEG_DECODER_TRAP: Calls sceIpu*/sceMpeg*/sceDvd* or refs mpeg.irx
+// Rule 35 DISPFB_WRITER: Writes GS reg 0x59/0x5B (DISPFB1/DISPFB2)
+// Rule 36 VIF1_TAGHI_BUILDER: VIF1 channel MMIO + dsll32/dsrl32 (DMAtag tag-high)
+// Rule 37 TAIL_CALL_INDIRECT: Terminal jr $reg (reg!=ra) as a call/computed flow
+// Rule 38 INDIRECT_CALL_T9: jalr $t9 count > 0 (vtable / PIC dispatch)
+// Rule 39 mainloop_depth: BFS depth from MainLoop (-1 if unreachable)
+// Rule 40 init_chain_depth: BFS depth from entry/_start
+// Rule 41 archive_io_callers: Per ARCHIVE_IO function, named caller list
+// Rule 42 jalSites dedup: Set semantics on (callSitePc,target) — fixes 3-count anomaly
+// Rule 43 IS_SCE_GIF_PK_REF_LOAD_IMAGE: Bullseye for the 4HH/Path3 guard
+// Rule 44 PATH3_INITIATOR: Writes to GIF CHCR (0x1000A000) — Path3 starters
+// Rule 45 SCE_GIF_PK_FAMILY: sceGifPk*/sceVif1Pk* roster
+// Rule 46 TEX0_REG_WRITER: GS reg 0x06/0x07 writers (TEX state corruption hunt)
+// Rule 47 PRIM_REG_READER: Reads GS reg 0x00 (PRIM corruption witnesses)
+// Rule 48 RGBAQ_WRITER: Writes GS reg 0x01 (vertex color setters)
+// Rule 49 DMA_KICK_PATTERN: Writes any DMA channel CHCR base (+0x00)
+// Rule 50 DMA_QWC_TADR_WRITER: Writes any DMA channel +0x20 (QWC) / +0x30 (TADR)
+// Rule 51 MICROCODE_UPLOADER: VIF1 MMIO + load from .text/.data (MPG payload)
+// Rule 52 AUDIO_RPC_HANDLER: sceSd*/sceSpu2*/libsd.irx audio path
+// Rule 53 MESWIN_LOADER: Refs string "meswin" — dialogue rendering pipeline
+// Rule 54 MC_TRANSITION_GATE: *ForMC/*McCheck*/*McError* small gates (FinishForMC pattern)
+// Rule 55 known_globals: JSON map of known the game gp-relative offsets
+// Rule 56 is_top_priority_fix: Derived: any community-bullseye tag is set
+// Rule 57 focus_set: Top-level array of every top-priority function
+// Rule 58 CORRECTED GS privileged MMIO map (0x12000070=DISPFB1, 0x12000090=DISPFB2, ...)
+// Rule 59 ACCESSES_IPU_MMIO: 0x10002000-0x10003000 — MPEG decoder hardware
+// Rule 60 WRITES_IPU_CMD: 0x10002000 — the MPEG kick (sub-MPEG_DECODER_TRAP)
+// Rule 61 GIF_PATH3_REG_TOUCHER: GIF_P3CNT (0x10003090) or GIF_P3TAG (0x100030A0)
+// Rule 62 GIF_FIFO_DIRECT_WRITER: 0x10006000 — bypass-DMA GIF write
+// Rule 63 VIF1_FIFO_DIRECT_WRITER: 0x10005000 — bypass-DMA VIF1 write
+// Rule 64 VIF0_FIFO_DIRECT_WRITER: 0x10004000
+// Rule 65 ACCESSES_VU_MICROMEM: VU0/VU1 micro-mem ranges (0x11000000/0x11008000)
+// Rule 66 ACCESSES_VU_DATAMEM: VU0/VU1 data-mem ranges
+// Rule 67 VIF_OPCODE_BUILDER: lui constant matches MPG/MSCAL/DIRECT/UNPACK opcode
+// Rule 68 VIF_MPG_OPCODE_BUILDER: lui 0x4A__ pattern (microcode upload)
+// Rule 69 VIF_MSCAL_OPCODE_BUILDER: lui 0x14__/0x15__ (kick)
+// Rule 70 VIF_DIRECT_OPCODE_BUILDER: lui 0x50__/0x51__ (GIF inline)
+// Rule 71 VIF_UNPACK_OPCODE_BUILDER: lui 0x60__-0x7F__ (vertex upload)
+// Rule 72 DMA_TAG_BUILDER: lui constant matches CNT/REF/REFS/CALL/RET/END/REFE
+// Rule 73 PSMT4HH_REFERENCE: lui/ori constant == 0x2C (font Z-buffer alias PSM)
+// Rule 74 SBUS_IOP_COMM_TOUCHER: 0x1000F200 (MSCOM) / 0x1000F210 (SMCOM)
+//
+// Rule 75 DISPFB_SDK_WRITER: Callee in {sceGsPutDispEnv, sceGsSetDispEnv, sceGsSetCRTC,
+//        mgSetDispEnv, sceGsResetGraph} — picks up SDK-routed DISPFB writers that
+//        the raw-MMIO Rule 35/58 misses. Includes GS-dump runtime corroboration input:
+//        optional folder of `*.gs.summary.json` from gs_dump_to_summary.py.
+//
+// Rule 76 PATH3_KICK_VIA_DMA_API: Caller of sceDmaSend*/sceGifSendChain*/
+//        sceGsSwapDBuff/sceGsExecStoreImage — the SDK-routed Path3 starters
+//        (raw-CHCR Rule 44 misses them).
+//
+// Rule 77 (reserved/skipped)
+//
+// Rule 78 VRAM_TBP_OVERLAY: Constants (lui/ori/addiu/li) matching runtime-witnessed
+//        tex0_tbps or vram_upload_tbps; emitted as `tbp_constants_loaded` + intersection
+//        with merged runtime as `tbp_runtime_confirmed`. TBP list gated on GS-side evidence
+//        (trampolines reported "TBP constants").
+//
+// Rule 79 GS_IRQ_HANDLER_SAFE_STUB: Name matches Signal/Finish/Label/Intc/sceGsSyncH/V
+//        handler shape AND all loaded GS-dump captures show IMR fully masking GS IRQs →
+//        tag as safe-stub candidate (decoration; no auto disposition flip).
+//
+// Rule 80 runtime_corroboration: Per-function block cross-checking static bullseye
+//        predictions against the merged runtime evidence. Adds tags:
+//        RUNTIME_CONFIRMED — at least one bullseye prediction has a witness.
+//        RUNTIME_DORMANT_GLOBAL — bullseye predictions but zero runtime witness.
+//        RUNTIME_MENU_ONLY — PSMT4HH_REFERENCE only witnessed in UI checkpoints
+//        (Inventory/Pause/Character/UI scenes), not in 3D-scene captures.
+//        gs_runtime_evidence top-level JSON block with per-checkpoint facts + merged unions.
+//
+// Rule 81 focus_set re-rank: Confirmed entries first, dormant last.
+//
+// Rule 82 CTOR_MULTI_FIELD_INITIALIZER: Ctor / Initialize that writes >= 5 distinct
+//        this+K slots in first 40 instructions. F33 caught __ct__11mgCDrawPrimFv nop-stubbed
+//        → manager/PRIM/Q/Z slots all garbage → entire Begin/Texture/Color chain dead.
+//        Firewalled against STUB classification (forceRecompile).
+//
+// Rule 83 DRAWING_CHAIN_DEPTH: BFS from GS-bullseye roots (sceGifPk family, PATH3_INITIATOR,
+//        mgEndFrame, Begin__11mgCDrawPrim). Functions with chain_depth <= 6 firewalled
+//        against STUB. Locks in F33's TitleModeDraw -> PrimQuad -> SetSpriteEnv -> Begin chain.
+//
+// Rule 84 LIFECYCLE_LAZY_INIT_GUARD: Initialize* / Begin__ / Open* / Acquire* whose first
+//        instructions read this+0x00 and branch on zero, with byteSize > 50. The
+//        "if (manager==null) { install manager; }" pattern that F33 had to manually override.
+//        Firewalled.
+//
+// Rule 85 BITBLTBUF_T4HH_UPLOADER: Function writes BITBLTBUF (GIF reg 0x50) AND loads
+//        PSMT4HH/4HL/8H constant. The F32 BITBLTBUF.dpsm=0x2C upload bullseye. Tagged
+//        separately from generic PSMT4HH_REFERENCE (which is sampler-side TEX0.psm) so
+//        runtime menu_only does not deprioritize these. RUNTIME_MENU_ONLY refinement:
+//        skip the tag when the function is a BITBLTBUF_T4HH_UPLOADER or drawing_chain_depth <= 3.
+//
+// Rule 86 VIF_BUILDER counter wiring: counters now incremented; per-func vif_opcodes_built[] retained.
+// Rule 87 PSMT constant — expand match: Now also matches addiu/li-zero, ori-zero, single-imm li
+//        for 0x2C/0x24/0x1B/0x13/0x2D (T4HH/T4HL/T8H/PSMCT16/T4).
+// Rule 88 LIBGCC_INTRINSIC exact-name: Hardcoded list (__divdi3 etc.) wired alongside regex;
+//        PS2 64-bit single-reg ABI tag.
+// Rule 89 JALR_T9 accept-any-flow: Counter no longer gated on flow type; tail_call_indirect splits direct vs $t9.
+// Rule 90 SPR_SYNC split fields: uses_spr / has_sync_instr / spr_sync_combined emitted separately.
+// Rule 91 BITBLTBUF_T4HH depth-2: Caller of an uploader also tagged via asset_upload_traces
+//        post-pass; runtime menu_only no longer suppresses.
+//
+// Rule 92 CTOR class+global+vtable: Demangled __ct__ class name, vtable install offset,
+//        vtable target addr, caller mode (direct_only / indirect_only / dual / unobserved),
+//        assigned-to-global flag, sibling ctor calls, ctor_risk_tier (CRITICAL / HIGH / MEDIUM / LOW).
+//
+// Rule 93 CLASS_REGISTRY top-level: classes section grouping ctors / dtor / methods /
+//        vtable_addr / has_virtual_draw / instantiation_sites.
+//
+// Rule 94 VIRTUAL_DISPATCH_SITES: Per-func list of `lw $rX,K($a0); lw $rY,K2($rX); jalr $rY`
+//        dispatch sites; slot offset captured.
+//
+// Rule 95 GLOBAL_RETURN_TRACKING: For every jal site, look ahead for `sw $v0, +imm($gp)`
+//        to discover ctor->global bindings. Catches F46.5 TitleCamera null-deref class of bugs.
+//        Auto-extends known_globals.
+//
+// Rule 96 GIF_NLOOP_DOUBLE_COUNT_RISK: Function that calls both makeGiftagAplusD/
+//        MakeGiftagAplusD and closePacketGifTag (Rule 86 F37).
+//
+// Rule 97 PAD_BUTTON_MASK_CONSUMER: andi/and against a known PS2 pad mask constant.
+//        Emits pad_masks_tested[] with friendly names.
+//
+// Rule 98 OVERRIDE_CLASSIFICATION: Parses game_override.cpp helper bodies; tags
+//        each binding as nop_stub / constant_return / state_machine / probe / real_shim;
+//        flags retire_candidate.
+//
+// Rule 99 FILE_PATH_SPRINTF_SOURCE: Caller of LoadFile2/sceCdRead/sceOpen whose $a0
+//        argument was set by sprintf with %s format; emits the format string when resolvable.
+//
+// Rule 100 FRAME_CLOCK_DRIVER: Function calls sceGsSyncV / WaitVSync / mgEndFrame;
+//        emit per-func + collect frame_clock_drivers[].
+//
+// Rule 101 SIF_CALL_RPC_FID: Capture the constant passed in $a1 to sceSifCallRpc
+//        (function-id) alongside SID.
+//
+// Rule 102 SCEVU0_HELPER_MUSTIMPL: Whitelist sceVu0* matrix/vector helpers; never
+//        auto-stubbed; emitted with vu0_helper_family.
+//
+// Rule 103 ASSET_UPLOAD_TRACES: Cross-references gs_runtime_evidence vram_upload_tbps_union
+//        and bitbltbuf_dpsms_union against per-func ori/li constants + writes_bitbltbuf_reg.
+//        Back-solves which ELF func should emit the missing T8 dbp=0x2720 dpsm=0x13 upload.
+//
+// Rule 104 CURRENT_PHASE_INPUTS: Expected upload manifest (dpsm/dbp pairs per phase)
+//        consumed by asset_upload_traces.
+//
+// Rule 105 CALL_CHAINS: save_to_map_load / title_to_menu / texture_upload — pre-computed
+//        forward callgraphs to bullseye sinks.
+//
+// Rule 106 BUILD_INVARIANTS: Build cmd + do-not-modify list emitted for downstream tools.
+// Rule 107 PHASE_TRACE_FLAGS: Inventory of the game_TRACE_* env flags.
+//
+// Rule 108 C++ DEMANGLER: Itanium-style __ct__<digits><name>F<args>, __dt__, __vt__,
+//        method-mangled names. Adds class_name+method_name to per-func record.
+//
+// Rule 109 DIFF MODE: If prior triage_map.json sits next to output, emit `delta` section
+//        listing new/changed/removed funcs.
+//
+// Rule 110 OVERRIDE_COVERAGE_REPORT: For every game_override binding, flag retire_candidate
+//        based on current static signals.
+//
+// Rule 111 SDK_CALLER_DEDUP_COUNT: Companion *_via_sdk_caller depth-1 metric for every
+//        count-zero raw-MMIO detector.
+//
+// Rule 112 SCHEMA_VERSION: 12.0 (v12 adds Rules 165-177).
+//
+// Rule 113 GIF_TAG_INLINE_BUILDER: 4-stride store cluster (0/8/0x10/0x18) to a common base,
+//        with stored constants whose upper byte encodes a GIFtag REGS/FLG field. Catches
+//        mgEndFrame / drawing-prim packet builders that the v8 raw-MMIO detectors miss.
+//
+// Rule 114 BITBLTBUF_MACRO_SEQUENCE: Function stores const 0x50/0x51/0x52/0x53
+//        (BITBLTBUF / TRXPOS / TRXREG / TRXDIR) — a complete upload macro regardless of dpsm.
+//        Auto-sets writesBitbltbufReg.
+//
+// Rule 115 DMA_CHCR_START_KICK: Loads const 0x101 (STR | TIE) AND writes to a known DMA
+//        channel CHCR (Path3 starter detection).
+//
+// Rule 116 DMA_SOURCE_CHAIN_TAG_BUILDER: Stores composite const with high nibble
+//        0x10/0x30/0x40/0x50/0x60/0x70 at offset 0 of any base — CNT/REF/REFS/CALL/RET/END
+//        source-chain DMA tags.
+//
+// Rule 117 VIF_TAG_STORED_IMMEDIATE: Any store of const-tracked reg whose upper byte
+//        matches VIF_OPCODES — captures MPG/MSCAL/UNPACK built ahead of DMA kick
+//        (Rule 67 detected lui only).
+//
+// Rule 118 DMA_TAG_STORED_IMMEDIATE: Same for high-nibble DMA tag ids.
+//
+// Rule 119 COMPOSITE_MMIO_RECOVERY: Tracks lui+ori|addiu|or composite values per reg and
+//        matches against every EE peripheral range. Fixes MMIO miss when Ghidra doesn't
+//        ref-flag the synthesised addr (the F26 vu_micromem=0 / F31 vif1 chunk class
+//        of false negatives).
+//
+// Rule 120 SYSCALL_TRAMPOLINE: addiu $v1,$zero,N; syscall; jr ra stub — names the function
+//        from EE_SYSCALL_NAMES (db-syscalls.md).
+//
+// Rule 121 BACKWARD_BRANCH_SYNC_WAIT: Small body, backward branch, polls a load/syscall
+//        in body — F24 / F27 / F28 host-wait blocker class. Tagged HOST_WAIT_CANDIDATE
+//        when also in mainLoopShield.
+//
+// Rule 122 INFINITE_SPIN_LOOP: 1-2 BB function whose only branch targets its entry. Same
+//        family as F24's never-returning dispatch path; quietly retired by the F23c libgcc
+//        unblock. INFINITE_SPIN_LOOP requires storeOps==0 (copy loops stored every iteration
+//        -> NOP-patch would corrupt data).
+//
+// Rule 123 INFINITE_FAIL_LOOP: Backward branch into a `break`/`syscall` / `nop`-only block
+//        — assertion / panic loops.
+//
+// Rule 124 IRX_LOADER: >=2 calls to sceSifLoadModule, or 1 call + IRX path string ref.
+//        IOP-side init function.
+//
+// Rule 125 IOP_REBOOT_HANDLER: Calls sceSifRebootIop.
+//
+// Rule 126 RENDER_FRAME_ENTRY: Name match against the the game render frame entry list
+//        (mgEndFrame*, mgEndDraw*, mgBeginFrame*, BeginDrawing*, EndDrawing*).
+//
+// Rule 127 STRUCT_INITIALIZER: Non-ctor func that writes >=4 distinct +K($a0) slots.
+//        Catches mgInit-style initializers the ctor demangler misses.
+//
+// Rule 128 FUNCTION_POINTER_TABLES: Scans non-.text initialized blocks for runs of >=3
+//        valid function entry pointers (tag-tolerant for boxed pointers). Discovers
+//        vtables Ghidra didn't auto-create. Tags entries DISPATCH_TABLE_TARGET and
+//        table-reading funcs TABLE_DISPATCH_CALL. Anonymous classes named Class_0xADDR / slot N.
+//
+// Rule 129 MODULE_CLUSTERS: Connected components on jal edges. Each function gets module_id;
+//        module addr lists emitted at top level. Useful for grouping mg*/mgC*/CScene/CMap/CMenu code.
+//
+// Rule 130 NAME_PREFIX_MODULES: Prefixes of length 2-6 occurring >=5 times — surfaces
+//        engineer-visible subsystems independent of callgraph.
+//
+// Rule 131 KNOWN_FUNCTION_ADDRESSES: Hardcoded address -> {name,phase,role,criticality}
+//        map from PROJECT_STATE.md so the report tool can lay out priority lists without
+//        re-deriving them. (+v11.3 block): VU1 model render+kick chain, character draw chain,
+//        CRunScript event VM, front-end, treemap/pad path, UI-text repros.
+//
+// Rule 132 the game_KNOWN_TBP_LABELS: VRAM heatmap labels per memory invariants doc
+//        (T8_map=0x2720, font_4HH=0x10E0, CLUT_T4HH=0x3FDC, mgDBuff_fbp=0x68,
+//        HUD_font_cache=16284..16316). (+G-era atlas/CLUT pages 0x2aa0 title,
+//        0x2920/0x2c20 fukusel/cursor, 0x3fd4/0x3fd8 CLUTs).
+//
+// Rule 133 RUNTIME_INVARIANTS: Top-level section listing every invariant confirmed
+//        across all 9 GS dumps (Path1/2 dead, REGLIST/IMAGE2 never used, IMR=0x7F00,
+//        PMODE=0x7F23, FRAME PSM=0, ZBUF PSM=1, HUD pages 16324..16348). Lets the
+//        report tool gray-out functions whose only output is into a confirmed-dead pipe.
+//        (+G-era): EE_SCRATCHPAD_DMA_CH8_9_REQUIRED, SUBWORD_DMA_STR_KICK,
+//        VU1_XGKICK_LIVE_FOR_CHARACTER_MODELS, STALE_PTR_CACHE_CTOR, UNFUNDED_GUEST_HEAP_OOM,
+//        EVENT_VM_AUDIO_GATED_STALL, LIVE_PAD_IS_read_pad_stub, the game_KEY_GLOBALS roster.
+//
+// Rule 134 CALL_CHAINS: Pre-computed forward callgraphs for the 5 critical chains:
+//        save_to_map_load / title_to_menu / texture_upload / frame_loop / render_chain.
+//        (+character_model_vu1 / event_script_vm / costume_select).
+//
+// Rule 135 PAD_INPUT_SCRIPTS: Working PAD_INPUT scripts from F40/F42/F46 fix logs
+//        — embedded so the runtime side can re-use them as headless input templates.
+//        (+F64 dungeon/opening, +G9 costume).
+//
+// Rule 136 SCORE_FOCUS_SYNTH: Fallback for focus_set when zero bullseyes fire —
+//        picks top-32 by static score.
+//
+// Rule 137 TRIAGE_ADVISORY_TOML: New TOML appendix [triage_advisory] with nop / patch /
+//        force_recompile categorised lists, each line carrying a 4-tag prioritised comment.
+//
+// Rule 138 STUB_TOML_TAG_COMMENTS: Every spliced stub/skip entry gets ` # TAG1,TAG2,TAG3`
+//        so ps2recomp.exe operators can triage at a glance.
+//
+// Rule 139 DISCOVERED_IOP_SIDS_SECTION: Aggregated map of every detected SID with its caller
+//        list — captures ezMIDI / save data / loader RPCs the hardcoded KNOWN_IOP_SIDS table misses.
+//
+// Rule 140 COP2_DESTMASK_VERIFY: VU0-macro COP2 ops with a PARTIAL dest field (.xy / .z / .xyz ...).
+//        F51.8 ROOT CAUSE: the recompiler emitted the COP2 dest-component blend mask in REVERSED
+//        lane order, so every partial-dest op wrote X/Y/Z into the wrong SIMD lane → ALL
+//        VU0-macro 3D perspective transforms degenerate (off-screen) → dungeon black for 50+ phases.
+//        Emits per-func partial/full counts + dest_fields and a top-level `cop2_partial_dest_risk`
+//        list (Vertex__11mgCDrawPrim, mgInversMatrix, mgClipBox*, mgDistVector*). Firewalled against STUB.
+//
+// Rule 141 STATIC_INIT_MANIFEST: For every `__sinit_*` (no jal caller — runs only via the
+//        global-ctors table) emit the globals/vtables it installs + UNCALLED_STATIC_INIT. F50.4/F50.7:
+//        un-run __sinit leaves a global object's vtable pointer null → its virtual init dispatch
+//        silently no-ops (MainScene+0x10548=__vt__6CScene; CRandomCircle / CGeoStone).
+//        Top-level `static_init_manifest` is replayable.
+//
+// Rule 142 MEMORY_ALLOCATOR_NEVER_STUB: Allocator / pool-init / placement-new / array-ctor
+//        (memoryInit, Alloc__9mgCMemory, __nw__, construct_new_array, stAlloc, SetHeapMem).
+//        F50.1/F50.2: auto-stubbing one returns 0 → null pool → construct-on-null = garbage
+//        vtable PC (masquerades as a bad ctor). Forced RECOMPILE; top-level `memory_allocators` list.
+//
+// Rule 143 GUEST_LOCK_HOG_CANDIDATE: Thread yield/spin function that may hold the single
+//        guest-execution mutex without releasing it (GamePadStep → RotateThreadReadyQueue syscall 0x2B).
+//        F49.5/F50 menu→dungeon deadlock.
+//
+// Rule 144 EABI_ARG_T0: Function reads $t0 ($a4) before defining it — consuming the MIPS-EABI
+//        5th integer arg. F50.1/F50.2: the game passes arg5 in $t0, not on the stack; a CRT/runtime
+//        override must match.
+//
+// Rule 145 MAP_CLUT_PSMCT16_UPLOADER: BITBLTBUF writer that loads a PSMCT16 (dpsm=0x2)
+//        constant. F50.8-F50.11: the dungeon map texture subsystem (tbp=0x2580 / CLUT cbp=0x2980
+//        PSMCT16) is separate from mgCTextureManager and its CLUT is NEVER transferred → empty CLUT → black.
+//
+// Rule 146 COMPUTED_JUMP_TARGETS: Back-solves computed `jr $reg` switch tables: harvests
+//        Ghidra's resolved jump-table destinations per site and emits them (top-level
+//        `computed_jump_targets`) so the recompiler can pre-populate its indirect-jump dispatch
+//        instead of panicking on an unknown target. Sites with no resolved target →
+//        COMPUTED_JUMP_UNRESOLVED (the real risk set). (jalr $t9 vtable slots remain
+//        in virtual_dispatch_sites.)
+//
+// Rule 147 COP2_SPECIAL_OPS_REVIEW: EE COP2 macro ops beyond the Rule 140 dest-mask blends
+//        — vdiv/vsqrt/vrsqrt (EFU Q latency), vclipw (CLIP flag), vrnext/vrget/vrxor (R register),
+//        vmr32, vwaitq/p, vopmsub/vopmula, xgkick. The F51.8 fix log explicitly says to spot-check
+//        these; they share the COP2 codegen path that reversed the dest mask. Firewalled against STUB.
+//
+// Rule 148 FPU_NONIEEE_SENSITIVE: EE FPU is non-IEEE (no denormals/NaN, truncation, soft div/sqrt).
+//        Flags funcs that write FPU control (ctc1/cfc1) or use div.s/sqrt.s/rsqrt.s while FPU-heavy
+//        — naive host float diverges (collision/physics drift).
+//
+// Rule 149 SDK_COVERAGE_AUDIT: Cross-references every SDK-shaped callee (sce*) against the known
+//        rosters + game_override bindings; emits `sdk_coverage_audit` partitioned into must_implement /
+//        must_stub / coverage_gap (called but neither bound nor recognized → needs a stub/implement
+//        decision before the recomp build).
+//
+// Rule 150 OVERLAY_LOADER: Detects EE code-overlay exec/load callees (LoadExecPS2/ExecPS2/
+//        LoadModuleBuffer ...). Static recompilers assume a flat address space; an overlay game needs
+//        per-bank TOMLs. Empty for a single-binary game (the game) — absence is itself the finding.
+//
+// Rule 151 STEP1_NAME_MISMATCH: name@addr disagrees with ELF symbol → stale/wrong-region DAC.toml;
+//        forced RECOMPILE + review. Also: TRUNCATED NAMES (v9-era input truncated mangled C++ labels).
+//        step1 tokens bind by ADDRESS so these are NOT wrong-region drift - they were inflating
+//        name_mismatches. Now detected (isTruncatedNameOf), counted as step1_truncated_names, tagged
+//        STEP1_TRUNCATED_NAME, and passed through the NORMAL keep gate (decided on real traits)
+//        instead of force-rescued with a misleading "wrong-region?" reason.
+//
+// Rule 152 dual-binding hygiene: entry in BOTH stubs and skip -> keep stub.
+//
+// Rule 153 RUNTIME-HANDLER ROSTER: scrapes ps2xRuntime (tries D:\ps2r\PS2Recomp\ps2xRuntime first,
+//        then asks) for implemented handler names; bound stubs without a handler get
+//        NO_RUNTIME_HANDLER -> native_impl_needed + review; per-func has_runtime_handler in JSON.
+//        Roster-backed keeps beat promote passes (handler existence = intent + tested implementation).
+//
+// Rule 154 ELF IDENTITY GUARD: DAC.toml `elf_hash` vs this ELF's md5. output [general] now carries
+//        `elf_hash = "<md5>"` of THIS ELF, so the next re-entrant run gets the Rule 154 identity
+//        guard automatically.
+//
+// Rule 155 (reserved - veto override)
+//
+// Rule 156 MAINLOOP SHIELD DEPTH-3: capped 768; was direct callees only.
+//
+// Rule 157 SUGGESTED TRIAGE RETURNS: per bound stub: reta0 / ret0_or_ret1_ab_test / ret0 / ret0_then_verify.
+//
+// Rule 158 OVERLAY GUARD: overlay-block bindings vetoed; out-of-text bindings tagged OUT_OF_TEXT_BINDING
+//        -> review. The keep gate is BYPASSED for LOCKED entries and no promote pass (drawing-chain /
+//        ctor-risk / sceVu0 / v13 binding firewall / Rule 161b) ever rescues the binding. Only the
+//        Rule 158 overlay veto beats a lock.
+//
+// Rule 159 SYSCALL_TRAMPOLINE POLICY: trampoline shape decided FIRST: STUB only when the runtime
+//        implements the handler by name; SKIP only when xref count is 0; otherwise RECOMPILE
+//        (recompiler turns `syscall` into runtime->handleSyscall(), always correct).
+//
+// Rule 160 STRIPPED TRAMPOLINE NAME RECOVERY: decoded $v1 immediate -> EE_SYSCALL_NAMES -> roster
+//        -> bind "Handler@0xADDR".
+//
+// Rule 161 DYNAMIC_CODE_LOADER: FlushCache + file/archive evidence (same body or layered across
+//        the call graph). PRECISION: dynamic_code_loaders over-fired on the game (34 false: asset loaders
+//        that stream DATA.DAT/HD2 + FlushCache per DMA). Real code loader must EXECUTE loaded bytes
+//        - now requires an overlay/exec callee (LoadExecPS2/ExecPS2/LoadModuleBuffer) in the same body,
+//        and the layered Rule 161b post-pass only runs when the ELF has >=1 overlay-exec callee
+//        anywhere (overlay_loaders>0). the game (flat ELF, overlay_loaders=0) -> 0. the game is a single flat
+//        ELF: statistic should be 0; non-zero is a project red flag.
+//
+// Rule 162 SPR_DMA_STAGER / SUBWORD_DMA_STR_KICK: The G26 root-cause class, generalised. Flags funcs
+//        that program a fromSPR(ch8 0x1000D000)/toSPR(ch9 0x1000D400) DMA channel, and funcs that kick
+//        a DMA via a sub-word (sb/sh) store into a CHCR word (the STR bit). the game stages each VU1 model
+//        VIF packet in EE scratchpad then copies it into mgVif1Packet via a fromSPR DMA started by a
+//        `sb` to CHCR+1; a runtime whose writeIORegister only dispatches GIF/VIF1 word writes drops it
+//        -> empty model slot -> no XGKICK. Detected in BOTH the Ghidra-ref and the composite-MMIO-recovery
+//        scan paths; per-func + top-level `spr_dma_stagers` list (with override_hookable for the fix strategy).
+//
+// Rule 163 VU1_DOUBLE_BUFFER_FRAMER: Builds BASE+OFFSET VIFcodes = the TOPS double-buffer framing
+//        the model needs (the context G23/G24 hunted). Derived from vifOpcodesBuilt (BASE 0x03 +
+//        OFFSET 0x02 both present).
+//
+// Rule 164 STALE_PTR_CACHE_CTOR: A ctor that caches a derived global pointer (a Get*Ptr/Man/Data/Mgr
+//        callee result) into this+K. If it runs before the source is funded it caches 0/stale and the
+//        downstream Draw silently skips (G12 cursor / G13 names / F50.4). Repair idempotently in a
+//        per-frame wrapper, never in the ctor. Per-func emit: derived `override_hookable` (= called
+//        only via indirect jalr/jr $t9, never via direct jal). registerFunction overrides are consulted
+//        ONLY for indirect dispatch; a direct-jal-only function is NOT hookable that way and must be
+//        fixed by wrapping the jal target or codegen.
+//
+// ================================================================
+// v12 RULES (165-177) - the game G27-G52 retrospective + general PS2 RTT/present hazards
+// ================================================================
+//
+// Rule 165 VRAM_OVERLAP_MAP (top-level `vram_overlap_pairs`): cross-function VRAM page-aliasing
+//        hunt. Every G-phase from G33-G50 chased one bug class - a FRAME/ZBUF target whose VRAM
+//        page ALIASES a texture/CLUT page (the model RTT fbp=0x139 == tex page 0x2720; the costume
+//        Z block 0x1a00 == menu-text VRAM, G45). This pass intersects each function's loaded
+//        VRAM-page constants (tbpConstantsLoaded ∩ KNOWN_TBP_LABELS) with the GS reg KIND it
+//        writes (FRAME / ZBUF / TEX0 / BITBLTBUF / DISPFB) and emits pairs of functions that
+//        target the SAME labelled page with DIFFERING kinds → RTT_ALIAS / Z_ALIAS / TIMESHARE.
+//        One static signal that would have front-loaded ~20 phases of blind page hunting.
+//
+// Rule 166 RTT_TARGET (per-func): writesFrameReg AND loads a const that hits a known texture/CLUT
+//        page (or fbp 0x139) → tag RTT_TARGET + rtt_aliased_pages[]. Firewalled against STUB
+//        (G37/G44 had to hand-protect the in-place RTT writers).
+//
+// Rule 167 ZBUF_VRAM_ALIAS_RISK (per-func): writesZbufReg AND a loaded const hits a FRAME/texture
+//        page → the G45 root (synthetic Z block aliases live VRAM). Generalises the narrow v4
+//        Rule 33 (which only caught the 4HH dsll32 font shape).
+//
+// Rule 168 SKINNED_DRAW_CHAIN refresh: KNOWN_FUNCTION_ADDRESSES extended with the G26-G52
+//        skinned-model chain (DrawDirect__12CActionChara/CCharacter2, COutLineDraw, DrawDivSprite4,
+//        DeformMesh, MotionProc2, GetLWMatrix, mgInversMatrix, mgGetDrawRect). Marks skin_chain_role.
+//
+// Rule 169 VF0_DEPENDENT_INVERSE (per-func): a matrix-inverse helper (name ~Invers / mgInvers*)
+//        that uses COP2 + an EFU_Q-latency op (vdiv/vrsqrt → Q) feeding a vmulq. The G40 50-phase
+//        collapse: Q = vf0.w/det, and vf0.w must be the HW-hardwired 1. Emits a note that the
+//        runtime must pin vu0_vf[0]=(0,0,0,1). Firewalled against STUB.
+//
+// Rule 170 AUDIO_COMPLETION_GATE (per-func): backward-branch wait that polls an audio/stream
+//        completion signal (sceSifCheckStatRpc / StreamOpenState / sceSd* / voice-done flag).
+//        F63/F64 event stall class AND the #3 active foundation blocker (audio). Tagged
+//        AUDIO_GATED_STALL when also a sync-wait loop.
+//
+// Rule 171 MEMCARD_IO (per-func): calls the sceMc*/libmc save-data family (card detect / dir /
+//        file / format). #4 active blocker (save/load) - not yet implemented, so a roster of the
+//        subsystem entry points is pure forward-help. Top-level `memcard_io_roster`.
+//
+// Rule 172 EVENT_SCRIPT_VM: CRunScript VM materialised in the game_KNOWN + RUNTIME_INVARIANTS
+//        (exe/resume/run @0x1873c0/0x1871e0/0x187210; layout +0x38 vmcode / +0x3c done / +0x40
+//        skip / +0x08 ext table; opcodes 3 push / 0x13 call / 0x15 ext / 0xf|0x1b end / 0x17 yield).
+//
+// Rule 173 PRESENTATION_FIELD_STATE (per-func): writes a GS privileged field/interlace reg
+//        (SMODE1 / SMODE2 / PMODE / CSR / SYNCV) beyond plain DISPFB. #5 blocker (interlace jitter).
+//        Top-level `presentation_field_writers`. General PS2: the deinterlace/field-timing surface.
+//
+// Rule 174 DISPLAY_BUFFER_FLIP (per-func): a DISPFB writer that is also a frame-clock driver or
+//        loads >=2 distinct fbp-shape constants → the double-buffer/present boundary signal G49
+//        needed (clear private Z once per flip). General PS2 double-buffer detection.
+//
+// Rule 175 CLUT_CACHE_INVALIDATOR (per-func): issues TEXFLUSH (GS reg 0x3F) or writes TEX0 while
+//        loading a known CLUT-page const. PROJECT_STATE flags CLUT upload / cache-invalidation as a
+//        top corruption suspect after allocator fixes; no prior detector. Top-level `clut_cache_ops`.
+//
+// Rule 176 PERF_HOT_FRAME_PATH (per-func, derived): mainloop_depth in [0,3] AND has a backward
+//        branch (inner loop) AND calleeCount high → frame-hot optimisation candidate. #7 blocker
+//        (few FPS). Static cannot measure frequency; ranks the suspects. Top-level `perf_hot_candidates`.
+//
+// Rule 177 GS_LOCAL_MEM_BUDGET (top-level `gs_local_mem_budget`): sum of distinct labelled VRAM
+//        pages referenced statically; flags >4MB (PS2 GS local memory) → bank-switched VRAM the
+//        recompiler's flat model would break. Pairs with Rule 150 overlay logic on the GS side.
+//
+// ================================================================
+// v13 RULES (178-189) - the game G53-G82 title-3D retrospective + general PS2 hazards
+// ================================================================
+//
+// Rule 178 CONDITIONAL_INIT_ON_GLOBAL (per-func): instruction-scan for the shape
+//        `lw $rX, <global>; beq/beqz $rX,$zero,skip; <stores that configure an object>`.
+//        G58/G81 KILLER (cost ~6 phases): TitleModeInit's camera-setup block runs only
+//        `if (TitleCamera != 0)`; headless TitleCamera@0x377E38 was still 0 (its producer
+//        had not run) → the block was skipped → the camera kept its ctor defaults
+//        (mgCCameraFollow distance=40/height=30/look-at-origin) → the rock cavern was out of
+//        frame. Same shape as the empty scene-camera slots (CScene::Initialize ordering).
+//        Generalises Rule 84 (LIFECYCLE_LAZY_INIT_GUARD, which only saw `this+0`) to a
+//        GLOBAL-guarded configuration block. Captures guard_globals + configured_slots.
+//        Firewalled against STUB. Feeds Rule 186.
+//
+// Rule 179 RENDER_MODE_SELECTOR (per-func): a function that picks a per-mesh render mode
+//        (copy/passthrough vs transform/VU-packer) and writes the selector into a render-info
+//        struct. G75-G80 (cost ~6 phases): every title map-part mesh was flagged TRANSFORM
+//        (`mgRENDER_INFO+0xfc4`!=0 → VU packers 0x1c50/0x1ff0/0x1dc0 whose +2048/ADC gate culls
+//        100%) instead of COPY (passthrough packer 0x1b68 that carries tbp + per-vertex ADC) →
+//        flat-blue background. The discriminator is `mgClipInBoxW@0x12f380` ret stored as the mode
+//        flag. Detected as: callee in the clip-test/render-mode roster OR name in the render-mode
+//        roster, with a store of the result. Top-level `render_mode_selectors`. Firewalled.
+//
+// Rule 180 VERTEX_LIGHTING_NORMAL_TERM (per-func): per-vertex directional-light path. G82:
+//        the title rock per-vertex SHADE had RED ≈ half HW (runner R≈36 vs HW R≈66) → MODULATEd
+//        brown texture went green everywhere; prime suspect = the title map-part directional-light
+//        N·L sign / normal-transform applied with the wrong sign (HW brightens R, runner darkens it).
+//        Detected as: callee in {GetLightInfo, mgSetLight, mgSetAmbient, mgSetFogParam, *Light*} OR
+//        (COP2 OUTER_PRODUCT/dot feeding an RGBAQ writer), with a draw-chain anchor. Top-level
+//        `vertex_lighting_terms`. Firewalled. Static cannot prove the sign — it ranks suspects.
+//
+// Rule 181 VTABLE_TAILCALL_THUNK (per-func): a terminal `jr $rX` (rX∉{ra,t9}) where $rX was
+//        loaded from `*(objptr + K)` (a vtable slot) — the inherited-virtual tail-call. G59:
+//        Draw__8mgCFrame@0x1387f0 (`a1=0; jr *(vtable+0x44)`) was mistranslated by the recompiler
+//        into a return-to-dispatcher ("Function at address 0xN not found") instead of completing
+//        the inherited call → mgDraw exited early → process fell through to _Exit. Distinct from
+//        Rule 37 (generic indirect tail) and Rule 38 (jalr $t9). Emits tailcall_vtable_slots[].
+//        Firewalled (recompiler-dispatch risk). General PS2: every C++ game with virtual inheritance.
+//
+// Rule 182 RTT_NO_RESTORE (per-func): an RTT_TARGET (Rule 166) FRAME writer that targets an RTT/
+//        texture page but does NOT also write a display-buffer FRAME (0x0/0x68) back in the same
+//        body → GS render-target / scissor left pointing at the RTT page. G79: after Title→New
+//        Game→costume→back, the costume RTT (fbp=0x139) was never restored → title 3D bg flat-blue.
+//        Top-level `rtt_no_restore`. General PS2: RTT scope leaks.
+//
+// Rule 183 TITLE_CHAIN_ROSTER refresh: KNOWN_FUNCTION_ADDRESSES + KNOWN_TBP_LABELS +
+//        RUNTIME_INVARIANTS + CALL_CHAINS extended with the G53-G82 title-3D facts
+//        (TitleLoop/TitleModeInit/TitleMapDraw, the clip-test render-mode discriminator, the
+//        copy vs transform packer addresses, mgRENDER_INFO lightInfo layout, TitleCamera globals,
+//        the per-vertex-RED-deficit invariant). Pure data — stops the report re-deriving them.
+//
+// Rule 184 VU_FLAG_PIPELINE_UPLOADER (per-func, advisory): an EE function that uploads VU
+//        microcode (Rule 51/68 MICROCODE_UPLOADER, or mgSendVuProg). The EE script cannot scan VU
+//        μcode, but G71 found the VU1 interpreter never maintained MAC/STATUS flags, so any
+//        FMEQ/FMAND/FMOR/FCAND→IBxx in an uploaded program evaluated against constant 0. Top-level
+//        `vu_flag_pipeline_uploaders` flags the upload sites whose programs need flag upkeep verified.
+//
+// Rule 185 LOOP_STATE_MODEL (top-level `loop_state_model`): the front-end/dungeon LoopNo legend +
+//        the mutually-exclusive front-end sub-states. G79: `LoopNo=3 && titleMode=2 && menuId=0x17`
+//        is an illegal-concurrent state (TitleLoop New-Game menu + MenuCostumeSel both live) that
+//        leaked GS state. Materialised so the report can flag draws reachable in contradictory states.
+//
+// Rule 186 INIT_ORDER_DEPENDENCY (top-level `init_order_hazards`, general PS2): cross-function
+//        producer→consumer ordering for globals. Builds global→writers (ctor/return-to-global/
+//        __sinit installs) and global→guarded-readers (Rule 178). Emits INIT_ORDER_HAZARD when a
+//        global is read-and-branched-on by a reader whose only writer is a __sinit / uncalled
+//        static-init (headless-init-ordering gap, the most reusable G58/G81 signal).
+//
+// Rule 187 PACKED_RGBAQ_BUILDER (per-func, advisory, general PS2): a GIF_TAG_INLINE_BUILDER
+//        (Rule 113) that also writes RGBAQ. G82: GIF PACKED RGBAQ is a SPREAD layout (R=byte0,
+//        G=byte4, B=byte8, A=byte12) — a contiguous parser gets (R,0,0,0). Flags the builders whose
+//        emitted PACKED vertex colour the runtime GS decode must read as spread. Top-level
+//        `packed_rgbaq_builders`.
+//
+// Rule 188 FRAME_RESUME_RISK (per-func, advisory, general PS2): a large draw/frame function that
+//        can be preempted/resumed mid-body (re-entered at an interior label) — G58/G59 resumed
+//        TitleMapDraw at an interior label with the wrong $sp ($0x830 too low) → garbage saved-$ra
+//        → bad-PC. Approximated as: byteSize large AND (render-frame-entry OR drawing_chain_depth in
+//        [0,6]) AND terminal indirect flow. Top-level `frame_resume_risk`.
+//
+// Rule 189 SCHEMA_VERSION: 13.0 (v13 adds Rules 178-189).
+//
+// ================================================================
+// v15 RULES (190-198) - the game G83-G115 retrospective + general PS2 ADC/packer,
+//                       allocator-coherence, frame-pacing, camera hazards
+// ================================================================
+//
+// Rule 190 GIFTAG_PRIM_CLASS_SELECTOR (per-func + top-level `prim_class_selectors`):
+//        an EE function that builds the VIF UNPACK selector qword (the game `qword38`) a VU
+//        dispatcher reads to PICK the PRIM-class packer (indep-tri / tristrip / trifan /
+//        copy). G77-G115 (cost ~30 phases) hand-decoded this every phase. the game anchor =
+//        CreateRenderInfoPacket__12mgCVisualMDT@0x1404d0; the selector bit formula is
+//        materialised as static metadata (bit0=fc0||fc4, bit1=fc4, bit2=desc+0x2c, ...).
+//        Detected as: name in PRIM_SELECTOR_NAMES, OR (builds a VIF UNPACK opcode AND is a
+//        render-mode selector). Firewalled against STUB. General PS2: every mg/libgraph-style
+//        VU engine routes primitives through a selector qword.
+//
+// Rule 191 ADC_KICK_VERTEX_SOURCE (per-func + top-level `adc_kick_sources`): the 50-phase
+//        title hole (G65-G115). The VU `+2048`/0x800 add that sets the per-vertex ADC
+//        ("Add Drawing Kick" suppression = tristrip strip-restart) is UNCONDITIONAL in the
+//        packer, so HW's selective ~60% pattern is driven by the per-vertex INPUT (the vertex
+//        `.w` / a per-vertex ADC flag in the EE-built geometry stream). The runner zeroes /
+//        uniformly-sets it (blue void or over-draw). Flags EE-side per-vertex geometry builders
+//        and classifies adc_source = input_driven_xyz3 (writes both XYZ2+XYZ3 = restart control
+//        present) / uniform_xyz2 / constant_kick (only the 0x800 add). Firewalled. THE signal
+//        that would have front-loaded the active blocker. General PS2: any VU1 tristrip game.
+//
+// Rule 192 XYZ2_VS_XYZ3_KICK_WRITER (per-func + top-level `kick_mode_writers`): GS reg 0x05
+//        XYZ2 (draw-kick) vs 0x0D XYZ3 (no-kick / strip-restart) writer. Both already in
+//        KNOWN_GS_REGS but had no detector. Alternating them is per-vertex drawing-kick control;
+//        in PACKED mode the ADC bit is bit 111 of the XYZ qword (a SPREAD field, cf. Rule 187
+//        RGBAQ). Detected via the const-tracked A+D reg store (0x05/0x0D). General PS2.
+//
+// Rule 193 TEXTURE_RELOAD_INTERLEAVE_HAZARD (per-func + top-level `texture_reload_interleave`):
+//        G90-G97 (cost ~8 phases). A "per-block reload" function binds MANY TEX0 up front then
+//        draws MANY batches in a loop, so each batch samples whatever was last-bound (HW binds
+//        one TEX0 per strip). Detected as: writes TEX0 AND a per-batch loop (backward branch)
+//        AND draw-kick evidence (gifTagInlineBuilder / path3 / indirect dispatch), or a
+//        texture-manager name. Advisory. General PS2: any block-batched texture pipeline.
+//
+// Rule 194 ALLOCATOR_FAMILY_COHERENCE (top-level `allocator_family` + `allocator_family_split`):
+//        the PROJECT_STATE regen caveat #1. malloc/_malloc_r, free/_free_r, realloc, calloc,
+//        memalign/_memalign_r, operator new/delete MUST all land on the SAME side (all runtime
+//        or all recompiled); a split heap frees through a different allocator → silent
+//        alignment / CLUT / menu corruption. Audits the whole family's dispositions and raises
+//        ALLOCATOR_FAMILY_SPLIT. A build-correctness invariant the map now enforces. General PS2.
+//
+// Rule 195 VSYNC_COUPLED_GAME_STEP (per-func + top-level `frame_pacing_drivers`): the #2
+//        foundation blocker (perf). The title game-loop steps logic only when render completes
+//        (~0.3-1.5x/s vs 30; G103/F52 half-rate). Flags functions that BOTH advance game state
+//        (writes globals, fan-out) AND wait on vsync/frame completion (FRAME_CLOCK_DRIVER /
+//        sceGsSyncV / mgEndFrame) in one body, shallow from the main loop. Static cannot measure
+//        FPS - it names the coupling site so the perf phase starts at the right function.
+//        Complements Rule 176 PERF_HOT_FRAME_PATH. General PS2.
+//
+// Rule 196 VIEW_PROJECTION_MATRIX_WRITER (per-func + top-level `view_projection_writers`):
+//        G98/G99. The SHARED camera/view-projection matrix (the game mgRENDER_INFO@0x380ec0 +0x10
+//        view / +0x110 proj / +0x150) was wrong while the per-part WORLD matrices were
+//        byte-perfect. Separates view/projection writers from world-matrix writers so an
+//        "off-screen geometry" bug routes to the camera source, not the (correct) world
+//        transform. Detected via camera/projection callee+name roster + a write to a renderinfo
+//        global. Firewalled. General PS2: every 3D engine with a shared view matrix.
+//
+// Rule 197 OBJECT_ARRAY_CTOR (per-func + top-level `object_array_ctors`): the G92 deferred
+//        georama null-vtable. An array of polymorphic objects (CEditMap+0x1054[i]) each needs
+//        its vtable; an auto-stubbed element ctor leaves vtable+K null → the indexed virtual
+//        dispatch (`*(base+i*stride + K)` jalr) faults (DrawSub__8CEditMapFi pc-zero). Extends
+//        Rule 142 construct_new_array with the construct-loop + the indexed-dispatch consumer.
+//        Firewalled against STUB. General PS2: any C++ game with arrays of virtual objects.
+//
+// Rule 184+ VU_EXEC_HAZARD_MANIFEST (top-level `vu_exec_hazard_manifest`): consolidation of the
+//        four worst VU/COP2 interpreter divergences this project burned phases on - Q-register
+//        latency (G87), MAC/STATUS/CLIP flag pipeline (G71), vf0=(0,0,0,1) (G40), COP2 dest-mask
+//        lane order (F51.8), plus EE-FPU/denormal clamp - emitted per relevant function as a
+//        checklist so a future regen/route cannot silently miss one. Derived from existing
+//        traits (no new scan). General PS2.
+//
+// Rule 198 SCHEMA_VERSION: 14.0 (v15 adds Rules 190-198; refreshes Rule 184).
+//
+// ================================================================
+// v15.1 RULES (199-202) - PCSX2 source cross-check (D:\ps2r\pcsx2-master).
+// All EE constants verified against PCSX2 (GS A+D reg ids GSRegs.h; PACKED ADC =
+// U32[3]&0x8000 = bit 111; DMA tag ids REFE=0..END=7 Dmac.h; VIF cmd map
+// Vif_Codes.cpp). These add the few HW behaviours PCSX2 models that no rule flagged.
+// ================================================================
+//
+// Rule 199 VIF_UNPACK_DECOMPRESS_STATE (per-func + top-level `vif_unpack_decompress_state`):
+//        PCSX2 Vif_Unpack.cpp/Vif_Codes.cpp. The VIF1 UNPACK path decompresses with STMOD
+//        (mode 1 = dest+MaskRow, mode 2 = difference-accumulate), STMASK (per-component 2-bit:
+//        0 data / 1 MaskRow / 2 MaskCol / 3 SKIP the VU-mem write), STCYCL (cl/wl fill-skip),
+//        STROW/STCOL (the row/col regs), plus ITOP/BASE/OFFSET (double-buffer framing). A
+//        runtime VIF that ignores mode/mask/row/col/cycle silently corrupts the unpacked
+//        vertex/colour stream. the game stages every VU1 model packet through UNPACK (G26 delivery).
+//        Detected from const-tracked VIF command bytes, GATED on independent VIF evidence
+//        (vifOpcodesBuilt / VIF1 MMIO / microcode upload / double-buffer framer). General PS2.
+//
+// Rule 200 GS_XYOFFSET_GUARD_BAND (per-func + top-level `xyoffset_guard_writers`): writes GS
+//        XYOFFSET (A+D 0x18/0x19) — the 12.4 guard-band centre (typ. 2048<<4). G88: the title
+//        rock's `+2048` integer bias places verts into the ±2047 guard band; an XYOFFSET /
+//        bias mismatch fans geometry off-screen. Pairs with Rule 191's kick_const_add (0x800).
+//        General PS2: every VU1 geometry game biases into the guard band.
+//
+// Rule 201 GS_TEX1_FILTER_WRITER (per-func + top-level `tex1_filter_writers`): writes GS TEX1
+//        (A+D 0x14/0x15) — MMAG/MMIN texture filter (+ MXL/LCM mip). G8: the game UI/HUD fonts are
+//        point-sampled (TEX1=0x201, MMAG/MMIN=0); "fix the blur" by changing filter mode is
+//        wrong. Flags the filter-mode setters so a sampling bug routes to TEX1, not the sampler.
+//        General PS2.
+//
+// Rule 184++ VU_EXEC_HAZARD_MANIFEST adds P_LATENCY: PCSX2 VUops.cpp confirms the VU EFU
+//        P-register pipeline (ESADD/ERSADD/ELENG/ERLENG/EATAN/ESUM/ESQRT/ERSQRT/ESIN/EEXP +
+//        WAITP) - reading P before WAITP gives the stale pipelined value (the exact G87 Q-latency
+//        class, separate register). Every microcode uploader's program is flagged to verify P
+//        (and Q) latency + MAC/STATUS/CLIP flags. EE script cannot scan VU microcode; it marks
+//        the upload sites. General PS2.
+//
+// Rule 202 SCHEMA_VERSION: 14.1 (v15.1 adds Rules 199-202; refreshes Rule 184 with P_LATENCY).
+//
+// ================================================================
+// v15.2 RULES (203-206) - skill cross-check ([project_skill_folder]). The agent skill the
+// porter reads names FOUR silent-wrong recompiler codegen classes (SKILL.md L13;
+// 10-agent-guardrails L27/L64 "audit the WHOLE class"): VU0/COP2 partial-dest masks
+// (Rule 140), MMI, control-reg maps, branch thunks (Rule 181). It also lists CFC2/CTC2
+// in the 15-vu1-gs-debugging §2 VU checklist and a "sampled page with no upload" decisive
+// probe in §4.1. These add the rosters that let the AI sweep those whole classes.
+// ================================================================
+//
+// Rule 203 MMI_SIMD_OP (per-func + top-level `mmi_codegen_risk`): the EE R5900 Multimedia
+//        Instructions (128-bit SIMD integer: PADDW/PEXTLW/PMADDW/PCPYLD/PMFHL/PPACW/QFSRV...
+//        + the pipeline-1 ops MULT1/DIV1/MADD1/MFHI1/MFLO1). The recompiler can emit wrong
+//        C++ for these (lane/pack/HI1-LO1 errors) SILENTLY, exactly like the partial-dest
+//        class. No prior rule flagged them. Emits the roster so the AI can "audit the whole
+//        class" (guardrails L64) instead of one op at a time. General PS2.
+//
+// Rule 204 COP2_CONTROL_REG_ACCESS (per-func + top-level `cop2_control_reg_access`; adds
+//        CONTROL_REG_MAP to the Rule 184 manifest): CFC2/CTC2 read/write a VU0 control
+//        register by ARCHITECTURAL macro index (15-vu1-gs-debugging §2.1: STATUS=16, MAC=17,
+//        CLIP=18, R=20, I=21, Q=22, P=23, TPC=26, CMSAR0=27, FBRST=28, VPU_STAT=29,
+//        CMSAR1=31). The F51.8 audit found a control-reg map defect; the recompiler can map
+//        the numeric field to the wrong reg. Completes the §2 VU checklist coverage. Captures
+//        the index when resolvable. General PS2.
+//
+// Rule 205 UNFUNDED_TEXTURE_PAGE (top-level `unfunded_texture_pages`, advisory): the
+//        15-vu1-gs-debugging §4.1 DECISIVE probe materialised statically - a labelled VRAM
+//        page that is SAMPLED (a TEX0 writer loads its const) but has NO BITBLTBUF uploader
+//        in the static set → the "game binds a tbp/cbp the texture manager never uploads to"
+//        black-texture class. Static can miss composite/computed uploads (false positives),
+//        so it is flagged "confirm with a runtime BITBLTBUF-dbp counter", not asserted.
+//        Derived from the Rule 165 vramPageWriters map. General PS2.
+//
+// Rule 206 SCHEMA_VERSION: 14.2 (v15.2 adds Rules 203-206; surfaces the v15 hazard counts in
+//        functions_index statistics{}; fixes the per-func/index schema_version stamp).
+//
+// PIPELINE (v11.3): the script now asks "FIRST run for this ELF?" up front:
+//   - YES -> full pipeline. Delegates the Step-1 export to ExportPS2Functions via runScript,
+//            then enriches; emits csv + assembly + decompiled + flowchart + unified TOML + triage_map.json.
+//   - NO -> INCREMENTAL. Re-emits triage_map.json and MODIFIES the live config IN PLACE, but only
+//           when the executable content actually changed. Preserves # LOCKED + manual edits via the
+//           re-entrant+LOCK machinery. Pick NO whenever the ELF is unchanged.
+//
+// POST-REGEN COP2 (v11.3): emitCop2FixScript writes fix_cop2_destmask.py (RECOMP path pre-filled) +
+//   post_regen_steps.md beside the output, derived from this run's cop2_partial_dest_risk model.
+//   The F51.8 fix CANNOT run inside this Ghidra pass, so it ships with the map and is listed as
+//   a mandatory post-regen step.
+//
+// RE-ENTRANT INPUT: The step1 input may now be a PREVIOUS enricher output (evolving config_auto_recomp.toml
+//   workflow) instead of the frozen DAC.toml. writeUnifiedConfig sanitizes its own artifacts on read
+//   (header comment block, advisory pointer comment, any old [triage_advisory] section), so headers/advisory
+//   never stack across runs. COUNT RECOMPUTE: stub_count / skip_count recomputed from ACTUAL array contents.
+//   PROVENANCE SPLIT: entries under a "# --- Triage Enricher" marker parse as step1_source = "enricher_prev"
+//   (vs "exporter") in the JSON. LOCK: `"name@0xADDR",  # LOCKED` trailing comment or a `locked = ["..."]`
+//   array in [general]: the keep gate is BYPASSED and no promote pass ever rescues the binding. Use for
+//   deliberate F-phase stubs that carry no host-boundary evidence. Locked entries: STEP1_LOCKED tag,
+//   "step1_locked": true, statistic step1_locked_kept.
+//
+// OUTPUT-SURFACE POLICY (v11): unified TOML = executable safe subset + pointer comment; full advisory
+//   content (incl. all Advisory categories) moved to triage_map.json "triage_advisory" as {entry, tags} objects.
+//   UTF-8 everywhere (utf8Writer/utf8Reader); jsonString full RFC 8259 control-char escaping.
+//   EE_SYSCALL_NAMES rebuilt against pcsx2 R5900OpcodeImpl.cpp + ps2xRuntime Dispatcher.cpp.
+//   detectSyscallTrampoline $v1 always wins over spurious scalars; single-line TOML arrays parsed + rewritten correctly.
+//   STEP1 VETTING: DAC.toml stub/skip entries are no longer trusted blindly and skipped. Every function is analyzed
+//   and included in the JSON with provenance (origin = auto/step1/override); inherited bindings survive only through
+//   a high-confidence keep gate (host-boundary evidence). RADAR REWRITE: Exact-name set + word-boundary prefix
+//   families replace bare startsWith(). v13 BINDING FIREWALL: post-pass rescues stub/skip entries that are
+//   address-taken callbacks / dispatch-table targets / init-chain members / render-critical. v13 DETECTOR GATES:
+//   PSMT4HH_REFERENCE requires GS-side context; VIF_OPCODE_BUILDER requires independent VIF/DMA/GIF evidence;
+//   A+D writer flags need >=2 distinct GS reg ids. v14: SIF_PACKET_BUILDER demotion; native_impl_needed + review
+//   advisory lists. SKIP no longer fires on hasSyscall||hasCOP0 (game ISRs use di/ei/mfc0); only bare syscall-trampoline
+//   shapes skip.
+//
 // OUTPUTS:
 //   1. config_auto_recomp.toml - UNIFIED config ready for ps2recomp.exe
-//      (merges Step 1 config.toml + our triage additions)
 //   2. triage_map.json - full DNA map with tags for the report tool
 //
-// WHAT'S NEW IN v4 (learned from DC2 Phase F22-F31):
-//   Rule 26 CTOR_FIELD_WRITER       __ct__ that writes *(this+K); never nop-stub
-//   Rule 27 VTABLE_SETTER           CTOR + lui+addiu constant -> *(this+K) (vtable)
-//   Rule 28 POLL_RETURN_CONSUMER    Tiny returner polled by a backward-branching caller
-//   Rule 29 A0_PASSTHROUGH_RETURNER move $v0,$a0/$a1 - auto-stub returning 0 breaks chains
-//   Rule 30 PROCESS_TERMINATOR      _Exit/abort/TerminateLibrary - never nop_stub
-//   Rule 31 LIBGCC_INTRINSIC        __[u]div/mod/mul/fix/floatXXdiYY libgcc helpers
-//   Rule 32 GIF_PATH3_HAZARD        Touches GIF CTRL/CHCR or GS PRIM offset (0x00)
-//   Rule 33 Z_BUFFER_ALIAS_RISK     ZBUF reg + dsll32/dsrl32 shift-24 pattern (4HH font)
-//   Rule 34 MPEG_DECODER_TRAP       Calls sceIpu*/sceMpeg*/sceDvd* or refs mpeg.irx
-//   Rule 35 DISPFB_WRITER           Writes GS reg 0x59/0x5B (DISPFB1/DISPFB2)
-//   Rule 36 VIF1_TAGHI_BUILDER      VIF1 channel MMIO + dsll32/dsrl32 (DMAtag tag-high)
-//   Rule 37 TAIL_CALL_INDIRECT      Terminal jr $reg (reg!=ra) as a call/computed flow
-//   Rule 38 INDIRECT_CALL_T9        jalr $t9 count > 0 (vtable / PIC dispatch)
-//   Rule 39 mainloop_depth          BFS depth from MainLoop (-1 if unreachable)
-//   Rule 40 init_chain_depth        BFS depth from entry/_start
-//   Rule 41 archive_io_callers      Per ARCHIVE_IO function, named caller list
-//   Rule 42 jalSites dedup          Set semantics on (callSitePc,target) - fixes 3-count anomaly
-//   Plus:   known_gs_registers map + extended IOP module string list
-//
-// WHAT'S NEW IN v5 (community gap closure + DC2 next-step bullseye):
-//   Rule 43 IS_SCE_GIF_PK_REF_LOAD_IMAGE  Bullseye for the 4HH/Path3 guard
-//   Rule 44 PATH3_INITIATOR        Writes to GIF CHCR (0x1000A000) - Path3 starters
-//   Rule 45 SCE_GIF_PK_FAMILY      sceGifPk*/sceVif1Pk* roster
-//   Rule 46 TEX0_REG_WRITER        GS reg 0x06/0x07 writers (TEX state corruption hunt)
-//   Rule 47 PRIM_REG_READER        Reads GS reg 0x00 (PRIM corruption witnesses)
-//   Rule 48 RGBAQ_WRITER           Writes GS reg 0x01 (vertex color setters)
-//   Rule 49 DMA_KICK_PATTERN       Writes any DMA channel CHCR base (+0x00)
-//   Rule 50 DMA_QWC_TADR_WRITER    Writes any DMA channel +0x20 (QWC) / +0x30 (TADR)
-//   Rule 51 MICROCODE_UPLOADER     VIF1 MMIO + load from .text/.data (MPG payload)
-//   Rule 52 AUDIO_RPC_HANDLER      sceSd*/sceSpu2*/libsd.irx audio path
-//   Rule 53 MESWIN_LOADER          Refs string "meswin" - dialogue rendering pipeline
-//   Rule 54 MC_TRANSITION_GATE     *ForMC/*McCheck*/*McError* small gates (FinishForMC pattern)
-//   Rule 55 known_dc2_globals      JSON map of known DC2 gp-relative offsets
-//   Rule 56 is_top_priority_fix    Derived: any community-bullseye tag is set
-//   Rule 57 focus_set              Top-level array of every top-priority function
-//
-// WHAT'S NEW IN v6 (PCSX2 source-grounded):
-//   Rule 58 CORRECTED GS privileged MMIO map (0x12000070=DISPFB1, 0x12000090=DISPFB2, ...)
-//   Rule 59 ACCESSES_IPU_MMIO      0x10002000-0x10003000 - MPEG decoder hardware
-//   Rule 60 WRITES_IPU_CMD         0x10002000 - the MPEG kick (sub-MPEG_DECODER_TRAP)
-//   Rule 61 GIF_PATH3_REG_TOUCHER  GIF_P3CNT (0x10003090) or GIF_P3TAG (0x100030A0)
-//   Rule 62 GIF_FIFO_DIRECT_WRITER 0x10006000 - bypass-DMA GIF write
-//   Rule 63 VIF1_FIFO_DIRECT_WRITER 0x10005000 - bypass-DMA VIF1 write
-//   Rule 64 VIF0_FIFO_DIRECT_WRITER 0x10004000
-//   Rule 65 ACCESSES_VU_MICROMEM   VU0/VU1 micro-mem ranges (0x11000000/0x11008000)
-//   Rule 66 ACCESSES_VU_DATAMEM    VU0/VU1 data-mem ranges
-//   Rule 67 VIF_OPCODE_BUILDER     lui constant matches MPG/MSCAL/DIRECT/UNPACK opcode
-//   Rule 68 VIF_MPG_OPCODE_BUILDER lui 0x4A__ pattern (microcode upload)
-//   Rule 69 VIF_MSCAL_OPCODE_BUILDER lui 0x14__/0x15__ (kick)
-//   Rule 70 VIF_DIRECT_OPCODE_BUILDER lui 0x50__/0x51__ (GIF inline)
-//   Rule 71 VIF_UNPACK_OPCODE_BUILDER lui 0x60__-0x7F__ (vertex upload)
-//   Rule 72 DMA_TAG_BUILDER        lui constant matches CNT/REF/REFS/CALL/RET/END/REFE
-//   Rule 73 PSMT4HH_REFERENCE      lui/ori constant == 0x2C (font Z-buffer alias PSM)
-//   Rule 74 SBUS_IOP_COMM_TOUCHER  0x1000F200 (MSCOM) / 0x1000F210 (SMCOM)
-//   Plus: known_gs_priv_regs, vif_opcode_constants, dma_tag_ids, pcsx2_baseline metadata
-//
-// WHAT'S NEW IN v7 (GS-dump runtime corroboration):
-//   Input: optional folder of `*.gs.summary.json` produced by
-//          gs_dump_to_summary.py from PCSX2 .gs dumps. One per checkpoint
-//          (SCE_Logo / Title / 3D_Scene / Inventory / Pause / Cutscene / ...).
-//          Merged into runtime evidence used to corroborate static rules.
-//   Rule 75 DISPFB_SDK_WRITER       Callee in {sceGsPutDispEnv,sceGsSetDispEnv,
-//                                   sceGsSetCRTC,mgSetDispEnv,sceGsResetGraph}
-//                                   - picks up SDK-routed DISPFB writers that
-//                                   the raw-MMIO Rule 35/58 misses.
-//   Rule 76 PATH3_KICK_VIA_DMA_API  Caller of sceDmaSend*/sceGifSendChain*/
-//                                   sceGsSwapDBuff/sceGsExecStoreImage - the
-//                                   SDK-routed Path3 starters (raw-CHCR
-//                                   Rule 44 misses them).
-//   Rule 78 VRAM_TBP_OVERLAY        Constants (lui/ori/addiu/li) matching
-//                                   runtime-witnessed tex0_tbps or
-//                                   vram_upload_tbps; emitted as
-//                                   `tbp_constants_loaded` + intersection
-//                                   with merged runtime as
-//                                   `tbp_runtime_confirmed`.
-//   Rule 79 GS_IRQ_HANDLER_SAFE_STUB Name matches Signal/Finish/Label/Intc/
-//                                   sceGsSyncH/V handler shape AND all
-//                                   loaded GS-dump captures show IMR fully
-//                                   masking GS IRQs -> tag as safe-stub
-//                                   candidate (decoration; no auto disposition flip).
-//   Rule 80 runtime_corroboration   Per-function block cross-checking
-//                                   static bullseye predictions against the
-//                                   merged runtime evidence. Adds tags:
-//                                   RUNTIME_CONFIRMED         - at least one
-//                                       bullseye prediction has a witness.
-//                                   RUNTIME_DORMANT_GLOBAL    - bullseye
-//                                       predictions but zero runtime witness
-//                                       across loaded checkpoints.
-//                                   RUNTIME_MENU_ONLY         - PSMT4HH_REFERENCE
-//                                       only witnessed in UI checkpoints
-//                                       (Inventory/Pause/Character/UI scenes),
-//                                       not in 3D-scene captures.
-//   Rule 81 focus_set re-rank       Confirmed entries first, dormant last.
-//   Plus: gs_runtime_evidence top-level JSON block with per-checkpoint
-//         facts + merged unions; auto-populated pcsx2_baseline checkpoints.
-//
-// WHAT'S NEW IN v7.1 (F32-F34 retrospective):
-//   Rule 82 CTOR_MULTI_FIELD_INITIALIZER  Ctor / Initialize that writes
-//          >= 5 distinct this+K slots in first 40 instructions. F33 caught
-//          __ct__11mgCDrawPrimFv nop-stubbed -> manager/PRIM/Q/Z slots all
-//          garbage -> entire Begin/Texture/Color chain dead. Firewalled
-//          against STUB classification (forceRecompile).
-//   Rule 83 DRAWING_CHAIN_DEPTH         BFS from GS-bullseye roots
-//          (sceGifPk family, PATH3_INITIATOR, mgEndFrame, Begin__11mgCDrawPrim).
-//          Functions with chain_depth <= 6 firewalled against STUB. Locks in
-//          F33's TitleModeDraw -> PrimQuad -> SetSpriteEnv -> Begin chain.
-//   Rule 84 LIFECYCLE_LAZY_INIT_GUARD   Initialize* / Begin__ / Open* / Acquire*
-//          whose first instructions read this+0x00 and branch on zero, with
-//          byteSize > 50. The "if (manager==null) { install manager; }"
-//          pattern that F33 had to manually override. Firewalled.
-//   Rule 85 BITBLTBUF_T4HH_UPLOADER     Function writes BITBLTBUF (GIF reg 0x50)
-//          AND loads PSMT4HH/4HL/8H constant. The F32 BITBLTBUF.dpsm=0x2C
-//          upload bullseye. Tagged separately from generic PSMT4HH_REFERENCE
-//          (which is sampler-side TEX0.psm) so runtime menu_only does not
-//          deprioritize these.
-//   Plus: RUNTIME_MENU_ONLY refinement - skip the tag when the function is
-//         a BITBLTBUF_T4HH_UPLOADER or drawing_chain_depth <= 3.
-//
-// RULES IMPLEMENTED (17 + tags):
-//   1.  No DANGEROUS_KEYWORDS (removed - was killing game logic)
-//   2.  IOP_MODULE_STRINGS: only .IRX/.irx + specific module names (no .BIN/.DAT)
-//   3.  referencesIopModule: size cap 800 bytes (larger = game logic)
-//   4.  accessesHardware: DATA references only (not CALL/FLOW)
-//   5.  accessesHardware - ACCESSES_MMIO tag only (not disposition)
-//   6.  KSEG1 masking in all address checks (addr & 0x1FFFFFFF)
-//   7.  isKernelInternal replaces isRadarBehaviorallyDangerous (syscall+COP0 only)
-//   8.  IOP refs - STUB, kernel internals - SKIP
-//   9.  TOML parser: handles name-only AND name@address entries
-//   10. Whitelist: entry/_start exempt from all firewalls
-//   11. MainLoop shield: ML + depth-1 callees exempt (manual or auto-detect)
-//   12. $gp fallback: lui+addiu scan in entry point for stripped binaries
-//   13. SMC detection: function boundaries + instruction-at-target check
-//   14. No lui scanner for VIF (didn't work, removed)
-//   15. No VIF_DMA_UPLOAD tag (ACCESSES_MMIO covers it)
-//   16. vcallms - VU0_MICROCODE - forced STUB
-//   17. jr $reg (reg!=ra) - COMPLEX_CONTROL_FLOW tag
-//   +   ORPHAN_CODE tag for zero-xref functions
-//   +   Unified config output (ready for ps2recomp.exe)
-//
-// WHAT'S NEW IN v3 (learned from DC2 Phase F3-F12 triage):
-//
-//  Rule 18 - DC2 GAME OVERRIDE PARSER
-//      Reads a dc2_game_override.cpp (or any *_game_override.cpp) and
-//      imports every bindAddressHandler / registerFunction address as
-//      already-classified. Prevents re-stubbing functions that the
-//      runtime has already manually bound.
-//
-//  Rule 19 - CONVENTION_VIOLATION tag
-//      Detects functions where Ghidra's decompiler reports a0/a1 arg
-//      aliasing or where the function writes to $a1 as if it were a
-//      return buffer (pattern from GetFullPath__FPcPc bug in Phase F5).
-//
-//  Rule 20 - INIT_LARGE_FUNC guard
-//      Functions named *init* / *Init* / *__ct__* / *__sinit_* that
-//      have calleeCount > 10 OR byteSize > 2000 are tagged
-//      INIT_LARGE_FUNC and forced to RECOMPILE (not nop-stubbed).
-//      Prevents the Phase F4 bug where init__Fv (large, spawns threads)
-//      was silently nop'd.
-//
-//  Rule 21 - DMA_CHAIN_TTE_RISK tag
-//      Functions that call both a DMA Send variant AND touch VIF1-range
-//      MMIO (0x10009000) are tagged DMA_CHAIN_TTE_RISK. Flags potential
-//      TTE=0 + embedded VIFcodes patterns (Phase F7 root cause).
-//
-//  Rule 22 - IOP_RPC_DISPATCH tag
-//      Detects the sceSifCallRpc / sceSifBindRpc pattern + sid constant
-//      scan. Extracts the SID literal if found, emits it into JSON for
-//      cross-referencing with ps2_iop.cpp known SIDs.
-//
-//  Rule 23 - ARCHIVE_IO tag
-//      Detects DATA.DAT / DATA.HD2 string references inside I/O
-//      wrapper functions (from Phase F6). Tags for human review;
-//      these are game-specific archive stubs that need real
-//      implementations, not nop returns.
-//
-//  Rule 24 - PAD_POLL_LOOP tag
-//      Detects the busy-wait pattern: small function, calls
-//      scePadGetState (or has a loop branch + jal), byteSize < 200.
-//      Phase F3.5 lesson: always flag pad-state polling loops early.
-//
-//  Improved BUSY_WAIT_HAZARD (Rule 10 refinement):
-//      Now also fires when function contains a backward branch AND
-//      a jal to a known syscall stub (sceGsSyncV pattern from F3.5).
-//
-//  Improved STUB classification (Rule 3 refinement):
-//      `sceDevFont`, `sceDevCons`, `sceMSIn`, `sceSifAllocSysMemory`,
-//      `sceSifLoad*`, `sceSifUnload*`, `InitTLB`, `_InitTLB`,
-//      `SetTLBEntry`, `GetTLBEntry`, `InitAlarm`, `ReleaseAlarm`
-//      added to RADAR_FIREWALL_PREFIXES (all appear in dc2_game_override.cpp
-//      Group D as confirmed safe stubs).
-//
-//  ===== v15 (FF1 / Himuro-benchmark corrections) =====
-//  Benchmarked against Fatal Frame 1 (SLUS_203.88) with the Himuro decomp
-//  project as ground truth. The input toml (name-policy exporter) had:
-//    - stubbed memcpy/strcpy/sprintf/atoi/rand (pure libc compute),
-//    - stubbed the whole mc* memory-card UI + Scene*/Pad*/Dma*/str* game
-//      code ("Scene" had name-collided with the "sce" SDK prefix),
-//    - stubbed sceVu0*/sceRotMatrixXYZ VU0-macro math (broken camera/anim),
-//    - SKIPPED __ieee754_*/__kernel_*/libgcc int64+softfloat/newlib stdio
-//      internals and __do_global_ctors (broken math, dead static init).
-//  The old Rule 9 inherited all 651 entries blindly and excluded them from
-//  the JSON. v15 changes (all game-agnostic):
-//    1. Step1 stub/skip entries are fully analyzed, included in the JSON
-//       (origin="step1"), and must pass a high-confidence keep gate
-//       (step1KeepGateFailure): a STUB survives only with host-boundary
-//       evidence (syscall / SIF RPC / IRX load / IPU-MPEG / SDK-named tiny
-//       MMIO thunk); a SKIP only as a bare syscall trampoline or
-//       unreachable bootstrap. Everything else is rescued to RECOMPILE:
-//       the entry is REMOVED from the unified TOML (which stays the
-//       executable safe subset) and documented in the triage JSON's
-//       "rescued_from_step1" ledger (entry / from_section / new_decision /
-//       reason / evidence / derived_from) - v15.1 split: TOML executes,
-//       JSON explains.
-//    2. RADAR name matching rebuilt: exact-name set + word-boundary prefix
-//       families (matchesFamilyPrefix). The old bare startsWith() stubbed
-//       `exponent` via prefix "exp" and would hit tangent/logo_*/power_*.
-//       Pure-computation names (mem*/str*/math/malloc/_Z mangled C++/
-//       static-init sections/__cxa_*) removed from stub candidacy: for pure
-//       EE code, RECOMPILE is always correct; a stub is only correct if the
-//       runtime services it.
-//    3. A radar stub now requires name match AND trait corroboration
-//       (hasHostBoundaryEvidence / hasWeakSdkThunkEvidence).
-//    4. v13 firewall: SIF-RPC gateways excluded from init-chain-only rescue
-//       (they sit on init chains by construction, like syscall wrappers);
-//       step1 bindings kept on HARD evidence are only unwound by
-//       address-taken / dispatch-table conflicts (sent to review).
-//    5. Override-bound functions included in JSON (origin="override",
-//       disposition=OVERRIDE), never emitted into advisory arrays.
-//    6. JSON schema 12.2: per-function origin / step1_disposition /
-//       step1_rescue_reason; statistics step1_inherited_kept /
-//       step1_rescued_to_recompile / override_bound.
-//
-//  ===== v15.2 (output-surface split + input hygiene) =====
-//    7. EMIT_VERBOSE_TOML_ADVISORY (default false): the TOML now carries
-//       ONLY [general] / active stubs / active skip / [patches] plus a
-//       short pointer comment. The full advisory content (nop, patch,
-//       force_recompile, native_impl_needed, review, patch-instruction
-//       candidates) is emitted into triage_map.json "triage_advisory" as
-//       structured {entry, tags} objects. TOML executes, JSON explains.
-//    8. Rule 151 STEP1_NAME_MISMATCH: a step1 "name@addr" entry whose name
-//       differs from the real ELF symbol at that address (and the symbol is
-//       not a FUN_/sub_ default) marks a stale or wrong-region input toml
-//       (US vs EU/JP address drift). Binding a handler to the wrong
-//       function is the worst failure mode -> forced RECOMPILE + review.
-//    9. Rule 152 dual-binding hygiene: an entry listed in BOTH stubs and
-//       skip is an input bug - kept as stub, dropped from skip, warned.
-//
-//  ===== v15.3 (Rules 153-158) =====
-//   10. Rule 153 RUNTIME-HANDLER ROSTER (optional): user may select a
-//       ps2xRuntime checkout; handler names are scraped from src/ (handler
-//       defs taking R5900Context, raw rdram wrappers, bindAddressHandler
-//       string bindings, ps2_stubs:: refs; runner/ and build dirs never
-//       walked). Final bound stubs whose name is missing from the roster
-//       get NO_RUNTIME_HANDLER -> native_impl_needed + review, and a
-//       per-function has_runtime_handler field in the JSON.
-//   11. Rule 154 ELF IDENTITY GUARD: if the step1 toml embeds
-//       `elf_hash = "<md5>"`, it is compared with this program's hash.
-//       Mismatch = the input was built for a different ELF (revision or
-//       region) -> loud console + TOML-header warning + JSON statistic.
-//   12. Rule 155 RUNTIME_CONFIRMED VETO: GS-dump-corroborated functions
-//       (observed TBP/PSM signature in real captures) added to the v13
-//       firewall's render-critical rescue set - never left stubbed.
-//   13. Rule 156 MAINLOOP SHIELD DEPTH-3: shield BFS extended from direct
-//       callees to depth 3 (capped 768). Gate ordering updated: HARD
-//       host-boundary evidence now beats the whitelist, so per-frame SDK
-//       wrappers (sceGsSyncV) keep their stubs while per-frame game
-//       wrappers two hops below the loop are protected from stubbing.
-//   14. Rule 157 SUGGESTED TRIAGE RETURNS: every bound stub gets a JSON
-//       suggested_triage_return (reta0 / ret0_or_ret1_ab_test / ret0 /
-//       ret0_then_verify) derived from A0-passthrough + poll-target traits.
-//   15. Rule 158 OVERLAY GUARD: step1 bindings inside Ghidra overlay
-//       memory blocks are vetoed (overlays reuse addresses); enricher
-//       never auto-stubs/skips overlay code; non-overlay bindings outside
-//       [textStart,textEnd] get OUT_OF_TEXT_BINDING -> review.
-//
-//  ===== v15.4 (FF1 rerun corrections - over-rescue fixes) =====
-//  First full rerun kept only 9 of 651 inherited bindings; root causes and
-//  fixes (verified against Himuro ground truth + the real ps2xRuntime):
-//   16. SIF transport evidence: sceSifCallRpc/SetDma/SendCmd carry no
-//       syscall and don't call themselves - they kick SIF0/SIF1 DMA and
-//       touch SBUS. touchesSbus/touchesSbusFlags/SIF dma channels added to
-//       hasHostBoundaryEvidence (the whole RPC layer was being recompiled).
-//   17. ROSTER-BACKED KEEP: handler implemented in the runtime by exact
-//       name + SDK-family name match -> keep the stub (handler existence =
-//       intent + tested implementation). Beats whitelist/mainloop-shield
-//       rescue; also covers sceVu0* (runtimes ship SIMD-native math).
-//       sceGifPk*/sceVif1Pk* stay excluded (must recompile per SF3/DC2).
-//   18. v13 address-taken no longer unwinds hard-bound step1 stubs:
-//       PS2Recomp dispatch is address-keyed, so indirect calls through a
-//       taken pointer still reach the bound handler. FF1 showed addressTaken
-//       firing on EVERY 16-byte kernel wrapper (SetSyscall-style vector
-//       installs). Conflict still surfaced via ADDRESS_TAKEN_CALLBACK ->
-//       review. v8 ctor/sceVu0 promotes also respect hard-bound keeps.
-//   19. BIOS_FIREWALL_PREFIXES completed (SetGsCrt/GsPutIMR/Deci2Call/
-//       SetAlarm/Suspend-ResumeThread/EndOfHeap/OsdConfigParam/...);
-//       families += sceSd (SPU2), sceTty; exacts += sceGszbufaddr/
-//       sceSetBrokenLink/sceSetPtm/sceVpu0Reset/scePrintf/sceFs* (SDK names
-//       with lowercase continuation that defeat the boundary rule).
-//       Ground-truth re-check: 338 name matches on Himuro, zero game code.
-//
-//  OUTPUTS (unchanged filenames):
-//      config_auto_recomp.toml  - unified config for ps2recomp.exe
-//      triage_map.json          - full DNA map with new tags
-//      assembly.txt / decompiled.txt / flowchart.txt  (unchanged)
-//
-// @author Puggsy + Claude (v3: DC2 Phase F3-F12 knowledge integration)
+// @author Puggsy + Claude (v11: the game comprehensive rule reorganization)
 // @category PS2Recomp
 
 import ghidra.app.decompiler.DecompInterface;
@@ -449,10 +800,10 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 
-public class General_PS2Recomp_TriageEnricher extends GhidraScript {
+public class PS2Recomp_TriageEnricher extends GhidraScript {
 
     // =========================================================
-    // v15.2: OUTPUT-SURFACE POLICY
+    // v11 (ported from General v15.2): OUTPUT-SURFACE POLICY
     // The unified TOML is the EXECUTABLE SAFE SUBSET: [general], active
     // stubs, active skip, [patches]. All advisory material (force_recompile,
     // native_impl_needed, review, nop, patch-instruction candidates, rescue
@@ -462,10 +813,18 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // =========================================================
     private static final boolean EMIT_VERBOSE_TOML_ADVISORY = false;
 
-    // v15.5: all text outputs are written as UTF-8 regardless of platform
-    // default charset. JSON MUST be UTF-8 (RFC 8259); the old FileWriter
-    // default produced mojibake / U+FFFD bytes on Windows (cp125x) hosts.
+    // v11 (General v15.5 Bugfix S): all text outputs are written as UTF-8
+    // regardless of platform default charset. JSON MUST be UTF-8 (RFC 8259);
+    // the old FileWriter default produced mojibake / U+FFFD bytes on Windows
+    // (cp125x) hosts.
     private static PrintWriter utf8Writer(File f) throws IOException {
+        // Self-heal the output tree: every file write funnels through here, so creating the
+        // parent dir on demand guarantees index/ and functions/ exist regardless of which
+        // output location the run picked (the one-time mkdirs at setup can be a no-op when the
+        // chosen outputDir has no pre-existing index/ subdir -> FileNotFoundException).
+        File p = f.getParentFile();
+        if (p != null && !p.isDirectory() && !p.mkdirs() && !p.isDirectory())
+            throw new IOException("Cannot create output directory: " + p.getAbsolutePath());
         return new PrintWriter(new BufferedWriter(new OutputStreamWriter(
             new FileOutputStream(f), StandardCharsets.UTF_8)));
     }
@@ -491,7 +850,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     private static final long VIF1_CHANNEL_BASE = 0x10009000L;
     private static final long VIF1_CHANNEL_END  = 0x1000903FL;
 
-    // v4 Rule 32: GIF MMIO (CTRL + CHCR) - Path3 hazard hunt
+    // v4 Rule 32: GIF MMIO (CTRL + CHCR) — Path3 hazard hunt
     private static final long GIF_CTRL_BASE     = 0x10003000L;
     private static final long GIF_CTRL_END      = 0x100030FFL;
     private static final long GIF_CHCR_BASE     = 0x1000A000L;
@@ -510,8 +869,8 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     private static final long GS_ZBUF_2         = 0x4FL;
     private static final long GS_DISPFB1        = 0x59L;
     private static final long GS_DISPFB2        = 0x5BL;
-    // Known GS register name map (emitted to JSON for the report tool to label hits).
-    // Complete GIF A+D register table from pcsx2/GS/GSRegs.h (GIF_A_D_REG_*).
+    // v9.1: complete GIF A+D register table from pcsx2/pcsx2/GS/GSRegs.h
+    // (line 76-130, GIF_A_D_REG_*). Map: A+D id -> friendly name.
     private static final Map<Long,String> KNOWN_GS_REGS = new LinkedHashMap<>();
     static {
         KNOWN_GS_REGS.put(0x00L, "PRIM");
@@ -577,13 +936,13 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // FIREWALL LISTS
     // Rule 1:  No DANGEROUS_KEYWORDS (removed in v2, kept removed)
     // Rule 2:  IOP_MODULE_STRINGS - .IRX/.irx + specific module names
-    // v3 adds: Group D confirmed-safe prefixes from dc2_game_override.cpp
+    // v3 adds: Group D confirmed-safe prefixes from game_override.cpp
     // =========================================================
-    // v15 (FF1-benchmark corrections): the old RADAR_FIREWALL_PREFIXES list
-    // used bare startsWith() with short tokens. On FF1 this stubbed
-    // `exponent` (matched prefix "exp" - a 224-byte newlib float formatter),
-    // and on any game it would match `tangent`, `logo_*`, `power_*`,
-    // `freeCamera`, `sinit`, etc. Two structural fixes:
+    // v11 (ported from General v15, FF1-benchmark corrections): the old
+    // RADAR_FIREWALL_PREFIXES list used bare startsWith() with short tokens.
+    // On FF1 this stubbed `exponent` (matched prefix "exp" - a 224-byte
+    // newlib float formatter), and on any game it would match `tangent`,
+    // `logo_*`, `power_*`, `freeCamera`, `sinit`, etc. Two structural fixes:
     //  1. EXACT names vs PREFIX FAMILIES are now separate lists; families are
     //     matched with a word-boundary check (next char after the family root
     //     must not be a lowercase letter, so "sceCd"+"Read" matches but
@@ -595,10 +954,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     //     correct if a handler exists - so the safe default is RECOMPILE:
     //       - malloc/free/calloc/realloc/__builtin_new: Rule 142 already says
     //         never auto-stub allocators; the old list contradicted it.
-    //       - "_Z" stubbed EVERY Itanium-mangled C++ function - fatal on any
-    //         C++ game.
+    //       - "_Z" stubbed EVERY Itanium-mangled C++ function - fatal on a
+    //         C++ game like the game (mg*/Sg*/CScene class methods).
     //       - "__sti"/"__std"/"_GLOBAL_" stubbed static initializers - the
-    //         exact functions Rule 141 (STATIC_INIT_VTABLE_INSTALLER) exists
+    //         exact functions Rule 141 (__sinit manifest, F50.4/F50.7) exists
     //         to protect.
     //       - sin/cos/tan/sqrt/mem*/str*/sprintf: FPU/integer math the
     //         recompiler translates exactly; a host handler is an optional
@@ -606,15 +965,16 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // Matching additionally requires host-boundary trait evidence - see
     // hasHostBoundaryEvidence(). A name match alone never stubs.
     private static final Set<String> RADAR_EXACT_STUB_NAMES = new HashSet<>(Arrays.asList(
-        // DC2 Group D confirmed-safe oddballs (exact spellings)
+        // the game Group D confirmed-safe oddballs (exact spellings from
+        // game_override.cpp)
         "InitTLB","_InitTLB","SetTLBEntry","GetTLBEntry",
         "InitAlarm","ReleaseAlarm",
         "mcHearAlarm","mcDelayThread",
         "printfloat","_system_header","dmaRefImage",
         "EnableCache","DisableCache",
         "isceSifSetDma","isceSifSetDChain","_sceCallCode",
-        // v15.4: SDK names with lowercase continuation that defeat the
-        // family-boundary rule, plus TTY/FS init wrappers (FF1 benchmark).
+        // SDK names with lowercase continuation that defeat the
+        // family-boundary rule (General v15.4 FF1 benchmark set).
         "sceGszbufaddr","sceSetBrokenLink","sceSetPtm","sceVpu0Reset",
         "scePrintf","sceFsInit","sceFsReset","sceResetttyinit"
     ));
@@ -634,21 +994,18 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         "sceSymlink","sceReadlink","sceRemove","sceMkdir","sceRmdir",
         "sceFormat","sceAddDrv","sceDelDrv","sceDevctl",
         "scePowerOffHandler",
-        // v15.4: SPU2 audio + TTY debug output families (host boundaries).
+        // SPU2 audio + TTY debug output families (host boundaries).
         "sceSd","sceTty",
         "_sceCd_","_sceFsIob","_sceFsWait","_sceFs_",
-        // v9: CRI ADX middleware (SF3 / many Capcom & Sega ports). All audio /
-        // streaming runtime - STUB candidates.
-        "adx_","cri_","sj_","sjx_","sjr_","dvci","htci","svm_",
-        "lsc_","dtr_","dtx_","rna_","mwadx","acrmw",
-        // v9: PS2 SDK extras
         "sceGsfx","sceLgfx"
     };
 
-    /** v15: word-boundary family match. A family root that ends in '_' (or any
-     *  non-letter) matches as a plain prefix; otherwise the char following the
-     *  root must NOT be a lowercase letter. This keeps "sceCd"->"sceCdRead"
-     *  and "adx_"->"adx_open" while rejecting "exp"->"exponent" class bugs. */
+    /** v11 (General v15): word-boundary family match. A family root that ends
+     *  in '_' (or any non-letter) matches as a plain prefix; otherwise the
+     *  char following the root must NOT be a lowercase letter. This keeps
+     *  "sceCd"->"sceCdRead" and "_sceCd_"->"_sceCd_cd_callback" while
+     *  rejecting "exp"->"exponent" class bugs (and the game's Scene/mg game code
+     *  can never collide with the "sce" SDK families). */
     private static boolean matchesFamilyPrefix(String name, String family) {
         if (!name.startsWith(family)) return false;
         if (name.length() == family.length()) return true;
@@ -658,7 +1015,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         return !Character.isLowerCase(next);
     }
 
-    /** v15: name-only part of the stub gate (no trait evidence). */
+    /** v11 (General v15): name-only part of the stub gate (no trait evidence). */
     private boolean matchesHostBoundaryName(String name) {
         if (name.startsWith("sceVu0")) return false; // VU0 macro math: always RECOMPILE
         if (RADAR_EXACT_STUB_NAMES.contains(name)) return true;
@@ -669,36 +1026,35 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         return false;
     }
 
-    /** v15: trait corroboration required before any name-based stub binding.
-     *  "Host boundary" = the function provably leaves the EE program: kernel
-     *  syscall, SIF RPC to the IOP, IRX module loading, IPU/MPEG hardware, or
-     *  a tiny leaf thunk (classic SDK wrapper shape). COP1/COP2 usage and
-     *  plain MMIO stores are deliberately NOT evidence - the recompiler
-     *  translates those (patch_cop0 / runtime MMIO routing). */
+    /** v11 (General v15): trait corroboration required before any name-based
+     *  stub binding. "Host boundary" = the function provably leaves the EE
+     *  program: kernel syscall, SIF RPC to the IOP, IRX module loading,
+     *  IPU/MPEG hardware, or a tiny leaf thunk (classic SDK wrapper shape).
+     *  COP1/COP2 usage and plain MMIO stores are deliberately NOT evidence -
+     *  the recompiler translates those (patch_cop0 / runtime MMIO routing). */
     private static boolean hasHostBoundaryEvidence(FuncTraits t) {
         if (t == null) return false;
         if (t.hasSyscall) return true;
-        if (t.callsSifRpc || t.detectedRpcSid != 0 || !t.detectedRpcSids.isEmpty()
-            || !t.allDetectedSids.isEmpty()) return true;
+        if (t.callsSifRpc || t.detectedRpcSid != 0 || !t.discoveredRpcSids.isEmpty()
+            || !t.detectedRpcFids.isEmpty()) return true;
         if (t.refsIopModuleString || t.isIrxLoader || t.sifLoadModuleCallCount >= 1) return true;
         if (t.isAudioRpcHandler || t.isIopRebootHandler) return true;
         if (t.callsMpegFamily || t.accessesIpuMmio || t.writesIpuCmd) return true;
-        // v15.4 (FF1 rerun fix): SIF transport itself. sceSifCallRpc/SetDma/
-        // SendCmd build SIF packets and kick the SIF0/SIF1 DMA channels or
-        // touch SBUS registers - they ARE the EE<->IOP boundary, but carry no
-        // syscall and don't call themselves, so the first benchmark rescued
-        // them and recompiled the whole RPC layer.
+        // General v15.4 (FF1 rerun fix): SIF transport itself. sceSifCallRpc/
+        // SetDma/SendCmd build SIF packets and kick the SIF0/SIF1 DMA channels
+        // or touch SBUS registers - they ARE the EE<->IOP boundary, but carry
+        // no syscall and don't call themselves.
         if (t.touchesSbus || t.touchesSbusFlags) return true;
         if (t.dmaKickChannels.contains("SIF0") || t.dmaKickChannels.contains("SIF1")
             || t.dmaKickChannels.contains("SIF2")) return true;
         return false;
     }
 
-    /** v15: weak evidence - tiny leaf MMIO thunk (<=64 bytes, no calls). The
-     *  classic SDK register-poker/poller shape. Only acceptable as stub
-     *  corroboration when the name ALSO matches a known SDK family: a
-     *  game-code DMA-kick leaf (FF1: scePP1_Kick, DmaTransReq) has the same
-     *  shape and must recompile - runtime MMIO routing executes it correctly. */
+    /** v11 (General v15): weak evidence - tiny leaf MMIO thunk (<=64 bytes,
+     *  no calls). The classic SDK register-poker/poller shape. Only acceptable
+     *  as stub corroboration when the name ALSO matches a known SDK family: a
+     *  game-code DMA-kick leaf has the same shape and must recompile -
+     *  runtime MMIO routing executes it correctly. */
     private static boolean hasWeakSdkThunkEvidence(FuncTraits t) {
         return t != null && t.byteSize <= 64 && t.callOps == 0 && t.accessesMMIO;
     }
@@ -712,8 +1068,8 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         "AddDmacHandler","RemoveDmacHandler","EnableDmac","DisableDmac",
         "SetVSyncFlag","SetSyscall","SetVBlankHandler","SetHBlankHandler",
         "FlushCache","AllocSysMemory","FreeSysMemory",
-        // v15.4: EE kernel syscall wrappers missing from the original list -
-        // FF1 benchmark found these in the runtime roster but unmatched here.
+        // v11 (General v15.4): EE kernel syscall wrappers missing from the
+        // original list - found in the runtime roster but unmatched here.
         "SetGsCrt","GsGetIMR","GsPutIMR","Deci2Call",
         "SetAlarm","iSetAlarm","DeleteThread","iReleaseWaitThread",
         "CancelWakeupThread","iCancelWakeupThread","SuspendThread","ResumeThread",
@@ -721,9 +1077,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         "SetOsdConfigParam","GetOsdConfigParam","iFlushCache","GetMemorySize",
         "InitThread","ChangeThreadPriority","iChangeThreadPriority",
         "EnableIntcHandler","DisableIntcHandler","EnableDmacHandler","DisableDmacHandler",
-        // v15.5: EE kernel syscall wrappers seen unmatched on the Jak ELFs
-        // (word-boundary matched, so e.g. "GetThreadId" never hits game code
-        // spelled getThreadIdle - next char must not be lowercase).
+        // v11 (General v15.5): EE kernel syscall wrappers seen unmatched on
+        // the Jak ELFs (word-boundary matched, so e.g. "GetThreadId" never
+        // hits game code spelled getThreadIdle - next char must not be
+        // lowercase).
         "GetThreadId","TerminateThread","iTerminateThread","ExitDeleteThread",
         "SetVTLBRefillHandler","SetVCommonHandler","SetVInterruptHandler",
         "AddSbusIntcHandler","RemoveSbusIntcHandler","DelayThread",
@@ -738,7 +1095,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         "cdvdman","cdvdfsv","mcman","xmcman","mcserv","atad","hdd","pfs",
         "sio2man","padman","xpadman","mtapman","libsd","sdrdrv","audsrv","modmidi",
         "usbd","dev9","smap","ps2smap","ps2ip",".IRX",".irx",
-        // v4 additions - IOP video / audio streaming modules. Relevant for
+        // v4 additions — IOP video / audio streaming modules. Relevant for
         // MPEG_DECODER_TRAP (Rule 34) and future audio-routing work.
         "mpeg.irx","libmpeg.irx","scedvd.irx","sndstrm.irx","mpu.irx"
     };
@@ -780,18 +1137,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     };
 
     // Rule 52: audio callee / module-string roster.
-    // v12 (F1): added 989snd (`snd_`) - used by Jak/Ratchet/Sly/many SCE titles.
-    // Also CRI ADX (`cri_adx_`, `acrmw`), generic `Audio_`/`sceMSnd`/`sceSnd`.
     private static final String[] AUDIO_CALLEE_PREFIXES = {
-        "sceSd","sceSpu2","sceLibSd","sceAudio","sceMSIn","sceLibsd",
-        "sceSnd","sceMSnd",
-        "snd_","Snd_",                     // 989snd library
-        "cri_adx_","cri_aix_","cri_sj_",   // CRI middleware
-        "acrmw","Audio_","audio_"
+        "sceSd","sceSpu2","sceLibSd","sceAudio","sceMSIn","sceLibsd"
     };
     private static final String[] AUDIO_MODULE_STRINGS = {
-        "audsrv.irx","libsd.irx","libsd","sdrdrv.irx","sdrdrv","modmidi.irx",
-        "989snd.irx","989snd","SsAudio","SsUtil"
+        "audsrv.irx","libsd.irx","libsd","sdrdrv.irx","sdrdrv","modmidi.irx"
     };
 
     // Rule 53: dialogue/menu text source path.
@@ -799,47 +1149,17 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         "meswin","FontTex","sysmes","fonttbl","font2"
     };
 
-    // v9 R7: archive / asset file extensions referenced inline.
-    // v12 (E3): added Jak (.DGO/.STR/.CGO/.MUS/.AYB/.GO),
-    // generic SCE/ports (.LMP/.WAD/.LEV/.HDR/.VPK), and host0:/cdfs0: prefixes.
-    private static final String[] ARCHIVE_EXTS = {
-        ".AFS",".afs",".HD2",".hd2",".DAT",".dat",".BIN",".bin",
-        ".TIM2",".tim2",".TM2",".tm2",".AVB",".avb",".PSS",".pss",
-        ".SS2",".ss2",".IPU",".ipu",".ADX",".adx",".VAG",".vag",
-        ".AHX",".ahx",".ASS",".ass",".AFP",".afp",
-        // v12 (E3): Jak / Naughty Dog
-        ".DGO",".dgo",".CGO",".cgo",".STR",".str",".GO",".AYB",".ayb",
-        ".MUS",".mus",
-        // v12 (E3): common port/asset extensions
-        ".LMP",".lmp",".WAD",".wad",".LEV",".lev",".HDR",".hdr",
-        ".VPK",".vpk",".SBK",".sbk",".VPP",".vpp",".CHM",".chm",
-        ".TXM",".txm",".MDL",".mdl",".MOV",".mov",".PSF",".psf",
-        // path prefixes
-        "/CD/","/MC0/","/MC1/","cdrom0:","mc0:","mc1:","host0:","cdfs0:","rom0:"
-    };
-    // v12 (E1): behavioral asset-name regex - uppercase basename + extension.
-    // Captures TWEAKVAL.MUS / VAGDIR.AYB / *.DGO without per-game ext list.
-    private static final java.util.regex.Pattern ASSET_NAME_REGEX =
-        java.util.regex.Pattern.compile("^[A-Z0-9_]{1,16}\\.[A-Z0-9]{2,5}$");
-
     // Rule 54: memory-card transition gates that historically had to be no-op'd
     // (F21 FinishForMC, F-future McError). Small + name match.
-    // v12 (F2): generalized beyond DC2 - added MemCard/save_data/savefile shapes.
     private static final String[] MC_GATE_NAME_FRAGMENTS = {
-        "ForMC","McCheck","McError","FinishForMC","McUd","mcDelay","mcHear",
-        "MemCard","memcard","Memcard",
-        "mc_save","mc_load","saveGame","loadGame","savegame","loadgame",
-        "save_data","save_file","savefile","SaveData","LoadData",
-        "save_state","load_state"
+        "ForMC","McCheck","McError","FinishForMC","McUd","mcDelay","mcHear"
     };
-    // v12 (F2): behavioral MC gate - any function calling MC SDK functions.
-    private static final Set<String> MC_SDK_CALLEES = new HashSet<>(Arrays.asList(
-        "sceMcOpen","sceMcRead","sceMcWrite","sceMcClose","sceMcSeek",
-        "sceMcMkdir","sceMcDelete","sceMcGetDir","sceMcGetInfo",
-        "sceMcFormat","sceMcUnformat","sceMcSync","sceMcFlush",
-        "sceMcChdir","sceMcRename","sceMcSetFileInfo"
-    ));
 
+    // Rule 55: known the game gp-relative globals (signed 16-bit offset OR 32-bit
+    // unsigned encoding as it appears in addiu). Emitted as a labelled map so
+    // the report tool can decode literal_refs base=$gp hits without humans
+    // memorising offsets. Confirmed values pulled from game_override.cpp
+    // probes. Extend as further offsets are confirmed.
     // ===== v6 PCSX2-grounded HW maps =====
     // PCSX2 Hw.h: GS PRIVILEGED registers live at 0x12000000+ with these REAL
     // offsets. v4's GS register map confused these with GIF A+D reg numbers
@@ -905,36 +1225,6 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // EE-EE SBUS comm regs (kernel/IOP cross-talk)
     private static final long SBUS_MSCOM          = 0x1000F200L;
     private static final long SBUS_SMCOM          = 0x1000F210L;
-    private static final long SBUS_MSFLG          = 0x1000F220L;
-    private static final long SBUS_SMFLG          = 0x1000F230L;
-    // DMA CHCR STR|TIE start pattern (Rule 115 DMA_CHCR_START_KICK).
-    private static final long DMA_CHCR_START_CONST = 0x101L;
-
-    // v11 (E): EE peripheral register ranges per pcsx2/Hw.h. Distinguishes
-    // categories the v9 ACCESSES_MMIO bucket lumped together.
-    // Timer channels: 0x10000000-0x10001FFF (RCNT0-3).
-    private static final long RCNT_RANGE_START    = 0x10000000L;
-    private static final long RCNT_RANGE_END      = 0x10001FFFL;
-    // VIF unit CONTROL regs (STAT/FBRST/ERR/MARK/CYCLE/MODE/CODE/...) -
-    // distinct from VIF DMA channel block at 0x10008000 / 0x10009000.
-    private static final long VIF0_CTRL_START     = 0x10003800L;
-    private static final long VIF0_CTRL_END       = 0x10003BFFL;
-    private static final long VIF1_CTRL_START     = 0x10003C00L;
-    private static final long VIF1_CTRL_END       = 0x10003FFFL;
-    // DMAC global control block (CTRL/STAT/PCR/SQWC/RBSR/RBOR/STADR).
-    private static final long DMAC_GLOBAL_START   = 0x1000E000L;
-    private static final long DMAC_GLOBAL_END     = 0x1000E0FFL;
-    // INTC (interrupt controller).
-    private static final long INTC_STAT_ADDR      = 0x1000F000L;
-    private static final long INTC_MASK_ADDR      = 0x1000F010L;
-    // SIO (deci2 / debug printf).
-    private static final long SIO_RANGE_START     = 0x1000F100L;
-    private static final long SIO_RANGE_END       = 0x1000F1FFL;
-    // DMAC ext (D_ENABLER / D_ENABLEW) - the master DMA gate.
-    private static final long DMAC_EXT_START      = 0x1000F500L;
-    private static final long DMAC_EXT_END        = 0x1000F5FFL;
-    private static final long D_ENABLER           = 0x1000F520L;
-    private static final long D_ENABLEW           = 0x1000F590L;
 
     // PCSX2 Vif_Codes.cpp: VIFcode opcode (upper byte of 32-bit VIFcode word).
     // Functions that build VIFcodes via `lui $rN, 0xOPCC` will reveal which
@@ -958,7 +1248,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         VIF_OPCODES.put(0x20L, "STMASK");
         VIF_OPCODES.put(0x30L, "STROW");
         VIF_OPCODES.put(0x31L, "STCOL");
-        VIF_OPCODES.put(0x4AL, "MPG");        // Microcode upload - Path1 bullseye
+        VIF_OPCODES.put(0x4AL, "MPG");        // Microcode upload — Path1 bullseye
         VIF_OPCODES.put(0x50L, "DIRECT");     // Inline GIF via VIF1
         VIF_OPCODES.put(0x51L, "DIRECTHL");
         // UNPACK family 0x60..0x7F handled as a range below
@@ -980,48 +1270,109 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
     // PCSX2 GSRegs.h: PSMT4HH = 44 (0x2C). Constant load in a function that
     // also writes TEX0 / a TEX0 packet is a strong FONT 4HH alias signal.
-    // Also PSMT4HL=36 (0x24), PSMT8H=27 (0x1B) - other Z-buffer aliases.
+    // Also PSMT4HL=36 (0x24), PSMT8H=27 (0x1B) — other Z-buffer aliases.
     private static final long PSMT4HH = 0x2CL;
     private static final long PSMT4HL = 0x24L;
     private static final long PSMT8H  = 0x1BL;
 
-
-
-    // Rule 22: Known IOP SIDs from ps2_iop.h (for cross-referencing)
-    // v12 (D): added Jak SIDs from jak-project (game/common/*_rpc_types.h).
-    // Useful even when the binary is stripped - engineer can grep for usage.
-    private static final Map<Long, String> KNOWN_IOP_SIDS = new HashMap<>();
+    private static final Map<Long,String> KNOWN_GP_OFFSETS = new LinkedHashMap<>();
     static {
-        KNOWN_IOP_SIDS.put(0x00000000L, "IOP_SID_SNDDRV_COMMAND");
-        KNOWN_IOP_SIDS.put(0x00000001L, "IOP_SID_SNDDRV_STATE");
-        KNOWN_IOP_SIDS.put(0x80000701L, "IOP_SID_LIBSD");
-        // Jak1 RPC IDs (jak-project game/common/*_rpc_types.h)
-        KNOWN_IOP_SIDS.put(0x0000DEB1L, "JAK1_PLAYER_RPC");
-        KNOWN_IOP_SIDS.put(0x0000DEB2L, "JAK1_LOADER_RPC");
-        KNOWN_IOP_SIDS.put(0x0000DEB3L, "JAK1_RAMDISK_RPC");
-        KNOWN_IOP_SIDS.put(0x0000DEB4L, "JAK1_DGO_RPC");
-        KNOWN_IOP_SIDS.put(0x0000DEB5L, "JAK1_STR_RPC");
-        KNOWN_IOP_SIDS.put(0x0000DEB6L, "JAK1_PLAY_RPC");
-        // Jak2/3/X RPC IDs (same table)
-        KNOWN_IOP_SIDS.put(0x0000FAB0L, "JAK23X_PLAYER_RPC");
-        KNOWN_IOP_SIDS.put(0x0000FAB1L, "JAK23X_LOADER_RPC");
-        KNOWN_IOP_SIDS.put(0x0000FAB2L, "JAK23X_RAMDISK_RPC");
-        KNOWN_IOP_SIDS.put(0x0000FAB3L, "JAK23X_DGO_RPC");
-        KNOWN_IOP_SIDS.put(0x0000FAB4L, "JAK23X_STR_RPC");
-        KNOWN_IOP_SIDS.put(0x0000FAB5L, "JAK23X_PLAY_RPC");
+        // Template: KNOWN_GP_OFFSETS.put(offset_long, "label_string");
+        // e.g. KNOWN_GP_OFFSETS.put(0xFFFF8818L, "mgDBuffID");
     }
 
-    // v12 (A1): EE syscall imm -> canonical name. Sourced from
-    // skill/resources/db-syscalls.md (ps2tek sec.BIOS EE Syscalls). Covers the
-    // common bootstrap+thread+sema+intc+dmac surface that PS2 binaries wrap
-    // as tiny `syscall N; jr ra; nop` 12-byte trampolines.
-    private static final Map<Long, String> EE_SYSCALL_NAMES = new HashMap<>();
+    // v9 Rule 131: Known function addresses from PROJECT_STATE.md fix logs.
+    // Each entry: address -> {name, phase, role, criticality}.
+    // criticality: BLOCKER (active phase blocker), HIGH (frequently referenced
+    // in fix logs), MEDIUM (component fixed in a closed phase), LOW (utility).
+    private static final Object[][] KNOWN_FUNCTION_ADDRESSES = {
+        // Template: { addr (long), name (String), phase (String), role (String), criticality (String) }
+        // e.g. { 0x00100008L, "entry_0x100008", "boot", "main_loop_never_returns", "BLOCKER" }
+    };
+
+    // v9 Rule 132: the game VRAM TBP labels per runtime_invariants memory + F37/F43/F44 fix logs.
+    // dbp -> human label so report tools can decode tex0_tbps_union /
+    // vram_upload_tbps_union without re-deriving the mapping.
+    private static final Map<Long,String> KNOWN_TBP_LABELS = new LinkedHashMap<>();
     static {
-        // v15.5 REBUILD: the old map had wrong assignments (0x66/0x67 are
-        // CpuConfig/iGetCop0, NOT GsGetIMR/GsPutIMR; 0x68 is iFlushCache,
-        // NOT SetVSyncFlag; SetVSyncFlag is 0x73 and SetSyscall is 0x74) -
-        // and Rule 160 now BINDS runtime handlers from these names, so every
-        // entry is cross-checked against two authorities:
+        // Template: KNOWN_TBP_LABELS.put(tbp_long, "label_string");
+        // e.g. KNOWN_TBP_LABELS.put(0x2720L, "Mgr_T8_texture");
+    }
+
+    // v9 Rule 133: confirmed-across-9-GS-dumps runtime invariants (the game only).
+    // The report tool can deprioritise any function whose only hardware reach
+    // is one of these confirmed-dead pipes.
+    private static final String[][] RUNTIME_INVARIANTS = {
+        // Template: { tag (String), description (String) }
+        // e.g. { "PATH1_DEAD", "PATH1 transfer count == 0 in all GS dumps." }
+    };
+
+    // v9 Rule 134: pre-computed forward callgraphs to bullseye sinks. Each
+    // chain: {tag, [stations]} where stations are name fragments. Report tool
+    // can mark every intermediate function with the chain it participates in.
+    private static final Object[][] CALL_CHAINS = {
+        // Template: { tag (String), new String[]{ station_fragments... } }
+        // e.g. { "save_to_map_load", new String[]{"TitleModeKey", "LoadMapFile"} }
+    };
+
+    // v13 Rule 185: LOOP_STATE_MODEL. The front-end/dungeon program-state legend +
+    // the mutually-exclusive front-end sub-states (G79 illegal-concurrent leak).
+    // Format: {state, where, legend}.
+    private static final String[][] LOOP_STATE_MODEL = {
+        // Template: { state_name (String), location_probe (String), legend (String) }
+        // e.g. { "LoopNo", "*(gp-0x7524)=0x00376fcc", "0=boot, 2=dungeon" }
+    };
+
+    // v9 Rule 135: working PAD_INPUT scripts from F40/F42/F46 fix logs.
+    // Format: {tag, script, frame_anchor, observed_effect}.
+    private static final String[][] PAD_INPUT_SCRIPTS = {
+        // Template: { tag (String), script (String), frame_anchor (String), observed_effect (String) }
+        // e.g. { "F40_baseline_smoke", "1:Start", "mgEndFrame=1", "single inject at boot frame" }
+    };
+
+    // v9 Rule 124 / 125: IRX loader detection callees.
+    private static final Set<String> IRX_LOAD_CALLEES = new HashSet<>(Arrays.asList(
+        "sceSifLoadModule","sceSifLoadStartModule","sceSifLoadFileEx",
+        "SifLoadModule","SifLoadStartModule"
+    ));
+    private static final Set<String> IOP_REBOOT_CALLEES = new HashSet<>(Arrays.asList(
+        "sceSifRebootIop","SifRebootIop","sceSifInitIopHeap"
+    ));
+
+    // v9 Rule 126: the game render frame entry name fragments.
+    private static final String[] RENDER_FRAME_ENTRY_FRAGMENTS = {
+        "mgEndFrame","mgBeginFrame","mgEndDraw","mgBeginDraw",
+        "mgFlipDrawEnv","mgVSyncWait","mgSwapDBuff","mgEndDrawReload"
+    };
+
+    // v9 Rule 119 / extended MMIO ranges (E1-E3 from General v11).
+    private static final long SBUS_MSFLG          = 0x1000F220L;
+    private static final long SBUS_SMFLG          = 0x1000F230L;
+    private static final long RCNT_RANGE_START    = 0x10000000L;
+    private static final long RCNT_RANGE_END      = 0x10001FFFL;
+    private static final long VIF0_CTRL_START     = 0x10003800L;
+    private static final long VIF0_CTRL_END       = 0x10003BFFL;
+    private static final long VIF1_CTRL_START     = 0x10003C00L;
+    private static final long VIF1_CTRL_END       = 0x10003FFFL;
+    private static final long DMAC_GLOBAL_START   = 0x1000E000L;
+    private static final long DMAC_GLOBAL_END     = 0x1000E0FFL;
+    private static final long INTC_STAT_ADDR      = 0x1000F000L;
+    private static final long INTC_MASK_ADDR      = 0x1000F010L;
+    private static final long SIO_RANGE_START     = 0x1000F100L;
+    private static final long SIO_RANGE_END       = 0x1000F1FFL;
+    private static final long DMAC_EXT_START      = 0x1000F500L;
+    private static final long DMAC_EXT_END        = 0x1000F5FFL;
+    private static final long DMA_CHCR_START_CONST = 0x101L; // STR | TIE
+
+    // v9 Rule 120: EE syscall imm -> canonical name (db-syscalls.md / ps2tek).
+    private static final Map<Long,String> EE_SYSCALL_NAMES = new HashMap<>();
+    static {
+        // v11 REBUILD (General v15.5 Bugfix W): the old map had wrong
+        // assignments (0x66/0x67 are CpuConfig/iGetCop0, NOT GsGetIMR/
+        // GsPutIMR; 0x68 is iFlushCache, NOT SetVSyncFlag; SetVSyncFlag is
+        // 0x73 and SetSyscall is 0x74) - and Rule 160 now BINDS runtime
+        // handlers from these names, so every entry is cross-checked against
+        // two authorities:
         //   - pcsx2/R5900OpcodeImpl.cpp syscall name table (numbering), and
         //   - ps2xRuntime Kernel/Syscalls/Dispatcher.cpp numeric dispatch
         //     (handler spelling - names here use the RUNTIME's spelling so
@@ -1153,18 +1504,122 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         EE_SYSCALL_NAMES.put(0x8FL, "iGsPutIMR");            // -0x71
     }
 
+    // v9 Rule 137: tag priority for TOML comment generation (higher = printed first).
+    private static final Map<String,Integer> TAG_PRIORITY = new HashMap<>();
+    static {
+        // Tier-0 blocker tags
+        TAG_PRIORITY.put("TOP_PRIORITY_FIX", 1000);
+        // v11 (General v15.3): input-hygiene + handler-roster tags rank just
+        // below the render bullseyes - they mark wrong bindings, not wrong code.
+        TAG_PRIORITY.put("NO_RUNTIME_HANDLER", 985);
+        TAG_PRIORITY.put("STEP1_NAME_MISMATCH", 980);
+        TAG_PRIORITY.put("STEP1_TRUNCATED_NAME", 360);
+        TAG_PRIORITY.put("OVERLAY_REGION", 975);
+        TAG_PRIORITY.put("OUT_OF_TEXT_BINDING", 970);
+        // v11 (General v15.5 Rule 161): runtime code linker/loader.
+        TAG_PRIORITY.put("DYNAMIC_CODE_LOADER", 965);
+        TAG_PRIORITY.put("BITBLTBUF_T4HH_UPLOADER", 950);
+        TAG_PRIORITY.put("CTOR_RISK_CRITICAL", 940);
+        TAG_PRIORITY.put("DRAWING_CHAIN_NEAR_ROOT", 930);
+        TAG_PRIORITY.put("CTOR_MULTI_FIELD_INITIALIZER", 920);
+        TAG_PRIORITY.put("LIFECYCLE_LAZY_INIT_GUARD", 910);
+        TAG_PRIORITY.put("ASSET_UPLOAD_BULLSEYE", 900);
+        TAG_PRIORITY.put("RENDER_FRAME_ENTRY", 890);
+        TAG_PRIORITY.put("PATH3_INITIATOR", 880);
+        TAG_PRIORITY.put("PATH3_KICK_VIA_DMA_API", 870);
+        TAG_PRIORITY.put("IS_SCE_GIF_PK_REF_LOAD_IMAGE", 860);
+        TAG_PRIORITY.put("DMA_CHCR_START_KICK", 850);
+        TAG_PRIORITY.put("GIF_NLOOP_DOUBLE_COUNT_RISK", 840);
+        TAG_PRIORITY.put("HOST_WAIT_CANDIDATE", 830);
+        TAG_PRIORITY.put("VTABLE_SETTER", 820);
+        TAG_PRIORITY.put("CTOR_RISK_HIGH", 810);
+        TAG_PRIORITY.put("LIBGCC_INTRINSIC", 800);
+        TAG_PRIORITY.put("MICROCODE_UPLOADER", 790);
+        TAG_PRIORITY.put("FRAME_CLOCK_DRIVER", 780);
+        TAG_PRIORITY.put("BACKWARD_BRANCH_SYNC_WAIT", 770);
+        TAG_PRIORITY.put("INFINITE_FAIL_LOOP", 760);
+        TAG_PRIORITY.put("INFINITE_SPIN_LOOP", 750);
+        TAG_PRIORITY.put("Z_BUFFER_ALIAS_RISK", 740);
+        TAG_PRIORITY.put("GIF_PATH3_HAZARD", 730);
+        TAG_PRIORITY.put("BITBLTBUF_MACRO_SEQUENCE", 720);
+        TAG_PRIORITY.put("GIF_TAG_INLINE_BUILDER", 710);
+        TAG_PRIORITY.put("DMA_SOURCE_CHAIN_TAG_BUILDER", 700);
+        TAG_PRIORITY.put("VIF_MPG_OPCODE_BUILDER", 690);
+        TAG_PRIORITY.put("VIF_MSCAL_OPCODE_BUILDER", 685);
+        TAG_PRIORITY.put("VIF_DIRECT_OPCODE_BUILDER", 680);
+        TAG_PRIORITY.put("VIF_UNPACK_OPCODE_BUILDER", 670);
+        TAG_PRIORITY.put("DMA_TAG_BUILDER", 660);
+        TAG_PRIORITY.put("PSMT4HH_REFERENCE", 650);
+        TAG_PRIORITY.put("DISPFB_WRITER", 640);
+        TAG_PRIORITY.put("DISPFB_SDK_WRITER", 635);
+        // v13 Rules 178-188 (render/init-critical tier).
+        TAG_PRIORITY.put("CONDITIONAL_INIT_ON_GLOBAL", 938);
+        TAG_PRIORITY.put("RENDER_MODE_SELECTOR", 936);
+        TAG_PRIORITY.put("VERTEX_LIGHTING_NORMAL_TERM", 934);
+        TAG_PRIORITY.put("VTABLE_TAILCALL_THUNK", 932);
+        TAG_PRIORITY.put("RTT_NO_RESTORE", 930);
+        TAG_PRIORITY.put("FRAME_RESUME_RISK", 760);
+        TAG_PRIORITY.put("VU_FLAG_PIPELINE_UPLOADER", 705);
+        TAG_PRIORITY.put("PACKED_RGBAQ_BUILDER", 655);
+        TAG_PRIORITY.put("INDIRECT_CALL_T9", 600);
+        TAG_PRIORITY.put("TAIL_CALL_INDIRECT", 580);
+        TAG_PRIORITY.put("MPEG_DECODER_TRAP", 560);
+        TAG_PRIORITY.put("IOP_RPC_DISPATCH", 540);
+        TAG_PRIORITY.put("IRX_LOADER", 520);
+        TAG_PRIORITY.put("ARCHIVE_IO", 500);
+        TAG_PRIORITY.put("MC_TRANSITION_GATE", 480);
+        TAG_PRIORITY.put("PAD_BUTTON_MASK_CONSUMER", 460);
+        TAG_PRIORITY.put("PAD_POLL_LOOP", 440);
+        TAG_PRIORITY.put("THREAD_SYNC_POINT", 420);
+        TAG_PRIORITY.put("SBUS_IOP_COMM_TOUCHER", 400);
+        TAG_PRIORITY.put("MESWIN_LOADER", 380);
+        TAG_PRIORITY.put("DMA_KICK_PATTERN", 360);
+        TAG_PRIORITY.put("DMA_QWC_TADR_WRITER", 340);
+        // v11: step1-provenance + trampoline tags (informational tier).
+        TAG_PRIORITY.put("STEP1_LOCKED", 335);
+        TAG_PRIORITY.put("BINDING_FIREWALL_RESCUED", 330);
+        TAG_PRIORITY.put("STEP1_RESCUED", 325);
+        TAG_PRIORITY.put("ADDRESS_TAKEN_CALLBACK", 320);
+        TAG_PRIORITY.put("STEP1_BOUND_HOST_BOUNDARY", 315);
+        TAG_PRIORITY.put("STEP1_BOUND_ROSTER_HANDLER", 310);
+        TAG_PRIORITY.put("SYSCALL_TRAMPOLINE", 305);
+        TAG_PRIORITY.put("SIF_PACKET_BUILDER", 300);
+        // v12 Rules 165-177 (render/present/io hazard tier).
+        TAG_PRIORITY.put("RTT_TARGET", 945);
+        TAG_PRIORITY.put("VF0_DEPENDENT_INVERSE", 935);
+        TAG_PRIORITY.put("ZBUF_VRAM_ALIAS_RISK", 745);
+        TAG_PRIORITY.put("AUDIO_GATED_STALL", 835);
+        TAG_PRIORITY.put("AUDIO_COMPLETION_GATE", 525);
+        TAG_PRIORITY.put("CLUT_CACHE_INVALIDATOR", 515);
+        TAG_PRIORITY.put("PRESENTATION_FIELD_STATE", 510);
+        TAG_PRIORITY.put("DISPLAY_BUFFER_FLIP", 505);
+        TAG_PRIORITY.put("MEMCARD_IO", 470);
+        TAG_PRIORITY.put("PERF_HOT_FRAME_PATH", 295);
+    }
+
+    // Rule 23: Archive I/O string patterns (Phase F6)
+    private static final String[] ARCHIVE_IO_STRINGS = {
+        "DATA.DAT","DATA.HD2","data.dat","data.hd2",".dat",".hd2"
+    };
+
+    // Rule 22: Known IOP SIDs from ps2_iop.h (for cross-referencing)
+    private static final Map<Long, String> KNOWN_IOP_SIDS = new HashMap<>();
+    static {
+        KNOWN_IOP_SIDS.put(0x00000000L, "IOP_SID_SNDDRV_COMMAND");
+        KNOWN_IOP_SIDS.put(0x00000001L, "IOP_SID_SNDDRV_STATE");
+        KNOWN_IOP_SIDS.put(0x80000701L, "IOP_SID_LIBSD");
+        KNOWN_IOP_SIDS.put(0x00012346L, "the game_EzMidi_rpcSid");
+    }
+
     // Rule 10: Absolute whitelist - immune to ALL firewalls
     private static final String[] WHITELIST_NAMES = {
         "entry","_start","crt0","topThread","cmd_sem_init"
     };
 
     // Rule 24: Known pad-polling syscall names (for PAD_POLL_LOOP detection)
-    // v12 (F4): added generic names so stripped-symbol games still hit.
     private static final Set<String> PAD_POLL_CALLEES = new HashSet<>(Arrays.asList(
-        "scePadGetState","scePadGetReqState","scePadRead","scePadGetData",
-        "sceGsSyncV","sceGsSyncVCallback","WaitVSync",
-        "padGetData","padGetState","padRead","pad_get_state","pad_read",
-        "_pad_read_","_pad_get_state_","read_pad_state","read_pad_data"
+        "scePadGetState","scePadGetReqState","scePadRead",
+        "sceGsSyncV","sceGsSyncVCallback","WaitVSync"
     ));
 
     // ===== v7 (GS-dump runtime corroboration) =====
@@ -1187,51 +1642,48 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
     // Rule 79: GS IRQ handler names. IMR (priv reg 0x1010) controls which GS
     // IRQs reach the EE. When every loaded checkpoint shows IMR=0x7F00
-    // (all GS IRQs masked) these handlers can never fire - safe-stub label.
+    // (all GS IRQs masked) these handlers can never fire — safe-stub label.
     private static final String[] GS_IRQ_HANDLER_NAME_FRAGMENTS = {
         "GsSignal","GsFinish","GsLabel","SignalHandler","FinishHandler",
         "LabelHandler","sceGsSyncH","sceGsSyncV"
     };
 
-    // Rule 88: libgcc intrinsic exact names (union of General + DC2 sets).
+    // PSM code constants (PCSX2 GSRegs.h) for VRAM/Z-alias decoding.
+    private static final int PSM_PSMT4HH = 44;   // 0x2C — UI/font Z-buffer alias
+    private static final int PSM_PSMT4HL = 36;   // 0x24
+    private static final int PSM_PSMT8H  = 27;   // 0x1B
+
+    // Checkpoint name fragments treated as "menu/UI" for RUNTIME_MENU_ONLY
+    // classification. Lowercase comparison.
+    private static final String[] MENU_CHECKPOINT_FRAGMENTS = {
+        "menu","inventory","pause","character","title","select","ui","hud"
+    };
+
+    // ===== v8 constants =====
+    // Rule 88: exact libgcc / runtime helper names (not just regex matches).
     private static final Set<String> LIBGCC_EXACT_NAMES = new HashSet<>(Arrays.asList(
-        // 64-bit integer helpers
-        "__divdi3", "__udivdi3", "__moddi3", "__umoddi3",
-        "__muldi3", "__negdi2", "__lshrdi3", "__ashldi3", "__ashrdi3",
-        "__cmpdi2", "__ucmpdi2", "__ffsdi2", "__clzdi2", "__ctzdi2",
-        "__popcountdi2", "__paritydi2", "__bswapdi2",
-        // 32-bit integer helpers (DC2 set)
-        "__divsi3", "__udivsi3", "__modsi3", "__umodsi3",
-        // float<->int conversion
-        "__fixdfdi", "__fixunsdfdi", "__floatdidf", "__floatundidf",
-        "__fixsfdi", "__fixunssfdi", "__floatdisf", "__floatundisf",
-        "__floatsisf", "__floatsidf",
-        // double helpers
-        "__adddf3", "__subdf3", "__muldf3", "__divdf3",
-        "__cmpdf2",
-        // float helpers
-        "__addsf3", "__subsf3", "__mulsf3", "__divsf3",
-        "__cmpsf2",
-        // misc conversion
-        "__extendsfdf2", "__truncdfsf2", "__negdf2", "__negsf2",
-        // low-level FP pack/unpack (DC2 set - found in stripped PS2 SDK rt libs)
-        "__pack_d", "__unpack_d", "__pack_f", "__unpack_f",
-        "__fpcmp_parts_d", "__fpcmp_parts_f",
-        "__make_dp", "__make_fp"
+        "__divdi3","__udivdi3","__moddi3","__umoddi3","__muldi3",
+        "__fixdfdi","__fixunsdfdi","__floatdidf","__pack_d","__unpack_d",
+        "__pack_f","__unpack_f","__fpcmp_parts_d","__fpcmp_parts_f",
+        "__negdf2","__negsf2","__make_dp","__make_fp",
+        "__divsi3","__udivsi3","__modsi3","__umodsi3",
+        "__addsf3","__subsf3","__mulsf3","__divsf3",
+        "__adddf3","__subdf3","__muldf3","__divdf3",
+        "__cmpdf2","__cmpsf2","__fixsfdi","__floatdisf","__floatsisf","__floatsidf"
     ));
 
-    // Rule 96: GIF NLOOP hazard helpers (DC2: added MakeGiftagAplusD/makeGifTagAplusD/openGifTag)
+    // Rule 96: GIF packet helpers — NLOOP double-count hazard pair.
     private static final Set<String> GIF_PACKET_NLOOP_HELPERS = new HashSet<>(Arrays.asList(
-        "sceGifPkOpenGifTag", "sceVif1PkOpenGifTag", "sceGifPkAddGsAD",
-        "makeGiftagAplusD", "MakeGiftagAplusD", "makeGifTagAplusD", "openGifTag"
+        "makeGiftagAplusD","MakeGiftagAplusD","makeGifTagAplusD",
+        "sceGifPkOpenGifTag","sceVif1PkOpenGifTag","openGifTag"
     ));
-    // DC2: added ClosePacketGifTag/closeGifTag
     private static final Set<String> GIF_PACKET_CLOSE_HELPERS = new HashSet<>(Arrays.asList(
-        "sceGifPkCloseGifTag", "sceVif1PkCloseGifTag", "closePacketGifTag",
-        "ClosePacketGifTag", "closeGifTag"
+        "closePacketGifTag","ClosePacketGifTag","sceGifPkCloseGifTag",
+        "sceVif1PkCloseGifTag","closeGifTag"
     ));
 
-    // Rule 97: Pad button masks
+    // Rule 97: PS2 DUALSHOCK button mask constants (active-low; absolute bit
+    // values seen in masking sites). Mapping = bit -> friendly name.
     private static final Map<Long,String> PAD_BUTTON_MASKS = new LinkedHashMap<>();
     static {
         PAD_BUTTON_MASKS.put(0x0001L, "Select");
@@ -1252,78 +1704,70 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         PAD_BUTTON_MASKS.put(0x8000L, "Square");
     }
 
-    // Rule 99: File open callees (DC2: added LoadFileEx, sceCdStRead)
+    // Rule 99: file-open callee names — caller sprintf-source check anchors here.
     private static final Set<String> FILE_OPEN_CALLEES = new HashSet<>(Arrays.asList(
-        "sceCdRead", "sceCdSearchFile", "sceOpen", "sceLseek", "sceRead",
-        "LoadFile", "LoadFile2", "LoadFileEx", "fopen", "fread", "fseek",
-        "sceCdStRead"
+        "LoadFile2","LoadFile","LoadFileEx","sceCdRead","sceOpen","sceRead",
+        "sceCdSearchFile","fopen","sceCdStRead"
     ));
 
-    // Rule 100: Frame clock driver callees
-    // v12 (F3): generic frame-pacing names + engine-specific common variants.
+    // Rule 100: frame-clock advance callees.
     private static final Set<String> FRAME_CLOCK_CALLEES = new HashSet<>(Arrays.asList(
-        "sceGsSyncV", "sceGsSyncH", "WaitVSync", "SetVSyncFlag",
-        "sceGsSyncVCallback",
-        "wait_vsync","WaitFrameSync","wait_for_vsync","WaitForVBlank",
-        "WaitForVSync","wait_for_vblank","WaitForVblank",
-        "mgEndFrame","EndFrame","end_frame","present_frame","PresentFrame",
-        "vsync_handler","vsync-handler","vif1-vsync-handler"
+        "sceGsSyncV","sceGsSyncH","sceGsSyncVCallback","WaitVSync",
+        "SetVSyncFlag","mgEndFrame","mgFlipDrawEnv","mgVSyncWait"
     ));
 
-    // Rule 124/125: IRX loader and IOP reboot callee name sets.
-    private static final Set<String> IRX_LOAD_CALLEES = new HashSet<>(Arrays.asList(
-        "sceSifLoadModule", "sceSifLoadStartModule", "sceSifLoadFileEx",
-        "SifLoadModule", "SifLoadStartModule"
-    ));
-    private static final Set<String> IOP_REBOOT_CALLEES = new HashSet<>(Arrays.asList(
-        "sceSifRebootIop", "SifRebootIop", "sceSifInitIopHeap"
-    ));
-
-    // Rule 150: EE code-overlay exec/load callees. sceSifLoadModule (IOP modules)
-    // excluded - that is IRX loading (Rule 124), not an EE address-space overlay.
+    // v10.1 Rule 150: EE code-overlay exec/load callees. NOTE: sceSifLoadModule
+    // (IOP modules) is deliberately excluded — that is IRX loading (Rule 124),
+    // not an EE-address-space overlay. sceCdRead is excluded as too common.
     private static final Set<String> OVERLAY_LOADER_CALLEES = new HashSet<>(Arrays.asList(
-        "LoadExecPS2", "ExecPS2", "sceExecPS2", "LoadModuleBuffer",
-        "sceSifLoadModuleBuffer", "sceSifLoadElf", "ExecModule", "sceSifLoadElfPart"
+        "LoadExecPS2","ExecPS2","sceExecPS2","LoadModuleBuffer",
+        "sceSifLoadModuleBuffer","sceSifLoadElf","ExecModule","sceSifLoadElfPart"
     ));
 
-    // Rule 102: sceVu0 helper prefixes
+    // Rule 102: VU0 helper whitelist (must be implemented, never auto-stub).
     private static final String[] SCEVU0_HELPER_PREFIXES = {
-        "sceVu0", "_sceVu0"
+        "sceVu0","_sceVu0"
     };
 
-    // PSM code constants (PCSX2 GSRegs.h) for VRAM/Z-alias decoding.
-    private static final int PSM_PSMT4HH = 44;   // 0x2C - UI/font Z-buffer alias
-    private static final int PSM_PSMT4HL = 36;   // 0x24
-    private static final int PSM_PSMT8H  = 27;   // 0x1B
+    // v10: sceVu0* helpers still TODO_NAMED (throwing) in Kernel/Stubs/VU.cpp as
+    // of F50.7. Implement from ref/assembly.txt when a 3D route hits one. Already
+    // implemented: sceVu0InversMatrix (F50.7), sceVu0MulMatrix (F46.6),
+    // sceVu0CameraMatrix (F46.5). The RotTransPers* / ViewScreenMatrix throwers
+    // are NOT on the dungeon route (it uses inline COP2 instead, per F51.7).
+    private static final String[] SCEVU0_UNIMPLEMENTED = {
+        "sceVu0ecossin","sceVu0InterVector","sceVu0InterVectorf",
+        "sceVu0LightColorMatrix","sceVu0MulVector",
+        "sceVu0RotTransPers","sceVu0RotTransPersN","sceVu0ViewScreenMatrix"
+    };
 
-    // v11 (H): well-known PS2 file-format magic constants. Detection scans
-    // const_loads (lui+ori/li composites already gathered) for any 16/32-bit
-    // immediate matching this table. Entry: {label, 32-bit magic}.
-    // 16-bit shorts are tested against (mask & 0xFFFF).
-    private static final Map<Long,String> FORMAT_MAGIC_CONSTS = new LinkedHashMap<>();
+    // Rule 107: phase-trace env flags inventory (emitted into JSON for tools).
+    private static final String[] PHASE_TRACE_FLAGS = {
+        // Template: "ENV_FLAG_STRING"
+        // e.g. "GAME_TRACE_TITLE_PATH", "GAME_TRACE_PAD"
+    };
+
+    // Rule 104: expected GS uploads per phase (current blocker: T8 dbp=0x2720
+    // dpsm=0x13 inside CScene::LoadMapFromMemory). Extend as new phases land.
+    // Each entry: {tag, dpsm, dbp, phase, hint}.
+    private static final Object[][] EXPECTED_UPLOADS = {
+        // Template: { tag (String), dpsm (int), dbp (long), phase (String), hint (String) }
+        // e.g. { "T8_TEXTURE", 0x13, 0x2720L, "F43_T8", "Map texture uploader" }
+    };
+    // Sets derived from EXPECTED_UPLOADS for cheap membership tests in scan.
+    private static final Set<Long> EXPECTED_DBP_SET = new LinkedHashSet<>();
+    private static final Set<Integer> EXPECTED_DPSM_SET = new LinkedHashSet<>();
     static {
-        FORMAT_MAGIC_CONSTS.put(0x324D4954L, "TIM2");      // 'TIM2'
-        FORMAT_MAGIC_CONSTS.put(0x3254434CL, "CLT2");      // 'CLT2'
-        FORMAT_MAGIC_CONSTS.put(0x464C457FL, "ELF");       // 0x7F ELF
-        FORMAT_MAGIC_CONSTS.put(0x46524550L, "PERF");      // 'PERF'
-        FORMAT_MAGIC_CONSTS.put(0x53573031L, "SW01");      // ".SS2"-class
-        FORMAT_MAGIC_CONSTS.put(0xBA010000L, "PSS_PACK");  // PSS pack hdr
-        FORMAT_MAGIC_CONSTS.put(0x43475053L, "PSGC");      // 'SPGC'/'PSGC'
-        FORMAT_MAGIC_CONSTS.put(0x32706D69L, "imp2");      // 'imp2'
-    }
-    // 16-bit halves of common 32-bit magics (caught as standalone shorts).
-    private static final Map<Long,String> FORMAT_MAGIC_SHORTS = new LinkedHashMap<>();
-    static {
-        FORMAT_MAGIC_SHORTS.put(0x4954L, "TIM2_lo");
-        FORMAT_MAGIC_SHORTS.put(0x324DL, "TIM2_hi");
-        FORMAT_MAGIC_SHORTS.put(0x4C43L, "CLT2_lo");
-        FORMAT_MAGIC_SHORTS.put(0x3254L, "CLT2_hi");
+        for (Object[] row : EXPECTED_UPLOADS) {
+            EXPECTED_DBP_SET.add(((Number)row[2]).longValue() & 0xFFFFFFFFL);
+            EXPECTED_DPSM_SET.add(((Number)row[1]).intValue());
+        }
     }
 
-    // Checkpoint name fragments treated as "menu/UI" for RUNTIME_MENU_ONLY
-    // classification. Lowercase comparison.
-    private static final String[] MENU_CHECKPOINT_FRAGMENTS = {
-        "menu","inventory","pause","character","title","select","ui","hud"
+    // Rule 106: emitted build invariants for downstream tools.
+    private static final String BUILD_CMD = "";
+    private static final String[] BUILD_DO_NOT_MODIFY = {
+        // Template: "PATH_TO_GENERATED_FILE_TO_IGNORE"
+        // e.g. "D:/ps2r/game/generated/code.cpp"
     };
 
     // =========================================================
@@ -1393,7 +1837,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         // Path3 confirmation strength: total path3 transfers across all checkpoints
         long totalPath3Count = 0L;
         long totalPath3Bytes = 0L;
-        // True if no captures loaded - disables corroboration tags.
+        // True if no captures loaded — disables corroboration tags.
         boolean empty() { return checkpoints.isEmpty(); }
     }
 
@@ -1412,9 +1856,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         boolean writesToGlobal=false, usesCop1=false, usesCop2=false;
         boolean usesSPR=false, hasStackFrame=false, hasMutatingInstructions=false;
         int quadwordVU=0, accOps=0, callOps=0;
-        // v13: store-instruction count. Used to separate true idle/poll spins
-        // (no stores) from counted copy/clear loops (memcpy/memset shapes),
-        // which the old INFINITE_SPIN_LOOP rule falsely flagged for NOP patching.
+        // v11 (General v13): store-instruction count. Used to separate true
+        // idle/poll spins (no stores) from counted copy/clear loops
+        // (memcpy/memset shapes), which the old INFINITE_SPIN_LOOP rule
+        // falsely flagged for NOP patching.
         int storeOps=0;
         boolean writesToText=false;
         boolean hasSyncInstr=false;
@@ -1427,7 +1872,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         boolean callsDmaSend=false;          // Rule 21
         boolean callsSifRpc=false;           // Rule 22
         long detectedRpcSid=0L;             // Rule 22: SID literal found near sceSifBindRpc
-
+        boolean refsArchiveStrings=false;    // Rule 23
         boolean callsPadPollCallee=false;    // Rule 24
         boolean hasBackwardBranch=false;     // improved BUSY_WAIT
         boolean writesToA1Buffer=false;      // Rule 19: convention violation detector
@@ -1442,7 +1887,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         boolean hasCOP0=false;
         // [FIX v4] Folded from referencesIopModule into main instruction loop
         boolean refsIopModuleString=false;
-        // F21-prep: outgoing JAL records - pairs of (callSitePc, calleeTargetAddr).
+        // F21-prep: outgoing JAL records — pairs of (callSitePc, calleeTargetAddr).
         // Collected during the instruction scan; consumed in a post-pass to
         // build the reverse call-graph that lands in JSON as "callers".
         List<long[]> jalSites = new ArrayList<>();
@@ -1450,7 +1895,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         // after all functions are scanned. Each entry is [callerAddr, callSitePc].
         List<long[]> callers = new ArrayList<>();
         // F21-prep: memory-access literal references. Each entry is
-        // [pcHex, mnem, baseReg, offsetHex, destReg] - captured for load/store
+        // [pcHex, mnem, baseReg, offsetHex, destReg] — captured for load/store
         // opcodes that have a constant displacement so consumers can grep by
         // offset (e.g. "every read of +0x45C from a CGamePad pointer").
         List<String[]> literalRefs = new ArrayList<>();
@@ -1464,19 +1909,19 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         // Rule 28: tiny returner whose result is polled by a caller's backward
         // branch. Computed post-scan after reverse call-graph is built.
         boolean isLikelyPollTarget=false;
-        // Rule 29: function whose tail does `move $v0, $a0` (or $a1) - passthrough.
+        // Rule 29: function whose tail does `move $v0, $a0` (or $a1) — passthrough.
         // Auto-stub returning 0 would break chained calls like `f(g(x))` where
         // g forwards x. Detected via last-10 instructions scan.
         boolean returnsA0=false;
         boolean returnsA1=false;
-        // Rule 30: name-based - process terminator
+        // Rule 30: name-based — process terminator
         boolean isProcessTerminator=false;
         // Rule 31: libgcc 64-bit / FP intrinsic
         boolean isLibgccIntrinsic=false;
-        // Rule 32: GIF Path3 hazard - CTRL/CHCR/PRIM-offset signals
+        // Rule 32: GIF Path3 hazard — CTRL/CHCR/PRIM-offset signals
         boolean touchesGifCtrl=false;
         boolean writesGsPrimReg=false;
-        // Rule 33: Z-buffer alias risk - ZBUF reg + 24-bit shift
+        // Rule 33: Z-buffer alias risk — ZBUF reg + 24-bit shift
         boolean writesZbufReg=false;
         boolean hasShift24Pattern=false;
         // Rule 34: MPEG decoder
@@ -1509,7 +1954,8 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         boolean isAudioRpcHandler=false;         // Rule 52
         boolean refsMeswinStrings=false;         // Rule 53
         boolean isMcTransitionGate=false;        // Rule 54
-
+        // Rule 55: hits against KNOWN_GP_OFFSETS (labels only).
+        Set<String> globalsTouched = new LinkedHashSet<>();
         // Rule 56: derived after tag pass.
         boolean isTopPriorityFix=false;
 
@@ -1589,8 +2035,30 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         boolean calledViaDirectJal = false;     // observed direct jal caller
         boolean calledViaJrT9 = false;          // observed jalr $t9 caller (indirect)
         String  ctorCallMode = "unobserved";    // direct_only | indirect_only | dual | unobserved
+        // ===== v11.3 detectors (the game F52-G26 retrospective) =====
+        // Rule 162 SPR_DMA_STAGER: writes a fromSPR(ch8 0x1000D000)/toSPR(ch9
+        // 0x1000D400) DMA channel reg. the game stages each VU1 model VIF packet in
+        // EE scratchpad then copies it into mgVif1Packet via a fromSPR DMA
+        // (SendDMA@0x13e3d0). A runtime whose IO dispatch only handles GIF/VIF1
+        // drops ch8/ch9 -> empty model slot -> no XGKICK (G26 root cause).
+        boolean programsSprDma=false;
+        Set<String> sprDmaChannels=new LinkedHashSet<>();   // "fromSPR" / "toSPR"
+        // Rule 162 SUBWORD_DMA_STR_KICK: sb/sh landing in a DMA CHCR word
+        // (slot 0..3). The STR bit is set via a sub-word store (G26: SendDMA
+        // kicks ch8 with `sb` to CHCR+1). A word-only writeIORegister misses it.
+        boolean subwordDmaStrKick=false;
+        Set<String> subwordKickChannels=new LinkedHashSet<>();
+        // Rule 163 VU1_DOUBLE_BUFFER_FRAMER: builds BASE+OFFSET VIFcodes (the
+        // TOPS double-buffer framing G23/G24 could not find). Derived from
+        // vifOpcodesBuilt at categorise time.
+        boolean isVu1DoubleBufferFramer=false;
+        // Rule 164 STALE_PTR_CACHE_CTOR: a ctor that caches a getter result into
+        // this+K (G12/G13/F50.4). If it runs before the source is funded it
+        // caches 0/stale and the downstream Draw silently skips. Derived.
+        boolean isStalePtrCacheCtor=false;
+        String  stalePtrCacheGetter=null;
         String  ctorRiskTier = "LOW";           // CRITICAL | HIGH | MEDIUM | LOW
-        // Rule 94: virtual dispatch sites - entries [pcHex, slotOffsetHex, objReg].
+        // Rule 94: virtual dispatch sites — entries [pcHex, slotOffsetHex, objReg].
         List<String[]> virtualDispatchSites = new ArrayList<>();
         // Rule 95: any return value of a `jal <this>` site that was subsequently
         // stored to a $gp-rooted global. Populated post-scan.
@@ -1598,182 +2066,282 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         // Rule 97: andi/and immediates that look like PS2 pad button masks.
         Set<String> padMasksTested = new LinkedHashSet<>();
         boolean isPadButtonMaskConsumer = false;
-        // Rule 96: GIF NLOOP double-count hazard - function calls both open+close
+        // Rule 96: GIF NLOOP double-count hazard — function calls both open+close
         // helpers; flag for human review.
         boolean callsGifPacketOpen = false;
         boolean callsGifPacketClose = false;
         boolean gifNloopDoubleCountRisk = false;
         // Rule 99: file-open callee + format-string source for $a0 path argument.
         boolean callsFileOpen = false;
-        // v15.5 Rule 161: dynamic-code loader (reads payload from disc, then
-        // flushes the instruction cache before executing it).
+        // v11 (General v15.5 Rule 161): dynamic-code loader (reads payload
+        // from disc, then flushes the instruction cache before executing it).
         boolean isDynamicCodeLoader = false;
         Set<String> filePathSprintfFormats = new LinkedHashSet<>();
         boolean filePathHasPercentS = false;
-        // Rule 100: frame-clock driver - calls vsync / mgEndFrame
+        // Rule 100: frame-clock driver — calls vsync / mgEndFrame
         boolean isFrameClockDriver = false;
-        // Rule 101: SIF RPC fid (function id) literal - captured alongside SID.
+        // Rule 101: SIF RPC fid (function id) literal — captured alongside SID.
         Set<Long> detectedRpcFids = new LinkedHashSet<>();
-        // Rule 102: sceVu0 family - must-implement whitelist.
+        // Rule 102: sceVu0 family — must-implement whitelist.
         boolean isSceVu0Helper = false;
         String  vu0HelperFamily = null;         // matrix / vector / transform
         boolean mustBeImplemented = false;
+        // Rule 88: libgcc exact-name match (in addition to regex).
+        // Rule 90: split SPR_SYNC into separate emit fields (existing usesSPR /
+        // hasSyncInstr suffice for split).
+        // Rule 103: tagged when func writes BITBLTBUF + loads dbp constant from
+        // EXPECTED_DBP_SET. Includes which expected tags it satisfies.
+        Set<String> assetUploadTagsHit = new LinkedHashSet<>();
         // Rule 91: caller of an uploader (depth 1 or 2). Filled post-scan.
         boolean uploaderCallerDepth1 = false;
         boolean uploaderCallerDepth2 = false;
+        // Rule 98: override classification (filled from parseGameOverrideFile v8).
+        String  overrideKind = null;            // nop_stub | constant_return | state_machine | probe | real_shim
+        boolean overrideRetireCandidate = false;
         // Rule 111: companion SDK-caller depth-1 flags (used for *_via_sdk_caller
         // statistics so SDK-wrapped accesses still show in counts).
         boolean dispfbWriterViaSdkCallerDepth1 = false;
         boolean dmaKickViaSdkCallerDepth1 = false;
-        
-        // Rule 98: override classification
-        String overrideKind = null;
-        boolean overrideRetireCandidate = false;
-        
-        // Rule 103: asset upload traces
-        Set<String> assetUploadTagsHit = new LinkedHashSet<>();
 
-        // ===== v9 fields =====
-        // R11: every lui/ori/addiu/li constant in function body.
-        // entries = {pc, immediateValue, destReg.hashCode()}.
-        List<long[]> constLoads = new ArrayList<>();
-        Set<String> constLoadDestRegs = new LinkedHashSet<>();
-        // R2: function loads 0x101 (DMA CHCR start bit).
-        boolean loadsChcrStartConst = false;
-        // R2: function pairs CHCR-start const with channel-base load.
-        boolean dmaChcrStartKick = false;
-        // R1: GIF tag inline builder (>=4 16-byte-stride stores to same base
-        // with GIF NLOOP/FLG/REGS bit shape).
+        // ===== v9 fields (the game retrospective + General v11/v12 ports) =====
+        // Rule 113
         boolean gifTagInlineBuilder = false;
-        // v14: 16-byte-stride store pattern matched but the only context is
-        // SIF RPC packet building (no GIF/VIF/DMA evidence). Demoted from
-        // gifTagInlineBuilder so render heuristics ignore it.
+        // v11 (General v14): 16-byte-stride store pattern matched but the only
+        // context is SIF RPC packet building (no GIF/VIF/DMA evidence).
+        // Demoted from gifTagInlineBuilder so render heuristics ignore it.
         boolean sifPacketBuilder = false;
-        Set<String> gifTagFlags = new LinkedHashSet<>();   // PACKED/REGLIST/IMAGE
-        Set<Long> gifTagNloops = new LinkedHashSet<>();
-        Set<Long> gifTagRegsFields = new LinkedHashSet<>();
-        // R4: writes BITBLTBUF then TRXPOS then TRXREG then TRXDIR adjacent.
+        Set<Long>   gifTagRegsFields = new LinkedHashSet<>();
+        Set<Long>   gifTagNloops     = new LinkedHashSet<>();
+        Set<String> gifTagFlags      = new LinkedHashSet<>();
+        // Rule 114
         boolean bitbltbufMacroSequence = false;
-        // R6: render frame entry (frame-clock + MMIO writer reachable from mainloop).
-        boolean isRenderFrameEntry = false;
-        // R7: archive-IO string evidence.
-        Set<String> archiveStringExts = new LinkedHashSet<>();
-        boolean refsArchiveStrings = false;
-        // R8: every string referenced by this function (sampled, max ~16 per
-        // function to keep JSON bounded).
-        List<String> stringRefs = new ArrayList<>();
-        // R10: jalr through known function-pointer table - table base + slot.
-        Set<String> tableDispatchSites = new LinkedHashSet<>();
-        // R16: VU0 macro helper - instruction-mix derived.
-        int vu0MacroOps = 0;
-        boolean isVu0MacroHelper = false;
-        // R17: struct initializer (C-style ctor, no name match required).
-        boolean isStructInitializer = false;
-        // R18: module-cluster id assigned post-pass.
-        int moduleId = -1;
-        // R20: idle / spin-loop detection (refined).
-        boolean isInfiniteSpinLoop = false;
-        // Float compare cluster (R19).
-        int floatCmpOps = 0;
-
-        // ===== v10 generic fields =====
-        // G1: stored-immediate VIF/DMA tag detection. Tracks 32-bit values
-        // stored to qword-aligned offsets whose high byte matches an opcode.
-        Set<String> storedVifOpcodes = new LinkedHashSet<>();
-        Set<String> storedDmaTagIds  = new LinkedHashSet<>();
-        // G2: memory section / block name containing function entry.
-        String sectionName = null;
-        // G3: HI/LO register reads (integer mul/div result consumers).
-        int hiLoOps = 0;
-        // G3: per-opcode counter sample (mnem -> count). Capped emit.
-        Map<String, Integer> opcodeHistogram = new HashMap<>();
-        // 64-bit GIF tag composition fingerprint: lui+ori then dsll32 then ori
-        // resolved within ~6 instructions. Captures SCE_GIF_SET_TAG macro.
-        boolean buildsGifTag64 = false;
-        // Texture upload chunk-size constant (VIF1 LoadImage uses 0x70000).
-        boolean loads70000Chunk = false;
-        // Cyclomatic proxy = branchOps + jal callsites - returnPaths + 1.
-        // Computed at end. Stored here for emit.
-        int cyclomaticProxy = 0;
-        // dsll32-followed-by-ori-within-3 marker (64-bit composition).
-        boolean hasDsll32OrSequence = false;
-
-        // ===== v11 (E): peripheral register categories =====
-        boolean accessesRcnt = false;            // 0x10000000-0x10001FFF
-        boolean accessesVifCtrl = false;         // 0x10003800-0x10003FFF
-        boolean accessesDmacGlobal = false;      // 0x1000E000-0x1000E0FF
-        boolean writesIntcMask = false;          // 0x1000F010 write
-        boolean readsIntcStat = false;           // 0x1000F000 read
-        boolean accessesSio = false;             // 0x1000F100-0x1000F1FF
-        boolean writesDmacEnable = false;        // 0x1000F590 write (D_ENABLEW)
-        boolean touchesSbusFlags = false;        // 0x1000F220 / 0x1000F230
-        // ===== v11 (D): raw SID/FID list =====
-        Set<Long> detectedRpcSids = new LinkedHashSet<>();
-        // ===== v11 (F): source-chain DMA tag builder =====
+        // Rule 115
+        boolean loadsChcrStartConst = false;
+        boolean dmaChcrStartKick    = false;
+        // Rule 116
         boolean dmaSourceChainTagBuilder = false;
         Set<String> dmaSourceChainTagIds = new LinkedHashSet<>();
-        // ===== v11 (H): file-format magic numbers =====
-        Set<String> formatMagicHits = new LinkedHashSet<>();
-        // ===== v11 (I): IRX loader + IOP reboot =====
-        int sifLoadModuleCallCount = 0;
-        boolean isIrxLoader = false;
-        boolean isIopRebootHandler = false;
-        Set<String> irxModulePaths = new LinkedHashSet<>();
-        // ===== v11 (J): tight-loop sync waits =====
-        boolean isSyncWaitLoop = false;
-        boolean containsInfiniteFailLoop = false;
-        // ===== v12 fields =====
-        // F2: behavioral MC gate (function calls sceMcOpen/Read/Write/...).
-        boolean callsMcSdk = false;
-        // B1: composite-const MMIO ranges recovered post-scan from lui+ori
-        // pairs, not just resolved Ghidra refs. Each populates the matching
-        // legacy boolean flag in addition (so downstream stats/tags fire).
+        // Rule 117 / 118
+        Set<String> storedVifOpcodes  = new LinkedHashSet<>();
+        Set<String> storedDmaTagIds   = new LinkedHashSet<>();
+        // Rule 119
         Set<String> compositeMmioRangesHit = new LinkedHashSet<>();
-        // A2: name inferred from syscall imm when ELF was stripped.
-        String inferredName = null;
-        long  inferredSyscallImm = -1L;
-        // E1: behavioral asset-string discovery (regex over string refs).
-        Set<String> discoveredAssetPaths = new LinkedHashSet<>();
-        // D2: full SID + FID lists (multi-RPC functions).
-        Set<Long> allDetectedSids = new LinkedHashSet<>();
-        Set<Long> allDetectedFids = new LinkedHashSet<>();
-        // G1: candidate patch instructions (PC of backward branches in spin/wait).
-        Set<Long> patchCandidatePcs = new LinkedHashSet<>();
-        // H2: synthesized vtable-class name (stripped binaries).
-        String inferredClassName = null;
-        int    inferredVtableSlot = -1;
+        boolean accessesRcnt        = false;
+        boolean accessesVifCtrl     = false;
+        boolean accessesDmacGlobal  = false;
+        boolean writesIntcMask      = false;
+        boolean readsIntcStat       = false;
+        boolean accessesSio         = false;
+        boolean writesDmacEnable    = false;
+        boolean touchesSbusFlags    = false;
+        // Rule 120
+        String  inferredName        = null;
+        long    inferredSyscallImm  = -1L;
+        // Rule 121
+        boolean isSyncWaitLoop      = false;
+        boolean hostWaitCandidate = false;
+        // Rule 122 / 123
+        boolean isInfiniteSpinLoop  = false;
+        boolean containsInfiniteFailLoop = false;
+        // Rule 124 / 125
+        int     sifLoadModuleCallCount = 0;
+        boolean isIrxLoader         = false;
+        boolean isIopRebootHandler  = false;
+        Set<String> irxModulePaths  = new LinkedHashSet<>();
+        // Rule 126
+        boolean isRenderFrameEntry  = false;
+        // Rule 127
+        boolean isStructInitializer = false;
+        // Rule 128
+        String  inferredClassName   = null;
+        int     inferredVtableSlot  = -1;
+        Set<String> tableDispatchSites = new LinkedHashSet<>();
+        // Rule 129
+        int     moduleId            = -1;
+        // Rule 131
+        String  knownRole        = null;
+        String  knownPhase       = null;
+        String  knownCriticality = null;
+        // Rule 134: tags marking participation in pre-computed the game call chains
+        Set<String> callChainsTagged = new LinkedHashSet<>();
+        // Rule 139: SIDs / FIDs discovered via composite lui+ori before sceSifCallRpc
+        Set<Long> discoveredRpcSids  = new LinkedHashSet<>();
+        Set<Long> discoveredRpcFids2 = new LinkedHashSet<>();
+        // const loads captured for table-dispatch resolution (Rule 128)
+        List<long[]> constLoads = new ArrayList<>();
+        // R20: patch candidate PCs (BACKWARD_BRANCH_SYNC_WAIT / INFINITE_FAIL_LOOP)
+        List<Long> patchCandidatePcs = new ArrayList<>();
 
-        // ===== Rules 140-150 fields =====
-        // Rule 140: COP2_DESTMASK_VERIFY - partial dest-field VU0-macro ops.
+        // ===== v10 fields (the game F47-F52 retrospective) =====
+        // Rule 140: VU0-macro COP2 partial-destination write ops. F51.8 root
+        // cause: the recompiler emitted the COP2 dest-component blend mask in
+        // REVERSED lane order, so every PARTIAL-dest op (vftoi4.xy / vadd.xyz /
+        // vftoi0.z ...) wrote X/Y/Z into the wrong SIMD lane → all VU0-macro 3D
+        // perspective transforms produced degenerate (off-screen) vertices.
+        // Full `.xyzw` ops are symmetric → unaffected → the bug hid for 50+
+        // phases behind working 2D/UI. Any func with cop2PartialDestOps>0 must
+        // have its generated COP2 dest-mask lane order verified.
         int cop2PartialDestOps = 0;
-        int cop2FullDestOps = 0;
-        Set<String> cop2DestFields = new LinkedHashSet<>();
-        boolean cop2DestMaskVerify = false;
-        // Rule 141: STATIC_INIT_MANIFEST - __sinit_* vtable/global installers.
-        List<String> staticInitInstalls = new ArrayList<>();
-        boolean isStaticInitializer = false;
-        boolean staticInitInstallsVtable = false;
-        boolean isUncalledStaticInit = false;
-        // Rule 142: MEMORY_ALLOCATOR_NEVER_STUB - pool/alloc/placement-new/array-ctor.
+        int cop2FullDestOps    = 0;
+        Set<String> cop2DestFields = new LinkedHashSet<>();   // e.g. "xy","z","xyz"
+        boolean cop2DestMaskVerify = false;                   // partial-dest present
+        // Rule 141: static-initializer (__sinit_*) install manifest. These funcs
+        // have NO `jal` caller — they run ONLY via the global-ctors table. When
+        // that table is not driven (headless port), the global object's vtable
+        // pointer / field stays null and the next virtual dispatch silently
+        // no-ops (F50.4 MainScene+0x10548=__vt__6CScene, F50.7 CRandomCircle /
+        // CGeoStone). Each entry = [storePc, installedValue(target), storeOff].
+        List<long[]> staticInitInstalls = new ArrayList<>();
+        boolean isStaticInitializer = false;     // name starts with __sinit_
+        boolean staticInitInstallsVtable = false;// installs a __vt__* pointer
+        boolean isUncalledStaticInit = false;    // __sinit AND zero call/flow xrefs
+        // Rule 142: memory allocator / pool / placement-new. F50.1/F50.2: when
+        // auto-stubbed to `setReturnS32(0)` the pool is never created, Alloc
+        // returns 0, and constructing on null yields a garbage vtable PC deep in
+        // an init chain (masquerades as a bad-ctor crash). Never auto-stub.
         boolean isMemoryAllocator = false;
-        String  allocatorKind = null;
-        // Rule 143: GUEST_LOCK_HOG_CANDIDATE - yield-without-mutex-release pattern.
+        String  allocatorKind = null;            // pool_init | alloc | placement_new | array_ctor | stack
+        // Rule 143: guest-execution-lock hog. F49.5/F50: a guest thread spinning
+        // without yielding the single m_guestExecutionMutex (e.g. GamePadStep ->
+        // SwitchGamePadThread / RotateThreadReadyQueue syscall 0x2B) starves all
+        // other guest threads → menu→dungeon deadlock. Yield syscalls MUST wrap
+        // their wait in GuestExecutionReleaseScope.
         boolean isGuestLockHogCandidate = false;
-        // Rule 144: EABI_ARG_T0 - reads $t0 as 5th integer argument before defining it.
+        // Rule 144: MIPS EABI 5th-arg detection. F50.1/F50.2: the game passes the 5th
+        // integer arg in $t0 ($a4), not on the stack (construct_new_array:
+        // a0=array,a1=ctor,a2=dtor,a3=elemSize,a4=$t0=count). A runtime/CRT
+        // helper override must derive its ABI from the real call site. True when
+        // the body reads $t0 as a source before defining it in the prologue.
         boolean readsEabiArgT0 = false;
-        // Rule 145: MAP_CLUT_PSMCT16_UPLOADER - BITBLTBUF writer loading PSMCT16 (dpsm=0x2).
+        // Rule 145: PSMCT16 map-CLUT uploader. F50.8-F50.11: the dungeon map
+        // texture subsystem (tbp=0x2580 / CLUT cbp=0x2980 PSMCT16) is separate
+        // from mgCTextureManager and its PSMCT16 CLUT (dpsm=0x2) is NEVER
+        // transferred → empty CLUT → black. Flags BITBLTBUF writers that load a
+        // PSMCT16 dpsm constant.
         boolean loadsPsmct16Const = false;
         boolean isPsmct16ClutUploader = false;
-        // Rule 146: COMPUTED_JUMP_TARGETS - Ghidra-resolved jr $reg switch tables.
-        Map<Long,List<Long>> computedJumpTargets = new LinkedHashMap<>();
+
+        // ===== v10.1 fields (PCSX2- + skill-grounded) =====
+        // Rule 146: computed `jr $reg` switch-table sites + Ghidra-resolved
+        // destinations. Static recompilers panic on unresolved indirect jumps;
+        // emitting the resolved target list lets the recompiler pre-populate its
+        // jump dispatch. Each target entry = [sitePc, targetAddr]. switchPcs holds
+        // every computed-jr site (so a site with no targets = UNRESOLVED).
+        List<long[]> computedJumpTargets = new ArrayList<>();
         Set<Long> computedJumpSwitchPcs = new LinkedHashSet<>();
-        // Rule 147: COP2_SPECIAL_OPS_REVIEW - vdiv/vsqrt/vrsqrt/vclipw/xgkick etc.
+        // Rule 147: COP2 special-op / latency hazards beyond the dest-mask blends
+        // (F51.8 fix log: "watch vmr32 / vclip / vopmsub"). Families: EFU_Q_LATENCY
+        // (vdiv/vsqrt/vrsqrt write Q with latency), CLIP_FLAG (vclipw), R_REGISTER
+        // (vrnext/vrget/vrxor), VMR32, WAIT (vwaitq/p), OUTER_PRODUCT (vopmsub/
+        // vopmula), XGKICK.
         Set<String> cop2SpecialOps = new LinkedHashSet<>();
-        // Rule 148: FPU_NONIEEE_SENSITIVE - ctc1/cfc1 or div.s/sqrt.s with usesCop1.
+        // Rule 148: EE FPU is non-IEEE (no denormals/NaN, truncation, soft div/
+        // sqrt). Naive host float diverges. writesFpuControl = ctc1/cfc1 (rounding
+        // mode); usesFpuDivSqrt = div.s/sqrt.s/rsqrt.s.
         boolean writesFpuControl = false;
         boolean usesFpuDivSqrt = false;
-        // Rule 150: OVERLAY_LOADER - EE code-overlay exec/load callee detected.
+        // Rule 150: calls an EE code-overlay loader (LoadExecPS2/ExecPS2/
+        // LoadModuleBuffer ...). Static recompilers assume a flat address space;
+        // overlay games reuse a region for multiple code banks.
         boolean isOverlayLoader = false;
+
+        // ===== v12 fields (the game G27-G52 retrospective + general RTT/present hazards) =====
+        // Rule 166: writes the GS FRAME reg (A+D id 0x4C/0x4D) — the render-target setter.
+        boolean writesFrameReg = false;
+        // Rule 165/166/167: labelled VRAM pages this func loads as constants
+        // (tbpConstantsLoaded ∩ KNOWN_TBP_LABELS), captured before the
+        // Rule 78 noise gate clears tbpConstantsLoaded.
+        Set<Long> vramKnownPagesHit = new LinkedHashSet<>();
+        // Rule 166: writesFrameReg + a known texture/CLUT page const → in-place RTT.
+        boolean isRttTarget = false;
+        // Rule 167: writesZbufReg + a known FRAME/texture page const → Z aliases live VRAM (G45).
+        boolean zbufVramAliasRisk = false;
+        // Rule 169: matrix-inverse helper that depends on the vf0.w==1 HW constant (G40).
+        boolean isVf0DependentInverse = false;
+        // Rule 170: backward-branch wait on an audio/stream completion signal (F63/F64).
+        boolean isAudioCompletionGate = false;
+        Set<String> audioGateSignals = new LinkedHashSet<>();
+        // Rule 171: sceMc*/libmc save-data callee.
+        boolean isMemcardIo = false;
+        Set<String> memcardCallees = new LinkedHashSet<>();
+        // Rule 173: writes an interlace/field GS privileged reg (SMODE/PMODE/CSR/SYNCV).
+        boolean writesPresentationFieldState = false;
+        Set<String> presentationRegs = new LinkedHashSet<>();
+        // Rule 174: DISPFB writer that signals the double-buffer/present flip.
+        boolean isDisplayBufferFlip = false;
+        // Rule 175: TEXFLUSH / CLUT-page cache op.
+        boolean isClutCacheInvalidator = false;
+        // Rule 176: derived frame-hot optimisation candidate.
+        boolean isPerfHotFramePath = false;
+
+        // ===== v13 fields (the game G53-G82 title-3D retrospective + general PS2 hazards) =====
+        // Rule 178: `lw $rX,<global>; beqz $rX; <stores>` guarded-config block (G58/G81).
+        boolean isConditionalInitOnGlobal = false;
+        Set<String> guardGlobals = new LinkedHashSet<>();   // gp-rel label or abs-hex of the guard
+        int conditionalInitSlots = 0;                        // stores inside the guarded block
+        // Rule 179: render-mode (copy vs transform) selector writer (G75-G80).
+        boolean isRenderModeSelector = false;
+        // Rule 180: per-vertex directional-light / N·L term (G82).
+        boolean isVertexLightingTerm = false;
+        Set<String> lightingSources = new LinkedHashSet<>();
+        // Rule 181: terminal `jr $rX` through a loaded vtable slot (G59 recompiler tail-call bug).
+        boolean isVtableTailcallThunk = false;
+        Set<Long> tailcallVtableSlots = new LinkedHashSet<>();
+        // Rule 182: RTT_TARGET that never writes a display-buffer FRAME back (G79 GS-state leak).
+        boolean isRttNoRestore = false;
+        // Rule 184: uploads VU microcode whose flag pipeline needs verifying (G71).
+        boolean isVuFlagPipelineUploader = false;
+        // Rule 187: GIF_TAG_INLINE_BUILDER that writes RGBAQ (PACKED spread-layout, G82).
+        boolean isPackedRgbaqBuilder = false;
+        // Rule 188: large draw/frame func re-enterable at an interior label (G58/G59 resume risk).
+        boolean isFrameResumeRisk = false;
+
+        // ===== v15 fields (the game G83-G115 retrospective + general PS2 ADC/packer/pacing) =====
+        // Rule 190: builds the VIF UNPACK selector qword a VU dispatcher reads to pick the
+        // PRIM-class packer (the game qword38 in CreateRenderInfoPacket@0x1404d0). G77-G115.
+        boolean isPrimClassSelector = false;
+        // Rule 192: const-tracked A+D store of GS reg 0x05 (XYZ2 draw-kick) / 0x0D (XYZ3 no-kick).
+        boolean writesXyz2Reg = false;     // 0x05 draw-kick vertex
+        boolean writesXyz3Reg = false;     // 0x0D no-kick / strip-restart vertex
+        boolean isKickModeWriter = false;
+        // Rule 191: the VU/EE per-vertex ADC strip-restart "+2048"/0x800 kick add (G65-G115).
+        int kickConstAddCount = 0;         // imm 0x800 in an add-family op
+        boolean isAdcKickVertexSource = false;
+        String  adcSource = null;          // input_driven_xyz3 | uniform_xyz2 | constant_kick
+        // Rule 193: per-block texture reload that de-interleaves TEX0 from geometry (G90-G97).
+        boolean isTextureReloadInterleave = false;
+        // Rule 195: game-step coupled to vsync/frame completion (G103 perf blocker).
+        boolean isVsyncCoupledGameStep = false;
+        // Rule 196: writes the shared view/projection (camera) matrix, not a world matrix (G98/G99).
+        boolean isViewProjectionMatrixWriter = false;
+        // Rule 197: ctor that constructs an array of objects whose elements need per-element vtables (G92).
+        boolean isObjectArrayCtor = false;
+        // Rule 184+: VU/COP2 interpreter-divergence hazards this func touches (manifest).
+        Set<String> vuExecHazards = new LinkedHashSet<>();
+
+        // ===== v15.1 fields (PCSX2-grounded cross-check, Rules 199-202) =====
+        // Rule 199: VIF unpack decompression-state commands this func programs
+        // (STMOD/STMASK/STROW/STCOL/STCYCL/ITOP/BASE/OFFSET). PCSX2 Vif_Unpack.cpp:
+        // mode 1 adds MaskRow, mode 2 difference-accumulates, mask nibble 3 skips the
+        // VU-mem write. A runtime VIF that ignores mode/mask/row/col/cycle decompresses
+        // the vertex/colour stream wrong.
+        Set<String> vifUnpackStateCmds = new LinkedHashSet<>();
+        boolean isVifUnpackDecompressState = false;
+        // Rule 200: writes GS XYOFFSET (A+D 0x18/0x19) — the ±2048 guard-band centre (G88).
+        boolean writesXyoffsetReg = false;
+        boolean isXyoffsetGuardWriter = false;
+        // Rule 201: writes GS TEX1 (A+D 0x14/0x15) — MMAG/MMIN texture filter mode (G8).
+        boolean writesTex1Reg = false;
+        boolean isTex1FilterWriter = false;
+
+        // ===== v15.2 fields (skill cross-check, Rules 203-206) =====
+        // Rule 203: EE MMI (128-bit SIMD integer) ops — a silent-wrong recompiler codegen class.
+        boolean usesMmi = false;
+        int mmiOpCount = 0;
+        Set<String> mmiFamilies = new LinkedHashSet<>();    // e.g. PEXT, PCPY, PMADD, PMFHL, PIPE1
+        // Rule 204: CFC2/CTC2 VU0 control-register access (control-reg map codegen class).
+        boolean usesCop2ControlReg = false;
+        Set<String> cop2ControlRegs = new LinkedHashSet<>();  // resolved index names (STATUS/MAC/CLIP/Q/...)
     }
 
     // =========================================================
@@ -1792,51 +2360,73 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     private Set<Long> step1SkipAddresses = new HashSet<>();
     private Set<String> step1StubNames = new HashSet<>();
     private Set<String> step1SkipNames = new HashSet<>();
-    // v15: step1 entries rescued to RECOMPILE (keyed by address and by name,
-    // because step1 entries may carry either). writeUnifiedConfig drops
-    // these from the copied stubs/skip arrays; reasons live in the JSON.
+    // v11 (General v15): step1 entries rescued to RECOMPILE (keyed by address
+    // and by name, because step1 entries may carry either). writeUnifiedConfig
+    // drops these from the copied stubs/skip arrays; reasons live in the JSON.
     private Map<Long,String> step1RescueByAddr = new LinkedHashMap<>();
     private Map<String,String> step1RescueByName = new LinkedHashMap<>();
-    // v15.2 Rule 151: expected name per step1 address - detects stale /
+    // v11 Rule 151: expected name per step1 address - detects stale /
     // wrong-region input tomls (US vs EU/JP ELF address drift).
     private Map<Long,String> step1NameByAddr = new HashMap<>();
     private int step1NameMismatchCount = 0;
-    // v15.3 Rule 153: runtime-handler roster. Optional - user may point the
-    // script at a ps2xRuntime checkout; we scrape the handler names actually
-    // implemented there. A STUB binding routes to a runtime handler BY NAME,
-    // so a stub whose name is absent from the roster is a silent dead call:
-    // flag NO_RUNTIME_HANDLER -> native_impl_needed + review.
+    // v11.2: step1 tokens whose label is a TRUNCATED form of the real ELF
+    // symbol (v9-era mangled-name truncation, e.g. `__ct@0xADDR`). Counted
+    // separately so they never inflate step1_name_mismatches (which must
+    // mean genuine wrong-region/revision drift). The binding is valid (binds
+    // by address); the entry proceeds through the normal keep gate.
+    private int step1TruncatedNameCount = 0;
+    // v11.1 LOCK: entries marked `# LOCKED` (trailing comment) or listed in a
+    // `locked = [...]` array. Phase-era hand decisions: keep gate is BYPASSED
+    // (a deliberate F-phase stub rarely carries host-boundary evidence - the
+    // gate would strip it and silently regress the build). Locked bindings
+    // are never rescued by any promote pass.
+    private Set<Long> step1LockedAddresses = new HashSet<>();
+    private Set<String> step1LockedNames = new HashSet<>();
+    private int step1LockedKeptCount = 0;
+    // v11.1 RE-ENTRANT: entries that sit under a "# --- Triage Enricher"
+    // marker in the input toml were added by a PREVIOUS enricher run, not by
+    // the step1 exporter. Same vetting, distinct provenance in the JSON
+    // (step1_source = "enricher_prev" vs "exporter").
+    private Set<Long> step1EnricherPrevAddresses = new HashSet<>();
+    private Set<String> step1EnricherPrevNames = new HashSet<>();
+    // v11.1: this ELF's hash, stashed by run() so writeUnifiedConfig can
+    // embed `elf_hash = "<md5>"` into [general] - future re-entrant runs
+    // then get the Rule 154 identity guard for free.
+    private String elfHashForEmit = null;
+    // v11 Rule 153: runtime-handler roster. The script first tries the known
+    // the game layout (D:\ps2r\PS2Recomp\ps2xRuntime), then asks. A STUB binding
+    // routes to a runtime handler BY NAME, so a stub whose name is absent
+    // from the roster is a silent dead call: flag NO_RUNTIME_HANDLER ->
+    // native_impl_needed + review.
     private Set<String> runtimeHandlerNames = new HashSet<>();
     private boolean runtimeRosterLoaded = false;
     private int noHandlerStubCount = 0;
-    // v15.3 Rule 154: elf identity guard. Exporters may embed the hash of the
+    // v11 Rule 154: elf identity guard. Exporters may embed the hash of the
     // ELF they were generated from: `elf_hash = "<md5>"` in [general].
     private String step1ElfHash = null;
     private String step1ElfHashStatus = "absent";   // absent | match | mismatch
-    // v15.3 Rule 158: overlay / out-of-text binding guards.
+    // v11 Rule 158: overlay / out-of-text binding guards.
     private int overlayVetoCount = 0, outOfTextBindingCount = 0;
 
-    // v15.2: advisory lists handed from run() to writeTriageJson so the JSON
-    // carries the full [triage_advisory] content (TOML stays executable-only).
-    private List<String> advisoryNop = new ArrayList<>();
-    private List<String> advisoryPatch = new ArrayList<>();
-    private List<String> advisoryForceRecomp = new ArrayList<>();
-    private List<String> advisoryNativeImpl = new ArrayList<>();
-    private List<String> advisoryReview = new ArrayList<>();
-    private List<long[]> advisoryPatchInstr = new ArrayList<>();
+    // v11 (General v15.2): advisory lists handed from buildTriageAdvisoryBlock
+    // to writeTriageJson so the JSON carries the full [triage_advisory]
+    // content as structured {entry, tags} objects (TOML stays
+    // executable-only). Keyed by advisory category name; entries are raw
+    // "name@0xADDR" optionally followed by " # TAG,TAG".
+    private Map<String,List<String>> advisoryJsonLists = new LinkedHashMap<>();
+    // patch-instruction candidates: {pcHex, reason, funcToken}.
+    private List<String[]> advisoryPatchInstr = new ArrayList<>();
 
-    /** v15: record a step1 stub/skip entry rescued to RECOMPILE. Called both
-     *  from the main-loop keep gate and from every later promote-out-of-STUB
-     *  post-pass (drawing chain, ctor risk, sceVu0 helper, v13 firewall). */
-    /** v15.5: remove an auto stub/skip binding from a pending TOML list.
-     *  Covers both spellings: the ELF symbol and (Rule 160) the inferred
-     *  syscall handler name the entry may have been bound under. */
+    /** v11 (General v15.5): remove an auto stub/skip binding from a pending
+     *  TOML list. Covers both spellings: the ELF symbol and (Rule 160) the
+     *  inferred syscall handler name the entry may have been bound under. */
     private void removeAutoBindingEntries(List<String> list, FuncResult r) {
         list.remove(r.name + "@" + hex(r.address));
         if (r.traits != null && r.traits.inferredName != null)
             list.remove(r.traits.inferredName + "@" + hex(r.address));
     }
 
+    /** v11 (General v15): record a step1 stub/skip entry rescued to RECOMPILE. */
     private void noteStep1Rescue(String name, long addr, String reason) {
         step1RescueByAddr.putIfAbsent(addr & 0xFFFFFFFFL, reason);
         if (name != null && !name.isEmpty()) step1RescueByName.putIfAbsent(name, reason);
@@ -1853,32 +2443,35 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         noteStep1Rescue(r.name, r.address, reason);
     }
 
-    /** v15: step1 binding kept on HARD host-boundary evidence - a deliberate
-     *  boundary later promote passes must not unwind. v15.4: roster-backed
-     *  keeps (runtime implements the handler by name) are equally hard. */
+    /** v11 (General v15): step1 binding kept on HARD host-boundary evidence -
+     *  a deliberate boundary later promote passes must not unwind. v15.4:
+     *  roster-backed keeps (runtime implements the handler by name) are
+     *  equally hard. */
     private boolean isHardBoundStep1(FuncResult r) {
         if (!"step1".equals(r.origin)) return false;
+        // v11.1: explicit user lock beats every promote pass.
+        if (r.tags.contains("STEP1_LOCKED")) return true;
         if (!r.tags.contains("STEP1_BOUND_HOST_BOUNDARY")) return false;
         if (hasHostBoundaryEvidence(r.traits)) return true;
         return r.tags.contains("STEP1_BOUND_ROSTER_HANDLER");
     }
 
-    /** v15 high-confidence keep gate for inherited (step1) stub/skip bindings.
-     *  Returns null when the binding may stand; otherwise the rescue reason.
-     *  Philosophy: RECOMPILE is the safe default for anything that is pure EE
-     *  code - recompiled code is always semantically correct, while a stub is
-     *  only correct if the runtime actually services it. A binding therefore
-     *  survives only with host-boundary evidence (syscall / SIF RPC / IRX /
-     *  IPU-MPEG / SDK-named MMIO poller), and never against the existing
-     *  trait firewalls. */
+    /** v11 (General v15) high-confidence keep gate for inherited (step1 /
+     *  DAC.toml) stub/skip bindings. Returns null when the binding may stand;
+     *  otherwise the rescue reason. Philosophy: RECOMPILE is the safe default
+     *  for anything that is pure EE code - recompiled code is always
+     *  semantically correct, while a stub is only correct if the runtime
+     *  actually services it. A binding therefore survives only with
+     *  host-boundary evidence (syscall / SIF RPC / IRX / IPU-MPEG / SDK-named
+     *  MMIO poller), and never against the existing trait firewalls. */
     private String step1KeepGateFailure(String name, FuncTraits t, boolean isSkip,
                                         boolean isWhitelisted, boolean forceRecompile) {
-        // v15.5 Rule 159 (order matters, BEFORE the trait firewall): bare
-        // syscall trampolines. A <=32-byte, 0-call body with a syscall is
-        // just `li $v1,N; syscall; jr $ra` - the trait firewalls that can
-        // set forceRecompile on it (PROCESS_TERMINATOR / allocator / ctor
-        // names) are name-derived false positives on a 2-instruction body
-        // and used to rescue _exit/_Exit with a misleading reason.
+        // Rule 159 (order matters, BEFORE the trait firewall): bare syscall
+        // trampolines. A <=32-byte, 0-call body with a syscall is just
+        // `li $v1,N; syscall; jr $ra` - the trait firewalls that can set
+        // forceRecompile on it (PROCESS_TERMINATOR / allocator / ctor names)
+        // are name-derived false positives on a 2-instruction body and used
+        // to rescue _exit/_Exit with a misleading reason.
         //  - STUB binding + runtime handler by name -> keep (real impl).
         //  - STUB binding + roster loaded but NO handler -> rescue: the stub
         //    would compile to a ps2_stubs::TODO_NAMED placeholder returning
@@ -1898,14 +2491,14 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             return null;
         if (forceRecompile)
             return "trait firewall (vtable-ctor/allocator/large-init/multi-field-ctor/terminator/COP2)";
-        // v15.4: roster-backed keep. The runtime author already implemented a
-        // handler with this exact name AND the name is a known SDK boundary
-        // family - that is the strongest possible keep signal (handler
-        // existence = intent + tested implementation). Checked before the
-        // sceVu0 deny: runtimes ship SIMD-native sceVu0 math (skill sec.6), and
+        // General v15.4: roster-backed keep. The runtime author already
+        // implemented a handler with this exact name AND the name is a known
+        // SDK boundary family - that is the strongest possible keep signal
+        // (handler existence = intent + tested implementation). Checked
+        // before the sceVu0 deny: runtimes ship SIMD-native sceVu0 math, and
         // a verified handler beats recompiled COP2-macro translation. The
         // sceGifPk/sceVif1Pk packet families stay excluded - they build
-        // EE-RAM packets and the SF3/DC2 benchmarks proved they must
+        // EE-RAM packets and the SF3/the game benchmarks proved they must
         // recompile even when the runtime carries lookalike impls.
         boolean pkFamily = name.startsWith("sceGifPk") || name.startsWith("sceVif1Pk");
         if (runtimeRosterLoaded && hasRuntimeHandler(name) && !pkFamily && !isSkip
@@ -1913,22 +2506,22 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             return null;
         if (name.startsWith("sceVu0"))
             return "sceVu0 VU0-macro math must be recompiled (pure computation)";
-        boolean syscallWrapperShape = t.hasSyscall && t.byteSize <= 32 && t.callOps == 0;
+        boolean syscallWrapperShape = t != null && t.hasSyscall
+                && t.byteSize <= 32 && t.callOps == 0;
         if (isSkip) {
             // SKIP generates an error-returning placeholder: legal only for
-            // bare kernel trampolines and unreachable bootstrap code. The FF1
-            // input toml had SKIPPED __ieee754_sqrtf/__muldi3/__do_global_ctors
-            // - pure computation whose loss silently corrupts math and static
-            // init. Those must recompile.
+            // bare kernel trampolines and unreachable bootstrap code. Pure
+            // computation whose loss silently corrupts math and static init
+            // (libgcc/__do_global_ctors class) must recompile.
             if (syscallWrapperShape) return null;
-            if (t.hasSyscall && t.xrefToCount == 0) return null; // unreferenced kernel bootstrap
+            if (t != null && t.hasSyscall && t.xrefToCount == 0) return null; // unreferenced kernel bootstrap
             return "SKIP only for bare syscall trampolines / unreachable bootstrap; "
                  + "pure code must RECOMPILE";
         }
-        // v15.3 Rule 156 (order matters): HARD host-boundary evidence
-        // (syscall / SIF RPC / IRX / IPU-MPEG) keeps the stub even when the
-        // name looks like a callback/handler or sits inside the (now depth-3)
-        // mainloop shield - per-frame SDK wrappers like sceGsSyncV are still
+        // Rule 156 (order matters): HARD host-boundary evidence (syscall /
+        // SIF RPC / IRX / IPU-MPEG) keeps the stub even when the name looks
+        // like a callback/handler or sits inside the (now depth-3) mainloop
+        // shield - per-frame SDK wrappers like sceGsSyncV are still
         // deliberate boundaries. Whitelist shapes only rescue functions
         // WITHOUT hard evidence.
         if (hasHostBoundaryEvidence(t)) return null;
@@ -1944,11 +2537,6 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // Rule 18: Game override import (v3 NEW)
     private Set<Long> gameOverrideAddresses = new HashSet<>();
     private Map<Long, String> gameOverrideNames = new HashMap<>();
-    // Rule 98: handler body classification (addr -> kind string).
-    private Map<Long, String> overrideKindByAddr = new HashMap<>();
-    private Map<Long, String> overrideHandlerNames = new HashMap<>();
-    private int overrideClassifiedCount = 0;
-    private int overrideRetireCount = 0;
 
     // Rule 11: MainLoop shield
     private Set<Long> mainLoopShield = new HashSet<>();
@@ -1963,8 +2551,76 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // v3 counters
     private int conventionViolationCount=0, initLargeFuncCount=0;
     private int dmaTteRiskCount=0, iopRpcCount=0;
-    private int padPollLoopCount=0;
+    private int archiveIoCount=0, padPollLoopCount=0;
     private int gameOverrideImportedCount=0;
+    // v11.3 detector counters (Rules 162-164).
+    private int sprDmaStagerCount=0, subwordDmaStrKickCount=0;
+    private int vu1DoubleBufferFramerCount=0, stalePtrCacheCtorCount=0;
+    // v12 Rules 165-177 counters + top-level collectors
+    private int rttTargetCount=0, zbufVramAliasCount=0, vf0DependentInverseCount=0;
+    private int audioCompletionGateCount=0, memcardIoCount=0;
+    private int presentationFieldStateCount=0, displayBufferFlipCount=0;
+    private int clutCacheInvalidatorCount=0, perfHotFramePathCount=0;
+    private int frameRegWriterCount=0;
+    // Rule 165: VRAM page -> {kind -> list of func names} for overlap pairing.
+    private final Map<Long,Map<String,List<String>>> vramPageWriters = new LinkedHashMap<>();
+    // Rule 165 output: [pageHex, label, kindA, funcA, kindB, funcB, classification]
+    private final List<String[]> vramOverlapPairs = new ArrayList<>();
+    // Rule 177: distinct labelled VRAM pages referenced statically.
+    private final Set<Long> gsLocalMemPagesReferenced = new LinkedHashSet<>();
+    // ===== v13 counters + top-level lists (Rules 178-189) =====
+    private int conditionalInitOnGlobalCount=0, renderModeSelectorCount=0;
+    private int vertexLightingTermCount=0, vtableTailcallThunkCount=0;
+    private int rttNoRestoreCount=0, packedRgbaqBuilderCount=0, frameResumeRiskCount=0;
+    private int vuFlagPipelineUploaderCount=0;
+    // Rule 179/180/182/184/187/188 top-level rosters: [name, addrHex, detail].
+    private final List<String[]> renderModeSelectors = new ArrayList<>();
+    private final List<String[]> vertexLightingTerms = new ArrayList<>();
+    private final List<String[]> vtableTailcallThunks = new ArrayList<>();
+    private final List<String[]> rttNoRestoreFuncs = new ArrayList<>();
+    private final List<String[]> packedRgbaqBuilders = new ArrayList<>();
+    private final List<String[]> frameResumeRiskFuncs = new ArrayList<>();
+    private final List<String[]> vuFlagPipelineUploaders = new ArrayList<>();
+    // Rule 186 INIT_ORDER_DEPENDENCY: global token -> writer/reader func-name lists.
+    private final Map<String,List<String>> initGlobalWriters = new LinkedHashMap<>();
+    private final Map<String,List<String>> initGlobalSinitWriters = new LinkedHashMap<>();
+    private final Map<String,List<String>> initGlobalReaders = new LinkedHashMap<>();
+    // Rule 186 output: [globalToken, readerFunc, writerFunc, writerKind].
+    private final List<String[]> initOrderHazards = new ArrayList<>();
+    // ===== v15 counters + top-level rosters (Rules 190-198) =====
+    private int primClassSelectorCount=0, adcKickVertexSourceCount=0, kickModeWriterCount=0;
+    private int textureReloadInterleaveCount=0, vsyncCoupledGameStepCount=0;
+    private int viewProjectionWriterCount=0, objectArrayCtorCount=0;
+    // [name, addrHex, detail] triads (reuse emitV13Roster).
+    private final List<String[]> primClassSelectors      = new ArrayList<>();
+    private final List<String[]> adcKickSources          = new ArrayList<>();
+    private final List<String[]> kickModeWriters         = new ArrayList<>();
+    private final List<String[]> textureReloadInterleave = new ArrayList<>();
+    private final List<String[]> framePacingDrivers      = new ArrayList<>();
+    private final List<String[]> viewProjectionWriters   = new ArrayList<>();
+    private final List<String[]> objectArrayCtors        = new ArrayList<>();
+    // Rule 194 ALLOCATOR_FAMILY_COHERENCE: [name, addrHex, disposition].
+    private final List<String[]> allocatorFamily = new ArrayList<>();
+    private boolean allocatorFamilySplit = false;
+    // Rule 184+ VU_EXEC_HAZARD_MANIFEST: [name, addrHex, hazard1|hazard2|...].
+    private final List<String[]> vuExecHazardManifest = new ArrayList<>();
+    // ===== v15.1 counters + rosters (PCSX2-grounded, Rules 199-202) =====
+    private int vifUnpackDecompressCount=0, xyoffsetGuardWriterCount=0, tex1FilterWriterCount=0;
+    private final List<String[]> vifUnpackDecompressState = new ArrayList<>();
+    private final List<String[]> xyoffsetGuardWriters     = new ArrayList<>();
+    private final List<String[]> tex1FilterWriters        = new ArrayList<>();
+    // ===== v15.2 counters + rosters (skill cross-check, Rules 203-205) =====
+    private int mmiCodegenRiskCount=0, cop2ControlRegCount=0;
+    private final List<String[]> mmiCodegenRisk      = new ArrayList<>();
+    private final List<String[]> cop2ControlRegAccess = new ArrayList<>();
+    // Rule 205 UNFUNDED_TEXTURE_PAGE: [pageHex, label, samplerFunc].
+    private final List<String[]> unfundedTexturePages = new ArrayList<>();
+    // v11.3: run mode. false => FIRST run (full pipeline: generate functions.csv
+    // + base config + assembly/decompiled/flowchart + unified TOML + JSON).
+    // true => INCREMENTAL (emit the new JSON, and MODIFY the existing live
+    // config_auto_recomp.toml in place only when the content actually changes;
+    // preserves # LOCKED and manual edits via the re-entrant + LOCK machinery).
+    private boolean incrementalMode=false;
     private int threadSyncCount=0; // Rule 25
 
     // v4 counters
@@ -2018,76 +2674,68 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     private int filePathSprintfCount=0;
     private int frameClockDriverCount=0;
     private int sceVu0HelperCount=0;
+    private int assetUploadTraceFuncCount=0;
+    private int overrideClassifiedCount=0;
+    private int overrideRetireCount=0;
     private int dispfbWriterViaSdkCallerCount=0;
     private int dmaKickViaSdkCallerCount=0;
     private int returnWrittenToGlobalCount=0;
+    private int autoExtendedGlobalsCount=0;
+    // Auto-extended the game gp globals discovered via return-to-global tracking.
+    // Address -> guessed-name (class name where available, else "g_unk_<addr>").
+    private Map<Long,String> autoExtendedGlobals = new LinkedHashMap<>();
 
     // v9 counters
-    private int archiveIoCount=0;
-    private int gifTagBuilderCount=0;
-    private int bitbltbufMacroCount=0;
-    private int vu0MacroHelperCount=0;
-    private int structInitCount=0;
-    private int spinLoopCount=0;
-    private int dmaChcrStartKickCount=0;
-    private int renderFrameEntryCount=0;
-    private int tableDispatchCallCount=0;
-    // v10 generic counters
-    private int storedVifTagCount=0;
-    private int storedDmaTagCount=0;
-    private int gifTag64Count=0;
-    private int chunk70000Count=0;
-    private int hiLoConsumerCount=0;
-
-    // v11 counters (E/F/H/I/J)
-    private int rcntAccessCount=0;
-    private int vifCtrlAccessCount=0;
-    private int dmacGlobalAccessCount=0;
-    private int intcMaskWriterCount=0;
-    private int intcStatReaderCount=0;
-    private int sioAccessCount=0;
-    private int dmacEnableWriterCount=0;
-    private int sbusFlagAccessCount=0;
-    private int dmaSourceChainTagCount=0;
-    private int formatMagicHitCount=0;
-    private int irxLoaderCount=0;
-    private int iopRebootHandlerCount=0;
-    private int syncWaitLoopCount=0;
-    private int infiniteFailLoopCount=0;
-    // v15.5 Rule 159/161 counters
-    private int syscallTrampolineCount=0;
-    private int dynamicCodeLoaderCount=0;
-
-    // Rules 140-150 counters
-    private int cop2PartialDestFuncCount=0;
-    private int staticInitializerFuncCount=0;
-    private int uncalledStaticInitCount=0;
-    private int memoryAllocatorCount=0;
-    private int guestLockHogCount=0;
-    private int eabiArgT0Count=0;
-    private int psmct16ClutUploaderCount=0;
-    private int computedJumpSiteCount=0;
-    private int computedJumpUnresolvedCount=0;
-    private int cop2SpecialOpFuncCount=0;
-    private int fpuNonIeeeCount=0;
-    private int overlayLoaderCount=0;
-    private int discoveredSidCount=0;
-
-    // Rule 139: discovered IOP SID tracking (cross-function aggregation).
-    private Map<Long,List<Long>> discoveredSidToCallers = new LinkedHashMap<>();
-    private Map<Long,List<Long>> discoveredFidToCallers = new LinkedHashMap<>();
-
+    private int gifTagInlineBuilderCount = 0;
+    private int bitbltbufMacroSeqCount   = 0;
+    private int dmaChcrStartKickCount    = 0;
+    private int dmaSourceChainBuilderCount = 0;
+    private int compositeMmioRecoveryCount = 0;
+    private int syscallTrampolineCount    = 0;
+    // v11 (General v15.5 Rule 161) counter
+    private int dynamicCodeLoaderCount    = 0;
+    private int backwardSyncWaitCount     = 0;
+    private int infiniteSpinLoopCount     = 0;
+    private int infiniteFailLoopCount     = 0;
+    private int irxLoaderCount            = 0;
+    private int iopRebootHandlerCount     = 0;
+    private int renderFrameEntryCount     = 0;
+    private int structInitializerCount    = 0;
+    private int dispatchTableTargetCount  = 0;
+    private int tableDispatchCallCount    = 0;
+    private int hostWaitCandidateCount = 0;
+    private int knownAddressMatched    = 0;
+    // v11 (the game Rule 151 extension): known addresses whose real ELF symbol
+    // disagrees with the curated US-ELF name map (wrong-region detector).
+    private int knownNameMismatches    = 0;
+    private int discoveredRpcSidCount     = 0;
+    // v10 counters (the game F47-F52 retrospective)
+    private int cop2PartialDestFuncCount  = 0;   // Rule 140
+    private int staticInitializerFuncCount= 0;   // Rule 141
+    private int uncalledStaticInitCount   = 0;   // Rule 141
+    private int memoryAllocatorCount      = 0;   // Rule 142
+    private int guestLockHogCount         = 0;   // Rule 143
+    private int eabiArgT0Count            = 0;   // Rule 144
+    private int psmct16ClutUploaderCount  = 0;   // Rule 145
+    // v10.1 counters
+    private int computedJumpSiteCount     = 0;   // Rule 146 (distinct switch pcs)
+    private int computedJumpUnresolvedCount = 0; // Rule 146 (sites with 0 targets)
+    private int cop2SpecialOpFuncCount    = 0;   // Rule 147
+    private int fpuNonIeeeCount           = 0;   // Rule 148
+    private int overlayLoaderCount        = 0;   // Rule 150
+    // Top-level discoveries
+    private Map<Long, List<long[]>> functionPointerTables = new LinkedHashMap<>();
+    private Map<Integer, Set<Long>> moduleClusters       = new LinkedHashMap<>();
+    private Map<String, List<Long>> namePrefixModules    = new LinkedHashMap<>();
+    // address -> set of caller addresses (for discovered_iop_sids)
+    private Map<Long, Set<Long>> discoveredSidToCallers  = new LinkedHashMap<>();
+    private Map<Long, Set<Long>> discoveredFidToCallers  = new LinkedHashMap<>();
     // Rule 93 class registry: class name -> aggregated info.
     private Map<String, ClassEntry> classRegistry = new LinkedHashMap<>();
+    // Rule 103 asset upload traces: tag -> list of (funcAddr, funcName) + callers.
+    private Map<String, List<long[]>> assetUploadTraces = new LinkedHashMap<>();
     // Rule 109 diff-mode: address -> prior `disposition|category` string.
     private Map<Long,String> priorTriageMapCats = null;
-
-    // v9 R9: discovered function-pointer tables. {tableAddr -> list of entries}.
-    private Map<Long, List<Long>> functionPointerTables = new LinkedHashMap<>();
-    // v9 R18: module cluster registry. id -> set of function addrs.
-    private Map<Integer, Set<Long>> moduleClusters = new LinkedHashMap<>();
-    // v11 (K): name-prefix module index. prefix -> sorted addresses.
-    private Map<String, List<Long>> namePrefixModules = new LinkedHashMap<>();
 
     /** Rule 93: aggregated per-class info for the JSON `classes` section. */
     static class ClassEntry {
@@ -2117,18 +2765,60 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         memory = currentProgram.getMemory();
 
         println("=========================================================");
-        println("PS2Recomp TRIAGE ENRICHER v11 - FF1+DC2 cross-game rules");
+        println("PS2Recomp TRIAGE ENRICHER v3 - the game-aware (Rules 18-24)");
         println("=========================================================\n");
 
-        File csvFile = askFile("Select functions.csv from Step 1","Open");
-        if (csvFile==null||!csvFile.exists()){printerr("No CSV. Aborting.");return;}
+        // v11.3: run mode. FIRST run = full pipeline (generate functions.csv +
+        // base config via ExportPS2Functions, then enrich). INCREMENTAL = re-emit
+        // the JSON and MODIFY the existing live config in place, only on delta.
+        // If the ELF is unchanged since the last run, choose NO; the Rule 154
+        // elf_hash guard double-checks and warns on a real mismatch.
+        boolean firstRun = askYesNo("General TriageEnricher - run mode",
+            "Is this the FIRST run for this ELF?\n\n"
+          + "YES = full pipeline: generate functions.csv + base config (via "
+          + "ExportPS2Functions) + assembly/decompiled/flowchart + unified TOML + JSON.\n\n"
+          + "NO = incremental: emit the new triage_map.json and MODIFY the existing "
+          + "config_auto_recomp.toml IN PLACE, only where needed (preserves # LOCKED "
+          + "and manual edits).");
+        incrementalMode = !firstRun;
 
-        File configToml = askFile("Select config.toml from Step 1","Open");
-        if (configToml==null||!configToml.exists()){printerr("No config.toml. Aborting.");return;}
-
-        File outputDir = csvFile.getParentFile();
-        File unifiedToml = new File(outputDir,"config_auto_recomp.toml");
-        File triageJson  = new File(outputDir,"triage_map.json");
+        File csvFile, configToml, outputDir;
+        if (firstRun) {
+            // Step-1 export is delegated to ExportPS2Functions so the recompiler's
+            // ghidra_output CSV + executable-label records stay authoritative (no
+            // duplicated classifier). Falls back to manual select if the script is
+            // not on Ghidra's script path.
+            println("[RUN-MODE] FIRST run - generating functions.csv + base config via ExportPS2Functions.");
+            try { runScript("ExportPS2Functions.java"); }
+            catch (Exception ex) {
+                printerr("[RUN-MODE] ExportPS2Functions not run automatically ("
+                    + ex.getMessage() + "); run it yourself, then select its outputs.");
+            }
+            csvFile = askFile("Select the functions.csv (from ExportPS2Functions)","Open");
+            if (csvFile==null||!csvFile.exists()){printerr("No CSV. Aborting.");return;}
+            configToml = askFile("Select the base config.toml (from ExportPS2Functions)","Open");
+            if (configToml==null||!configToml.exists()){printerr("No config.toml. Aborting.");return;}
+            outputDir = csvFile.getParentFile();
+        } else {
+            // Incremental: point at the LIVE project config to modify in place.
+            configToml = askFile("Select the LIVE config_auto_recomp.toml to modify in place","Open");
+            if (configToml==null||!configToml.exists()){printerr("No config. Aborting.");return;}
+            outputDir = configToml.getParentFile();
+            csvFile = new File(outputDir, "functions.csv"); // directory anchor only; never parsed
+            println("[RUN-MODE] INCREMENTAL - "+configToml.getName()
+                +" will be modified in place only if the content changes.");
+        }
+        File unifiedToml = incrementalMode ? configToml
+                                           : new File(outputDir,"config_auto_recomp.toml");
+        // v14: the monolithic triage_map.json is replaced by index/functions_index.json
+        // (full machine-readable map) + per-function Markdown docs in functions/.
+        File indexDir    = new File(outputDir,"index");
+        File functionsDir = new File(outputDir,"functions");
+        indexDir.mkdirs(); functionsDir.mkdirs();
+        if(!indexDir.isDirectory() || !functionsDir.isDirectory())
+            println("[WARN] could not pre-create index/ or functions/ under "
+                + outputDir.getAbsolutePath() + " - utf8Writer will retry per file.");
+        File triageJson  = new File(indexDir,"functions_index.json");
 
         // Rule 9: Parse step 1 config
         parseStep1Config(configToml);
@@ -2136,54 +2826,66 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             step1StubAddresses.size(),step1StubNames.size(),
             step1SkipAddresses.size(),step1SkipNames.size()));
 
-        // Rule 18 (v3 NEW): Parse game override file
+        // Rule 18 (v3 NEW): Parse game override file (Auto-discovery)
         try {
-            File overrideFile = askFile(
-                "Select dc2_game_override.cpp (or similar) - Cancel to skip","Open");
-            if (overrideFile!=null && overrideFile.exists()) {
+            File overrideFile = new File(outputDir, "src/game_overrides.cpp");
+            if (!overrideFile.exists()) overrideFile = new File(outputDir, "src/game_override.cpp");
+            if (!overrideFile.exists()) overrideFile = new File(outputDir, "game_override.cpp");
+            
+            if (overrideFile.exists()) {
                 parseGameOverrideFile(overrideFile);
-                println(String.format("[OVERRIDE] Imported %d pre-bound addresses from %s.",
-                    gameOverrideImportedCount, overrideFile.getName()));
+                println(String.format("[OVERRIDE] Auto-imported %d pre-bound addresses from %s.",
+                    gameOverrideImportedCount, overrideFile.getAbsolutePath()));
             } else {
-                println("[OVERRIDE] Skipped - no game override file selected.");
+                println("[OVERRIDE] Skipped - no game_override.cpp found in src/ or output root.");
             }
         } catch (Exception ignored) {
-            println("[OVERRIDE] Skipped (dialog cancelled).");
+            println("[OVERRIDE] Skipped (error reading file).");
         }
 
-        // v7 (NEW): GS-dump runtime evidence folder. Optional.
+        // v7 (NEW): GS-dump runtime evidence folder (Auto-discovery). Optional.
         try {
-            File gsDir = askDirectory(
-                "Select folder of *.gs.summary.json files (Cancel to skip)","Open");
-            if (gsDir!=null && gsDir.isDirectory()) {
+            File gsDir = new File(outputDir, "gs_dumps");
+            if (!gsDir.exists()) gsDir = new File(outputDir, "dumps");
+            
+            if (gsDir.isDirectory()) {
                 loadGsSummaryFolder(gsDir);
                 int n = gsEvidence.checkpoints.size();
                 if (n > 0) {
-                    println(String.format("[GS-EVIDENCE] Loaded %d checkpoints from %s.",
-                        n, gsDir.getName()));
+                    println(String.format("[GS-EVIDENCE] Auto-loaded %d checkpoints from %s.",
+                        n, gsDir.getAbsolutePath()));
                     println(String.format("[GS-EVIDENCE] anyP1=%s anyP2=%s anyP3=%s any4HH=%s anyPrimGarb=%s imrAllMasked=%s",
                         gsEvidence.anyPath1, gsEvidence.anyPath2, gsEvidence.anyPath3,
                         gsEvidence.anyPsmt4hh, gsEvidence.anyPrimGarbage,
                         gsEvidence.imrAllMaskedGsIrqs));
                 } else {
-                    println("[GS-EVIDENCE] Folder selected but no .summary.json found.");
+                    println("[GS-EVIDENCE] Skipped - gs_dumps folder found but no .summary.json present.");
                 }
             } else {
-                println("[GS-EVIDENCE] Skipped - no folder selected.");
+                println("[GS-EVIDENCE] Skipped - no gs_dumps/ folder found in output directory.");
             }
         } catch (Exception ex) {
             println("[GS-EVIDENCE] Skipped: "+ex.getMessage());
         }
 
-        // v15.3 Rule 153: optional ps2xRuntime checkout - handler roster.
+        // v11 Rule 153 (General-tuned): ps2xRuntime handler roster. Try the
+        // known the game working-tree location first so the common case needs no
+        // dialog; fall back to askDirectory (Cancel to skip).
         try {
-            File rtDir = askDirectory(
-                "Select ps2xRuntime root for handler-roster check (Cancel to skip)","Open");
-            if (rtDir!=null && rtDir.isDirectory()) {
-                loadRuntimeHandlerRoster(rtDir);
+            File runtimeDir = new File("D:\\ps2r\\ps2xRuntime");
+            if (runtimeDir.isDirectory()) {
+                println("[RUNTIME-ROSTER] Using known the game runtime checkout: "
+                        + runtimeDir.getAbsolutePath());
+                loadRuntimeHandlerRoster(runtimeDir);
             } else {
-                println("[RUNTIME-ROSTER] Skipped - no runtime folder selected. "+
-                        "Stub-vs-handler check disabled.");
+                File rtDir = askDirectory(
+                    "Select ps2xRuntime root for handler-roster check (Cancel to skip)","Open");
+                if (rtDir!=null && rtDir.isDirectory()) {
+                    loadRuntimeHandlerRoster(rtDir);
+                } else {
+                    println("[RUNTIME-ROSTER] Skipped - no runtime folder selected. "+
+                            "Stub-vs-handler check disabled.");
+                }
             }
         } catch (Exception ex) {
             println("[RUNTIME-ROSTER] Skipped: "+ex.getMessage());
@@ -2196,44 +2898,15 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 "Enter MainLoop address (Cancel = auto-detect or skip)");
         } catch (Exception ignored) {}
         if (mainLoopAddr==null) {
-            // v9: widened name list (SF3 uses AcrMain; nj/SEGA SDK use njUserMain;
-            // common bare-C names: app_main / game_main; libc-style __libc_start_main).
-            // v12 (C2): expanded list. Demangled C++ ctor name still encoded
-            // as `Name__Fv`; behavioral fallback below covers stripped builds.
-            String[] mlNames = {
-                "mainloop__fv","mainloop","main_loop","MainLoop","Main_Loop",
-                "AcrMain","acrmain","app_main","game_main","gameMain",
-                "njUserMain","__libc_start_main","mainLoop","GameMain",
-                // v12 (C2): Jak / Naughty Dog kernel dispatch + generic shapes.
-                "KernelCheckAndDispatch","KernelCheckAndDispatch__Fv",
-                "kdispatch","kernel_main","start_kernel","MasterLoop",
-                "RunGame","RunGame__Fv","RunLoop","run_loop","RunMain",
-                "RunFrame","run_frame","tick","Tick","Tick__Fv",
-                "DispatchLoop","Dispatch__Fv","kernel_dispatcher",
-                // v11 (C): bare `main` - common in C-based PS2 titles
-                // (FF1 Himuro, many mid-2000s ports). Listed last so a more
-                // specific GameMain/mainLoop label wins when both exist.
-                "main"
-            };
-            // v12 (C2): name match accepts contains/suffix for engine-mangled
-            // forms (e.g. `_KernelCheckAndDispatch__Fv_0x00100130`).
-            outer:
             for (Function f : funcManager.getFunctions(true)) {
-                String nLow = f.getName().toLowerCase();
-                for (String cand : mlNames) {
-                    String c = cand.toLowerCase();
-                    if (nLow.equals(c) || nLow.startsWith(c+"_0x") ||
-                        (c.length() >= 8 && nLow.contains(c))) {
-                        mainLoopAddr = f.getEntryPoint();
-                        println("[MAINLOOP] Auto-detected by name: "+f.getName()+" @ "+mainLoopAddr);
-                        break outer;
-                    }
+                String n = f.getName().toLowerCase();
+                if (n.equals("mainloop__fv")||n.equals("mainloop")||n.equals("main_loop")) {
+                    mainLoopAddr = f.getEntryPoint();
+                    println("[MAINLOOP] Auto-detected: "+f.getName()+" @ "+mainLoopAddr);
+                    break;
                 }
             }
         }
-        // v9 behavioral fallback: if no name match, attempt graph-shape detection.
-        // Run AFTER scan in run() - defer detection until traits/jalSites built.
-        // (Hook below in main scan loop; see resolveMainLoopBehavioral().)
         if (mainLoopAddr!=null) {
             buildMainLoopShield(mainLoopAddr);
             mainLoopAddrOpt = mainLoopAddr.getOffset() & 0xFFFFFFFFL;
@@ -2254,14 +2927,61 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
         detectTextSection();
         long gpValue = detectGlobalPointer();
-        String elfHash = computeElfHash();
 
-        // v15.3 Rule 154: ELF identity guard. If the step1 toml recorded the
-        // hash of the ELF it was generated from, compare it with this
-        // program's hash. A mismatch means every address-based binding in the
-        // input may point at the wrong function (different revision / region
-        // ELF) - Rule 151 then catches the per-entry damage, but the global
-        // warning surfaces the root cause.
+        // v9.1: pre-scan KNOWN_FUNCTION_ADDRESSES. Counts both address +
+        // name hits across the ELF — independent of Step1/override gate that
+        // would otherwise skip pre-classified entries (so the static map is
+        // still populated even for funcs the main scan loop continues past).
+        {
+            int addrHits = 0, nameHits = 0, nameMismatches = 0;
+            ghidra.program.model.address.AddressFactory af = currentProgram.getAddressFactory();
+            for(Object[] row : KNOWN_FUNCTION_ADDRESSES) {
+                long want = ((Number)row[0]).longValue() & 0xFFFFFFFFL;
+                String wantName = (String)row[1];
+                Function f = funcManager.getFunctionAt(af.getDefaultAddressSpace().getAddress(want));
+                if(f != null) {
+                    addrHits++;
+                    // v11 (the game-specific Rule 151 extension): the curated
+                    // address map is ground truth for the US (SCUS-97316)
+                    // ELF. A real symbol at a known address that does NOT
+                    // match the expected name means this Ghidra project was
+                    // built from a different revision/region ELF - the same
+                    // failure mode Rule 154 catches via elf_hash, detectable
+                    // here even when DAC.toml carries no hash.
+                    String got = f.getName();
+                    if(!got.startsWith("FUN_") && !got.startsWith("sub_")
+                       && !got.startsWith("LAB_") && !got.startsWith("thunk_")
+                       && !got.equals(wantName)
+                       && !got.startsWith(wantName)) {
+                        nameMismatches++;
+                        if(nameMismatches <= 8)
+                            println("[KNOWN] !! 0x"+Long.toHexString(want)
+                                +" expected '"+wantName+"' but ELF symbol is '"+got+"'");
+                    }
+                } else {
+                    SymbolIterator si = currentProgram.getSymbolTable().getSymbols(wantName);
+                    if(si.hasNext()) nameHits++;
+                }
+            }
+            knownAddressMatched = addrHits + nameHits;
+            knownNameMismatches = nameMismatches;
+            println(String.format("[KNOWN] address_hits=%d name_hits=%d of %d entries.",
+                addrHits, nameHits, KNOWN_FUNCTION_ADDRESSES.length));
+            if(nameMismatches > 0)
+                println("[!!] KNOWN: "+nameMismatches+" known addresses carry a DIFFERENT real "
+                    +"symbol - this project may be a wrong-region/revision ELF (expect US SCUS-97316).");
+        }
+        String elfHash = computeElfHash();
+        // v11.1: stash for writeUnifiedConfig so the output [general] carries
+        // elf_hash for the next (re-entrant) run's Rule 154 check.
+        elfHashForEmit = elfHash;
+
+        // v11 Rule 154: ELF identity guard. If the step1 toml (DAC.toml)
+        // recorded the hash of the ELF it was generated from, compare it with
+        // this program's hash. A mismatch means every address-based binding
+        // in the input may point at the wrong function (different revision /
+        // region ELF) - Rule 151 then catches the per-entry damage, but the
+        // global warning surfaces the root cause.
         if (step1ElfHash != null && elfHash != null && !elfHash.isEmpty()) {
             step1ElfHashStatus = step1ElfHash.equalsIgnoreCase(elfHash) ? "match" : "mismatch";
             if ("mismatch".equals(step1ElfHashStatus)) {
@@ -2278,10 +2998,6 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         DecompInterface decomp = new DecompInterface();
         decomp.openProgram(currentProgram);
         BasicBlockModel blockModel = new BasicBlockModel(currentProgram);
-
-        PrintWriter asmWriter   = utf8Writer(new File(outputDir,"assembly.txt"));
-        PrintWriter decompWriter = utf8Writer(new File(outputDir,"decompiled.txt"));
-        PrintWriter flowWriter  = utf8Writer(new File(outputDir,"flowchart.txt"));
 
         long scanStart = System.currentTimeMillis();
         try {
@@ -2300,67 +3016,70 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 long offset = addr.getOffset();
                 String funcName = func.getName();
 
-                // Export text files
-                String header = "\n\n========================================\n"+
-                    "FUNCTION: "+funcName+"\n"+"ADDRESS: "+addr+"\n"+
-                    "========================================\n";
-                asmWriter.println(header);
+                // v14: capture listing text per function for the per-function
+                // Markdown docs (functions/<addr>_<name>.md), no longer streamed
+                // to monolithic assembly.txt / decompiled.txt / flowchart.txt.
+                StringBuilder sbAsm = new StringBuilder();
                 InstructionIterator instructions = currentProgram.getListing().getInstructions(func.getBody(),true);
                 while (instructions.hasNext()) {
                     Instruction instr = instructions.next();
-                    asmWriter.println(instr.getAddress()+" "+instr);
+                    sbAsm.append(instr.getAddress()).append("  ").append(instr).append('\n');
                 }
-                decompWriter.println(header);
+                String decompText;
                 DecompileResults decompResult = decomp.decompileFunction(func,30,monitor);
                 if (decompResult!=null&&decompResult.decompileCompleted())
-                    decompWriter.println(decompResult.getDecompiledFunction().getC());
+                    decompText = decompResult.getDecompiledFunction().getC();
                 else
-                    decompWriter.println("[decompile failed]");
-                flowWriter.println(header);
+                    decompText = "[decompile failed]";
+                StringBuilder sbFlow = new StringBuilder();
                 try {
                     CodeBlockIterator blocks = blockModel.getCodeBlocksContaining(func.getBody(),monitor);
                     while (blocks.hasNext()) {
                         CodeBlock block = blocks.next();
-                        flowWriter.println("  BLOCK: "+block.getFirstStartAddress());
+                        sbFlow.append("BLOCK: ").append(block.getFirstStartAddress()).append('\n');
                         CodeBlockReferenceIterator dests = block.getDestinations(monitor);
                         while (dests.hasNext()) {
                             CodeBlockReference ref = dests.next();
-                            flowWriter.println("    --> "+ref.getDestinationAddress()+" ["+ref.getFlowType().getName()+"]");
+                            sbFlow.append("  --> ").append(ref.getDestinationAddress())
+                                  .append(" [").append(ref.getFlowType().getName()).append("]\n");
                         }
                     }
                 } catch (Exception e) {
-                    flowWriter.println("  [flowchart failed: "+e.getMessage()+"]");
+                    sbFlow.append("[flowchart failed: ").append(e.getMessage()).append("]\n");
                 }
+                String capturedAsm = sbAsm.toString();
+                String capturedFlow = sbFlow.toString();
+                String capturedDecomp = decompText;
 
-                // Rule 9 (v15 REWRITE): step1-classified functions are no
-                // longer trusted blindly and skipped. FF1 benchmark: the input
-                // toml (made by a name-policy exporter) had stubbed memcpy/
-                // strcpy/sprintf, the whole mc* memory-card UI, ScenePrerender
-                // /SceneDraw (game render core, name-collided with the "sce"
-                // SDK prefix), sceVu0/sceRotMatrix VU0 math, and SKIPPED libm/
-                // libgcc/newlib internals (__ieee754_sqrtf, __muldi3,
-                // __do_global_ctors). The old `continue` meant these 651
-                // functions were never analyzed, never appeared in the triage
-                // JSON, and were re-emitted verbatim into the unified TOML.
-                // Now: analyze every function; inherit the step1 disposition
-                // only if it survives the high-confidence keep gate
+                // Rule 9 (v11 REWRITE, ported from General v15): step1
+                // (DAC.toml) classified functions are no longer trusted
+                // blindly and skipped. FF1 benchmark: a name-policy exporter
+                // had stubbed memcpy/strcpy/sprintf, whole game-code
+                // subsystems (Scene* name-collided with the "sce" SDK
+                // prefix), sceVu0 VU0 math, and SKIPPED libm/libgcc/newlib
+                // internals. The old `continue` meant such functions were
+                // never analyzed, never appeared in the triage JSON, and were
+                // re-emitted verbatim into the unified TOML. Now: analyze
+                // every function; inherit the step1 disposition only if it
+                // survives the high-confidence keep gate
                 // (step1KeepGateFailure); otherwise rescue to RECOMPILE and
-                // comment the entry out of the unified TOML with the reason.
+                // drop the entry from the unified TOML with the reason in
+                // triage_map.json.
                 boolean step1Stub = step1StubAddresses.contains(offset)
                         || step1StubNames.contains(funcName);
                 boolean step1Skip = !step1Stub && (step1SkipAddresses.contains(offset)
                         || step1SkipNames.contains(funcName));
 
-                // Rule 18 (v15): override-bound functions are also analyzed
+                // Rule 18 (v11): override-bound functions are also analyzed
                 // and included in the JSON (origin="override") so the triage
                 // map is complete; they never enter stub/skip/advisory lists.
                 boolean overrideBound = gameOverrideAddresses.contains(offset);
 
-                // v15.3 Rule 158: overlay / out-of-text guards. Overlay blocks
+                // v11 Rule 158: overlay / out-of-text guards. Overlay blocks
                 // reuse the same address range for different code blobs - any
                 // address-keyed binding there is unsafe by construction.
-                // Out-of-primary-text (non-overlay) bindings are merely
-                // suspicious: tagged + reviewed, not vetoed.
+                // (the game US is a single flat ELF, so this should stay 0 - a
+                // non-zero count is itself a red flag about the project.)
                 boolean inOverlayBlock = false;
                 try {
                     MemoryBlock mb = currentProgram.getMemory().getBlock(addr);
@@ -2394,7 +3113,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 // v4: extend to vtable-setter ctors, A0/A1 passthrough returners,
                 // libgcc intrinsics, and process terminators. All four were
                 // historically auto-stubbed and caused multi-phase debugging trips.
-                // v7.1: add F33-derived firewalls - multi-field ctors and
+                // v7.1: add F33-derived firewalls — multi-field ctors and
                 // lifecycle lazy-init guards. drawing_chain_depth firewall is
                 // applied in a post-pass after BFS runs.
                 boolean forceRecompile = traits.isLargeInitFunc
@@ -2405,28 +3124,48 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                                        || traits.isCtorMultiFieldInit
                                        || traits.isLifecycleLazyInit
                                        || traits.isBitbltbufT4hhUploader
-                                       // Rules 140-147: new safety firewalls
-                                       || traits.isDynamicCodeLoader            // Rule 161: runtime code linker/loader
-                                       || traits.isMemoryAllocator              // Rule 142: never auto-stub allocators
-                                       || traits.staticInitInstallsVtable       // Rule 141: uncalled static init vtable installers
-                                       || traits.cop2DestMaskVerify             // Rule 140: COP2 partial-dest transforms
-                                       || !traits.cop2SpecialOps.isEmpty();     // Rule 147: COP2 special-op review
+                                       // v10: never auto-stub allocators (F50.1/F50.2),
+                                       // static-init vtable installers (F50.4/F50.7), or
+                                       // COP2 partial-dest transforms (F51.8 codegen risk).
+                                       || traits.isMemoryAllocator
+                                       || traits.staticInitInstallsVtable
+                                       || traits.cop2DestMaskVerify
+                                       // v10.1: COP2 special-op funcs share the COP2
+                                       // codegen path — keep real bodies for review.
+                                       || !traits.cop2SpecialOps.isEmpty()
+                                       // v11 Rule 161: runtime code linker/loader.
+                                       || traits.isDynamicCodeLoader
+                                       // v13 Rule 178: a global-guarded init block must keep its
+                                       // real body (stubbing skips the configuration, G58/G81).
+                                       || traits.isConditionalInitOnGlobal
+                                       // v13 Rule 181: vtable tail-call thunk - stubbing breaks
+                                       // the recompiler's inherited-virtual dispatch (G59).
+                                       || traits.isVtableTailcallThunk
+                                       // v15 Rules 190/191/196/197: the PRIM-class selector,
+                                       // the per-vertex ADC/strip-restart geometry builder, the
+                                       // shared view/projection matrix writer, and the object-
+                                       // array ctor all carry render/init-critical state that a
+                                       // nop-stub silently destroys (G92/G98/G115).
+                                       || traits.isPrimClassSelector
+                                       || traits.isAdcKickVertexSource
+                                       || traits.isViewProjectionMatrixWriter
+                                       || traits.isObjectArrayCtor;
 
                 // --- Disposition decision ---
-                // v13 (SF3-benchmark corrections - all three legacy rules here
-                // produced false safe-stubs on real game code):
+                // v11 (ported from General v13 SF3-benchmark corrections - all
+                // three legacy rules here produced false safe-stubs on real
+                // game code):
                 //  - refsIopModuleString alone stubbed whole system-init
-                //    functions (SF3: system_hard_init = IOP module loads + pad
-                //    init + DMA-interrupt-handler install + channel caching).
-                //    Only "pure loader" shapes (small, few callees, no MMIO/
-                //    handler side effects) are still stub candidates; mixed
-                //    init functions stay RECOMPILE.
+                //    functions (IOP module loads + pad init + DMA-interrupt-
+                //    handler install in one body). Only "pure loader" shapes
+                //    (small, few callees, no MMIO/handler side effects) are
+                //    still stub candidates; mixed init functions stay
+                //    RECOMPILE.
                 //  - hasSyscall||hasCOP0 skipped game interrupt handlers and
-                //    critical sections: di/ei/sync/mfc0 appear all over EE game
-                //    code (SF3: flPS2DmaInterrupt, flPS2VSyncCallback were
-                //    skipped - no rendering, no frame flip). COP0 presence is
-                //    not kernel-internal evidence; the recompiler patches COP0
-                //    ops anyway (patch_cop0). SKIP now requires the bare
+                //    critical sections: di/ei/sync/mfc0 appear all over EE
+                //    game code. COP0 presence is not kernel-internal
+                //    evidence; the recompiler patches COP0 ops anyway
+                //    (patch_cop0). SKIP now requires the bare
                 //    syscall-trampoline shape only.
                 //  - hasVcallms stubbed VU0-microcode dispatchers - exactly
                 //    the functions that must run real logic. Now routed to
@@ -2443,15 +3182,43 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 String rescueReason = null;
                 boolean step1KeptHostBoundary = false;
                 boolean step1NameMismatchFlag = false;
+                boolean step1TruncatedFlag = false;
+                boolean step1LockedFlag = false;
                 if (overrideBound) {
-                    // Already hand-bound in game_override.cpp - record for the
-                    // JSON map, make no triage decision.
+                    // Already hand-bound in game_override.cpp - record for
+                    // the JSON map, make no triage decision.
                     origin = "override";
                     disposition = "OVERRIDE";
                 } else if (step1Stub || step1Skip) {
                     origin = "step1";
                     step1Disposition = step1Stub ? "STUB" : "SKIP";
-                    // v15.2 Rule 151: name/address mismatch veto. If the step1
+                    // v11.1 LOCK: phase-era hand decision - keep gate
+                    // BYPASSED. A deliberate F-phase stub rarely carries
+                    // host-boundary evidence; the gate would strip it and
+                    // silently regress the working build. Locked beats
+                    // everything except the overlay veto (address reuse is
+                    // unsafe no matter what the user wrote).
+                    boolean step1Locked = step1LockedAddresses.contains(offset)
+                            || step1LockedNames.contains(funcName);
+                    if (step1Locked && !inOverlayBlock) {
+                        disposition = step1Disposition;
+                        step1LockedKeptCount++;
+                        step1LockedFlag = true;
+                        // Rule 151 mismatch still surfaces for review (a
+                        // locked binding on a wrong-region address is worth
+                        // a human look), but does not unbind. v11.2: a
+                        // truncated mangled label is not drift - skip it.
+                        String expectedL = step1NameByAddr.get(offset);
+                        if (expectedL != null && !expectedL.isEmpty()
+                                && !funcName.equals(expectedL)
+                                && !funcName.startsWith("FUN_") && !funcName.startsWith("sub_")
+                                && !funcName.startsWith("LAB_") && !funcName.startsWith("thunk_")) {
+                            if (isTruncatedNameOf(expectedL, funcName)) { step1TruncatedNameCount++; step1TruncatedFlag = true; }
+                            else { step1NameMismatchCount++; step1NameMismatchFlag = true; }
+                        }
+                        if (outOfTextBinding) outOfTextBindingCount++;
+                    } else {
+                    // v11 Rule 151: name/address mismatch veto. If the step1
                     // entry recorded a different name for this address than
                     // the ELF symbol, the input toml is stale or built for a
                     // different region's ELF (US vs EU/JP address drift) -
@@ -2459,13 +3226,21 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     // failure mode, so force RECOMPILE + review. Only fires
                     // when the Ghidra name is real (not FUN_/sub_ defaults).
                     String expected = step1NameByAddr.get(offset);
-                    boolean nameMismatch = expected != null && !expected.isEmpty()
+                    boolean nameDiffers = expected != null && !expected.isEmpty()
                             && !funcName.equals(expected)
                             && !funcName.startsWith("FUN_") && !funcName.startsWith("sub_")
                             && !funcName.startsWith("LAB_") && !funcName.startsWith("thunk_");
+                    // v11.2: a truncated mangled label (`__ct`, `SetStatus`)
+                    // is NOT region drift - the address binds correctly. Such
+                    // entries skip the Rule 151 veto and proceed through the
+                    // normal keep gate, decided on real trait evidence (ctors
+                    // hit the ctor firewall, etc.). Only a genuinely different
+                    // symbol is a mismatch.
+                    boolean truncatedName = nameDiffers && isTruncatedNameOf(expected, funcName);
+                    boolean nameMismatch = nameDiffers && !truncatedName;
                     String gateFail;
                     if (inOverlayBlock) {
-                        // v15.3 Rule 158: hard veto - overlay address reuse.
+                        // v11 Rule 158: hard veto - overlay address reuse.
                         gateFail = "Rule 158: address sits in an overlay memory block - "
                                  + "address-keyed bindings are unsafe (overlays reuse addresses)";
                         overlayVetoCount++;
@@ -2478,6 +3253,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                                                         isWhitelisted, forceRecompile);
                     }
                     if (nameMismatch) { step1NameMismatchCount++; step1NameMismatchFlag = true; }
+                    if (truncatedName) { step1TruncatedNameCount++; step1TruncatedFlag = true; }
                     if (outOfTextBinding) outOfTextBindingCount++;
                     if (gateFail == null) {
                         disposition = step1Disposition;   // binding survives the gate
@@ -2488,15 +3264,16 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                         noteStep1Rescue(funcName, offset, gateFail);
                     }
                     // (rescuedBy recorded on the FuncResult below)
+                    }   // end v11.1 locked/vetted split
                 } else if (syscallWrapperShape && !inOverlayBlock) {
-                    // v15.5 Rule 159: bare syscall trampolines, decided BEFORE
-                    // the whitelist/trait-firewall guard. The old order let the
-                    // name-substring whitelist ("handler"/"callback") and the
-                    // PROCESS_TERMINATOR firewall block classification of
+                    // v11 Rule 159: bare syscall trampolines, decided BEFORE
+                    // the whitelist/trait-firewall guard. The old order let
+                    // the name-substring whitelist ("handler"/"callback") and
+                    // the PROCESS_TERMINATOR firewall block classification of
                     // AddIntcHandler/_Exit-style kernel trampolines, and the
                     // old action (auto-SKIP) compiled into a TODO_NAMED
                     // placeholder returning -1, silently losing live kernel
-                    // calls (Jak3: GetThreadId). New policy:
+                    // calls. New policy:
                     //  - runtime implements the handler by name AND the name
                     //    is a known boundary family -> STUB (real impl wins);
                     //  - completely unreferenced -> SKIP (dead bootstrap);
@@ -2510,14 +3287,14 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                         trampolineBindName = funcName;
                     } else if (runtimeRosterLoaded && traits.inferredName != null
                             && hasRuntimeHandler(traits.inferredName)) {
-                        // v15.5 Rule 160: stripped-name recovery. The syscall
-                        // immediate decoded from the body (`li $v1,N; syscall`)
-                        // is ground truth; when EE_SYSCALL_NAMES[N] resolves to
-                        // a handler the runtime implements, bind the ADDRESS to
-                        // that handler via the recompiler's documented
-                        // "Handler@0xADDR" stub selector - works even when the
-                        // ELF symbol is FUN_xxxxxxxx or a wrapper alias
-                        // (RFU116_SetSyscall).
+                        // v11 Rule 160: stripped-name recovery. The syscall
+                        // immediate decoded from the body (`li $v1,N;
+                        // syscall`) is ground truth; when EE_SYSCALL_NAMES[N]
+                        // resolves to a handler the runtime implements, bind
+                        // the ADDRESS to that handler via the recompiler's
+                        // documented "Handler@0xADDR" stub selector - works
+                        // even when the ELF symbol is FUN_xxxxxxxx or a
+                        // wrapper alias.
                         trampolineBindName = traits.inferredName;
                     }
                     if (trampolineBindName != null) {
@@ -2531,7 +3308,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     }
                     // else: RECOMPILE (default) - SYSCALL_TRAMPOLINE tag below.
                 } else if (!isWhitelisted && !forceRecompile && !inOverlayBlock) {
-                    // v15.3 Rule 158: never auto-stub/skip inside overlay blocks.
+                    // v11 Rule 158: never auto-stub/skip inside overlay blocks.
                     if (isRadarFirewalled(func, traits)) {
                         disposition="STUB";
                         newStubs.add(funcName+"@"+hex(offset));
@@ -2555,11 +3332,6 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 if (traits.calleeCount==0&&traits.callOps==0&&!traits.isThunk&&
                     traits.byteSize>0&&!traits.hasVcallms)
                     {tags.add("SAFE_LEAF");safeLeafCount++;}
-                // v15.5 Rule 159: bare syscall trampoline marker. RECOMPILE-d
-                // trampolines route through runtime handleSyscall(); the tag
-                // lets the report tool group the kernel-boundary surface.
-                if (syscallWrapperShape)
-                    {tags.add("SYSCALL_TRAMPOLINE");syscallTrampolineCount++;}
                 // [FIX] VU0_MICROCODE tagged before ACC_PRECISION_HAZARD so that
                 // classify_phases() in triage_analyzer.py routes consistently:
                 // a function with both tags lands in phase7, not phase5.
@@ -2577,145 +3349,106 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     {tags.add("COMPLEX_CONTROL_FLOW");jumpTableCount++;}
                 if (traits.accessesMMIO)
                     {tags.add("ACCESSES_MMIO");mmioCount++;}
-                // v9 R7: archive-IO string evidence.
-                if (traits.refsArchiveStrings) {
-                    tags.add("ARCHIVE_IO");
-                    archiveIoCount++;
-                }
-                // v15.5 Rule 161: dynamic-code loader.
-                if (traits.isDynamicCodeLoader) {
-                    tags.add("DYNAMIC_CODE_LOADER");
-                    dynamicCodeLoaderCount++;
-                }
-                // v14: SIF RPC packet headers are built with the same
-                // 16-byte-stride qword stores as a GIF tag (SF3 benchmark:
-                // sceOpen/sceSync landed in force_recompile this way, then
-                // corroborated PSMT4HH false positives). If the function
-                // talks to SIF RPC and shows zero GIF/VIF/DMA evidence,
-                // demote the trait to sifPacketBuilder so every downstream
-                // render heuristic (Rule 56, PSM gating, scoring,
-                // classification) ignores it.
-                if (traits.gifTagInlineBuilder && traits.callsSifRpc &&
-                    !traits.writesGifFifo && !traits.writesVif1Fifo &&
-                    !traits.writesVif0Fifo && !traits.accessesMMIO &&
-                    traits.dmaKickChannels.isEmpty() && !traits.dmaChcrStartKick &&
-                    !traits.dmaSourceChainTagBuilder && !traits.bitbltbufMacroSequence &&
-                    !traits.path3Initiator && traits.gifTagRegsFields.isEmpty()) {
-                    traits.gifTagInlineBuilder = false;
-                    traits.sifPacketBuilder = true;
-                }
-                // v9 R1: GIF tag inline builder.
-                if (traits.gifTagInlineBuilder) {
-                    tags.add("GIF_TAG_INLINE_BUILDER");
-                    gifTagBuilderCount++;
-                }
-                // v14: informational tag for the demoted case.
-                if (traits.sifPacketBuilder) {
-                    tags.add("SIF_PACKET_BUILDER");
-                }
-                // v9 R4: BITBLTBUF macro sequence.
-                if (traits.bitbltbufMacroSequence) {
-                    if(!tags.contains("BITBLTBUF_MACRO_SEQUENCE"))
-                        tags.add("BITBLTBUF_MACRO_SEQUENCE");
-                    bitbltbufMacroCount++;
-                }
-                // v9 R16: VU0 macro helper.
-                if (traits.isVu0MacroHelper) {
-                    tags.add("VU0_MACRO_HELPER");
-                    vu0MacroHelperCount++;
-                }
-                // v9 R17: C-style struct initializer.
-                if (traits.isStructInitializer) {
-                    tags.add("STRUCT_INITIALIZER");
-                    structInitCount++;
-                }
-                // v9 R20: infinite spin loop.
-                if (traits.isInfiniteSpinLoop) {
-                    tags.add("INFINITE_SPIN_LOOP");
-                    spinLoopCount++;
-                }
-                // v10 G1: stored-immediate VIF/DMA tag
-                if(!traits.storedVifOpcodes.isEmpty()) {
-                    if(!tags.contains("VIF_TAG_STORED_IMMEDIATE"))
-                        tags.add("VIF_TAG_STORED_IMMEDIATE");
-                    storedVifTagCount++;
-                }
-                if(!traits.storedDmaTagIds.isEmpty()) {
-                    if(!tags.contains("DMA_TAG_STORED_IMMEDIATE"))
-                        tags.add("DMA_TAG_STORED_IMMEDIATE");
-                    storedDmaTagCount++;
-                }
-                // v10 bonus: SCE_GIF_SET_TAG composition
-                if(traits.buildsGifTag64) {
-                    if(!tags.contains("BUILDS_GIF_TAG_64"))
-                        tags.add("BUILDS_GIF_TAG_64");
-                    gifTag64Count++;
-                }
-                // v10 bonus: texture upload chunk const
-                if(traits.loads70000Chunk) {
-                    if(!tags.contains("LOADS_VIF1_CHUNK_70000"))
-                        tags.add("LOADS_VIF1_CHUNK_70000");
-                    chunk70000Count++;
-                }
-                // v10 G3: HI/LO consumer
-                if(traits.hiLoOps > 0) {
-                    if(!tags.contains("HI_LO_CONSUMER"))
-                        tags.add("HI_LO_CONSUMER");
-                    hiLoConsumerCount++;
-                }
-                // ===== v11 tags =====
-                // E: peripheral categories
-                if(traits.accessesRcnt) {
-                    tags.add("RCNT_ACCESS"); rcntAccessCount++;
-                }
-                if(traits.accessesVifCtrl) {
-                    tags.add("VIF_CONTROL_REG"); vifCtrlAccessCount++;
-                }
-                if(traits.accessesDmacGlobal) {
-                    tags.add("DMAC_GLOBAL_REG"); dmacGlobalAccessCount++;
-                }
-                if(traits.writesIntcMask) {
-                    tags.add("WRITES_INTC_MASK"); intcMaskWriterCount++;
-                }
-                if(traits.readsIntcStat) {
-                    tags.add("READS_INTC_STAT"); intcStatReaderCount++;
-                }
-                if(traits.accessesSio) {
-                    tags.add("SIO_ACCESS"); sioAccessCount++;
-                }
-                if(traits.writesDmacEnable) {
-                    tags.add("WRITES_DMAC_ENABLE"); dmacEnableWriterCount++;
-                }
-                if(traits.touchesSbusFlags) {
-                    tags.add("SBUS_FLAG_TOUCHER"); sbusFlagAccessCount++;
-                }
-                // F: source-chain DMA tag builder
-                if(traits.dmaSourceChainTagBuilder) {
-                    tags.add("DMA_SOURCE_CHAIN_TAG_BUILDER");
-                    dmaSourceChainTagCount++;
-                }
-                // H: format magic
-                if(!traits.formatMagicHits.isEmpty()) {
-                    tags.add("FORMAT_MAGIC_PARSER");
-                    formatMagicHitCount++;
-                }
-                // I: IRX loader / IOP reboot
-                if(traits.isIrxLoader) {
-                    tags.add("IRX_LOADER"); irxLoaderCount++;
-                }
-                if(traits.isIopRebootHandler) {
-                    tags.add("IOP_REBOOT_HANDLER"); iopRebootHandlerCount++;
-                }
-                // J: sync waits
-                if(traits.isSyncWaitLoop) {
-                    tags.add("BACKWARD_BRANCH_SYNC_WAIT"); syncWaitLoopCount++;
-                }
-                if(traits.containsInfiniteFailLoop) {
-                    tags.add("INFINITE_FAIL_LOOP"); infiniteFailLoopCount++;
-                }
                 if (traits.usesCop2) tags.add("VU0_VECTORS");
+                // ===== v10 tags (the game F47-F52) =====
+                // Rule 140: COP2 partial-dest transform — verify generated
+                // dest-mask lane order (F51.8 recompiler codegen bug).
+                if (traits.cop2DestMaskVerify) {
+                    tags.add("COP2_DESTMASK_VERIFY");
+                    cop2PartialDestFuncCount++;
+                }
+                // Rule 141: static-init install manifest.
+                if (traits.isStaticInitializer) {
+                    staticInitializerFuncCount++;
+                    if (traits.staticInitInstallsVtable) tags.add("STATIC_INIT_VTABLE_INSTALLER");
+                    if (traits.isUncalledStaticInit) {
+                        tags.add("UNCALLED_STATIC_INIT");
+                        uncalledStaticInitCount++;
+                    }
+                }
+                // Rule 142: memory allocator — never auto-stub.
+                if (traits.isMemoryAllocator) {
+                    tags.add("MEMORY_ALLOCATOR_NEVER_STUB");
+                    memoryAllocatorCount++;
+                }
+                // Rule 143: guest-execution-lock hog candidate.
+                if (traits.isGuestLockHogCandidate) {
+                    tags.add("GUEST_LOCK_HOG_CANDIDATE");
+                    guestLockHogCount++;
+                }
+                // Rule 144: reads EABI 5th arg ($t0).
+                if (traits.readsEabiArgT0) {
+                    tags.add("EABI_ARG_T0");
+                    eabiArgT0Count++;
+                }
+                // Rule 145: PSMCT16 map-CLUT uploader.
+                if (traits.isPsmct16ClutUploader) {
+                    tags.add("MAP_CLUT_PSMCT16_UPLOADER");
+                    psmct16ClutUploaderCount++;
+                }
+                // ===== v10.1 tags (PCSX2- + skill-grounded) =====
+                // Rule 146: computed-jump sites; flag the ones with no resolved target.
+                if (!traits.computedJumpSwitchPcs.isEmpty()) {
+                    computedJumpSiteCount += traits.computedJumpSwitchPcs.size();
+                    Set<Long> resolvedPcs = new HashSet<>();
+                    for (long[] e : traits.computedJumpTargets) resolvedPcs.add(e[0]);
+                    int unresolved = 0;
+                    for (Long pc : traits.computedJumpSwitchPcs)
+                        if (!resolvedPcs.contains(pc)) unresolved++;
+                    if (unresolved > 0) {
+                        tags.add("COMPUTED_JUMP_UNRESOLVED");
+                        computedJumpUnresolvedCount += unresolved;
+                    }
+                }
+                // Rule 147: COP2 special-op / latency review.
+                if (!traits.cop2SpecialOps.isEmpty()) {
+                    tags.add("COP2_SPECIAL_OPS_REVIEW");
+                    cop2SpecialOpFuncCount++;
+                }
+                // Rule 148: EE FPU non-IEEE sensitivity.
+                if (traits.usesCop1 && (traits.usesFpuDivSqrt || traits.writesFpuControl)) {
+                    tags.add("FPU_NONIEEE_SENSITIVE");
+                    fpuNonIeeeCount++;
+                }
+                // Rule 150: EE code-overlay loader.
+                if (traits.isOverlayLoader) {
+                    tags.add("OVERLAY_LOADER");
+                    overlayLoaderCount++;
+                }
                 if (traits.usesCop1) tags.add("FPU_HEAVY");
                 if (traits.usesSPR)  tags.add("USES_SPR");
+                // ===== v11.3 Rules 162-164 (the game F52-G26 retrospective) =====
+                // Rule 162 SPR_DMA_STAGER / SUBWORD_DMA_STR_KICK — the G26
+                // delivery-bug class (scratchpad-staged VU1 model packet copied
+                // via fromSPR ch8, kicked by a sub-word CHCR store).
+                if (traits.programsSprDma)
+                    {tags.add("SPR_DMA_STAGER");sprDmaStagerCount++;}
+                if (traits.subwordDmaStrKick)
+                    {tags.add("SUBWORD_DMA_STR_KICK");subwordDmaStrKickCount++;}
+                // Rule 163 VU1_DOUBLE_BUFFER_FRAMER — builds BASE+OFFSET VIFcodes
+                // (TOPS double-buffer framing; the missing context in G23/G24).
+                if (traits.vifOpcodesBuilt.contains("BASE") &&
+                    traits.vifOpcodesBuilt.contains("OFFSET")) {
+                    traits.isVu1DoubleBufferFramer = true;
+                    tags.add("VU1_DOUBLE_BUFFER_FRAMER");vu1DoubleBufferFramerCount++;
+                }
+                // Rule 164 STALE_PTR_CACHE_CTOR — a ctor that caches a derived
+                // global pointer (Get*Ptr/Man/Data/Mgr) into this+K (G12/G13/
+                // F50.4). Caches 0/stale if it runs before the source is funded.
+                if (traits.isCtor && traits.ctorWritesA0Slot &&
+                    traits.stalePtrCacheGetter == null) {
+                    for (String cn : traits.calleeNames) {
+                        if (cn == null) continue;
+                        if (cn.startsWith("Get") && (cn.contains("Ptr") ||
+                            cn.contains("Man") || cn.contains("Data") || cn.contains("Mgr"))) {
+                            traits.isStalePtrCacheCtor = true;
+                            traits.stalePtrCacheGetter = cn;
+                            break;
+                        }
+                    }
+                }
+                if (traits.isStalePtrCacheCtor)
+                    {tags.add("STALE_PTR_CACHE_CTOR");stalePtrCacheCtorCount++;}
                 if (traits.writesToGlobal) tags.add("WRITES_GLOBAL");
                 if (traits.returnPaths>=3) tags.add("MULTI_RETURN");
                 if (!refManager.hasReferencesTo(addr)&&!isWhitelisted)
@@ -2734,10 +3467,9 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 // Rule 22
                 if (traits.callsSifRpc)
                     {tags.add("IOP_RPC_DISPATCH");iopRpcCount++;}
-                // Rule 139: discovered IOP SID via lui+ori composite (beyond whitelist).
-                if (!traits.allDetectedSids.isEmpty())
-                    {tags.add("DISCOVERED_IOP_SID"); discoveredSidCount++;}
-
+                // Rule 23
+                if (traits.refsArchiveStrings)
+                    {tags.add("ARCHIVE_IO");archiveIoCount++;}
                 // Rule 25
                 if (traits.isThreadSyncPoint)
                     {tags.add("THREAD_SYNC_POINT");threadSyncCount++;}
@@ -2852,14 +3584,31 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 if (traits.accessesVuMicromem) {tags.add("ACCESSES_VU_MICROMEM");vuMicromemCount++;}
                 if (traits.accessesVuDatamem)  {tags.add("ACCESSES_VU_DATAMEM");vuDatamemCount++;}
                 if (traits.touchesSbus)     {tags.add("SBUS_IOP_COMM_TOUCHER");sbusCount++;}
-                // v13: PSM constants (0x2C/0x24/0x1B/0x13) are tiny integers that
-                // appear constantly as struct sizes / loop counts / error codes.
-                // Bare matches tagged ~90% of SF3's force list, incl. sceOpen and
-                // sceMcRename. Require GS-side corroboration before tagging.
+                // v11 (General v14): SIF RPC packet headers are built with the
+                // same 16-byte-stride qword stores as a GIF tag (SF3:
+                // sceOpen/sceSync landed in force_recompile this way, then
+                // corroborated PSMT4HH false positives). If the function talks
+                // to SIF RPC and shows zero GIF/VIF/DMA evidence, demote the
+                // trait to sifPacketBuilder so every downstream render
+                // heuristic (PSMT4HH gate, Rule 56 scoring, classification)
+                // ignores it. Must run BEFORE the PSMT4HH gate below.
+                if (traits.gifTagInlineBuilder && traits.callsSifRpc &&
+                    !traits.writesGifFifo && !traits.writesVif1Fifo &&
+                    !traits.writesVif0Fifo && !traits.accessesMMIO &&
+                    traits.dmaKickChannels.isEmpty() && !traits.dmaChcrStartKick &&
+                    !traits.dmaSourceChainTagBuilder && !traits.bitbltbufMacroSequence &&
+                    !traits.path3Initiator && traits.gifTagRegsFields.isEmpty()) {
+                    traits.gifTagInlineBuilder = false;
+                    traits.sifPacketBuilder = true;
+                }
+                // v11 (General v13): PSM constants (0x2C/0x24/0x1B) are tiny
+                // integers that appear constantly as struct sizes / loop
+                // counts / error codes. Bare matches tagged ~90% of SF3's
+                // force list. Require GS-side corroboration before tagging.
                 boolean psm4hhInGsContext = traits.loadsPsm4hhConstant &&
                     (traits.writesTex0Reg || traits.writesBitbltbufReg ||
                      traits.bitbltbufMacroSequence || traits.gifTagInlineBuilder ||
-                     traits.buildsGifTag64);
+                     traits.isBitbltbufT4hhUploader);
                 if (psm4hhInGsContext) {tags.add("PSMT4HH_REFERENCE");psm4hhCount++;}
                 // v7.1 Rule 82
                 if (traits.isCtorMultiFieldInit) {
@@ -2876,44 +3625,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     tags.add("BITBLTBUF_T4HH_UPLOADER");
                     bitbltbufT4hhUploaderCount++;
                 }
-                // Rules 140-150: new tags
-                if (traits.cop2DestMaskVerify)
-                    {tags.add("COP2_DESTMASK_VERIFY"); cop2PartialDestFuncCount++;}
-                if (traits.staticInitInstallsVtable)
-                    {tags.add("STATIC_INIT_VTABLE_INSTALLER"); staticInitializerFuncCount++;}
-                if (traits.isUncalledStaticInit)
-                    {tags.add("UNCALLED_STATIC_INIT"); uncalledStaticInitCount++;}
-                if (traits.isMemoryAllocator)
-                    {tags.add("MEMORY_ALLOCATOR_NEVER_STUB"); memoryAllocatorCount++;}
-                if (traits.isGuestLockHogCandidate)
-                    {tags.add("GUEST_LOCK_HOG_CANDIDATE"); guestLockHogCount++;}
-                if (traits.readsEabiArgT0)
-                    {tags.add("EABI_ARG_T0"); eabiArgT0Count++;}
-                if (traits.isPsmct16ClutUploader)
-                    {tags.add("MAP_CLUT_PSMCT16_UPLOADER"); psmct16ClutUploaderCount++;}
-                if (!traits.computedJumpSwitchPcs.isEmpty()) {
-                    computedJumpSiteCount += traits.computedJumpSwitchPcs.size();
-                    boolean anyUnresolved = false;
-                    for(Map.Entry<Long,List<Long>> e : traits.computedJumpTargets.entrySet())
-                        if(e.getValue().isEmpty()) { anyUnresolved = true; break; }
-                    if(anyUnresolved)
-                        {tags.add("COMPUTED_JUMP_UNRESOLVED"); computedJumpUnresolvedCount++;}
-                }
-                if (!traits.cop2SpecialOps.isEmpty())
-                    {tags.add("COP2_SPECIAL_OPS_REVIEW"); cop2SpecialOpFuncCount++;}
-                if (traits.usesCop1 && (traits.usesFpuDivSqrt || traits.writesFpuControl))
-                    {tags.add("FPU_NONIEEE_SENSITIVE"); fpuNonIeeeCount++;}
-                if (traits.isOverlayLoader)
-                    {tags.add("OVERLAY_LOADER"); overlayLoaderCount++;}
-                // HOST_WAIT_CANDIDATE: sync-wait loop reachable from mainloop.
-                if (traits.isSyncWaitLoop && mainLoopShield.contains(offset))
-                    tags.add("HOST_WAIT_CANDIDATE");
-
-                // v13: lui-derived VIF opcode matches collide with ordinary
-                // global-address materialization (lui 0x60-0x7F == UNPACK is
-                // any global above 0x00600000 - SF3 tagged sceMcInit as a VIF
-                // builder this way). Require independent VIF/DMA/GIF evidence
-                // in the same function before believing the opcode match.
+                // v11 (General v13): lui-derived VIF opcode matches collide
+                // with ordinary global-address materialization (lui 0x60-0x7F
+                // == UNPACK is any global above 0x00600000). Require
+                // independent VIF/DMA/GIF evidence in the same function
+                // before believing the opcode match.
                 boolean vifBuilderCorroborated = !traits.vifOpcodesBuilt.isEmpty() &&
                     (traits.accessesVif1MMIO || traits.writesVif1Fifo ||
                      traits.writesVif0Fifo || traits.writesGifFifo ||
@@ -2938,19 +3654,107 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 if (!traits.dmaTagIdsBuilt.isEmpty())
                     {tags.add("DMA_TAG_BUILDER");dmaTagBuilderCount++;}
 
-                // Rule 56 (v5, extended by v6): derived top-priority bullseye.
-                // v6 adds: WRITES_IPU_CMD, GIF_PATH3_REG_TOUCHER, PSMT4HH_REFERENCE,
-                // VIF_MPG_OPCODE_BUILDER (microcode upload bullseye).
+                // ===== v9 tags =====
+                if (traits.gifTagInlineBuilder) {
+                    tags.add("GIF_TAG_INLINE_BUILDER"); gifTagInlineBuilderCount++;
+                }
+                // v11 (General v14): informational tag for the demoted case.
+                if (traits.sifPacketBuilder) {
+                    tags.add("SIF_PACKET_BUILDER");
+                }
+                if (traits.bitbltbufMacroSequence) {
+                    if(!tags.contains("BITBLTBUF_MACRO_SEQUENCE"))
+                        tags.add("BITBLTBUF_MACRO_SEQUENCE");
+                    bitbltbufMacroSeqCount++;
+                }
+                if (traits.dmaChcrStartKick) {
+                    tags.add("DMA_CHCR_START_KICK"); dmaChcrStartKickCount++;
+                }
+                if (traits.dmaSourceChainTagBuilder) {
+                    tags.add("DMA_SOURCE_CHAIN_TAG_BUILDER"); dmaSourceChainBuilderCount++;
+                }
+                if (!traits.storedVifOpcodes.isEmpty()) {
+                    tags.add("VIF_TAG_STORED_IMMEDIATE");
+                    if (traits.storedVifOpcodes.contains("MPG") &&
+                        !tags.contains("VIF_MPG_OPCODE_BUILDER"))
+                        tags.add("VIF_MPG_OPCODE_BUILDER");
+                    if ((traits.storedVifOpcodes.contains("MSCAL") ||
+                         traits.storedVifOpcodes.contains("MSCALF") ||
+                         traits.storedVifOpcodes.contains("MSCNT")) &&
+                        !tags.contains("VIF_MSCAL_OPCODE_BUILDER"))
+                        tags.add("VIF_MSCAL_OPCODE_BUILDER");
+                }
+                if (!traits.storedDmaTagIds.isEmpty())
+                    tags.add("DMA_TAG_STORED_IMMEDIATE");
+                if (!traits.compositeMmioRangesHit.isEmpty()) {
+                    tags.add("COMPOSITE_MMIO_RECOVERED");
+                    compositeMmioRecoveryCount++;
+                }
+                // v11 Rule 159: tag any bare-trampoline shape (not just the
+                // ones whose immediate decoded). RECOMPILE-d trampolines route
+                // through runtime handleSyscall(); the tag lets the report
+                // tool group the kernel-boundary surface.
+                if (syscallWrapperShape || traits.inferredSyscallImm > 0) {
+                    tags.add("SYSCALL_TRAMPOLINE"); syscallTrampolineCount++;
+                }
+                // v11 Rule 161: dynamic-code loader. For the game (single flat ELF,
+                // no overlays) this should stay 0 - a non-zero count means the
+                // recompiled ELF alone does NOT cover the game.
+                if (traits.isDynamicCodeLoader) {
+                    tags.add("DYNAMIC_CODE_LOADER");
+                    dynamicCodeLoaderCount++;
+                }
+                if (traits.isSyncWaitLoop) {
+                    tags.add("BACKWARD_BRANCH_SYNC_WAIT"); backwardSyncWaitCount++;
+                    // F24/F27 host-wait class marker for the report tool.
+                    if (mainLoopShield.contains(offset)) {
+                        tags.add("HOST_WAIT_CANDIDATE");
+                        traits.hostWaitCandidate = true;
+                        hostWaitCandidateCount++;
+                    }
+                }
+                if (traits.isInfiniteSpinLoop) {
+                    tags.add("INFINITE_SPIN_LOOP"); infiniteSpinLoopCount++;
+                }
+                if (traits.containsInfiniteFailLoop) {
+                    tags.add("INFINITE_FAIL_LOOP"); infiniteFailLoopCount++;
+                }
+                if (traits.isIrxLoader) {
+                    tags.add("IRX_LOADER"); irxLoaderCount++;
+                }
+                if (traits.isIopRebootHandler) {
+                    tags.add("IOP_REBOOT_HANDLER"); iopRebootHandlerCount++;
+                }
+                if (traits.isRenderFrameEntry) {
+                    tags.add("RENDER_FRAME_ENTRY"); renderFrameEntryCount++;
+                }
+                if (traits.isStructInitializer) {
+                    tags.add("STRUCT_INITIALIZER"); structInitializerCount++;
+                }
+                if (traits.knownRole != null) {
+                    tags.add("KNOWN_ROLE_" + traits.knownRole.toUpperCase());
+                    if ("BLOCKER".equals(traits.knownCriticality))
+                        tags.add("BLOCKER_REF");
+                }
+                if (!traits.discoveredRpcSids.isEmpty()) {
+                    tags.add("DISCOVERED_IOP_SID"); discoveredRpcSidCount++;
+                }
+
+                // Rule 56 (v5, extended by v6, v9): derived top-priority bullseye.
                 if (traits.isSceGifPkRefLoadImage || traits.path3Initiator ||
                     traits.path3KickViaDmaApi || traits.writesDispfbViaSdk ||
                     traits.isBitbltbufT4hhUploader ||
                     (traits.writesZbufReg && (traits.hasShift24Pattern||traits.hasDsll32OrDsrl32)) ||
                     traits.writesGsPrimReg || traits.touchesGifCtrl ||
                     traits.callsMpegFamily || traits.writesIpuCmd ||
+                    // v11 (General v13): use the corroborated forms so SIF
+                    // packet builders / loop-count constants don't inflate
+                    // the bullseye set.
                     traits.touchesGifP3Reg || psm4hhInGsContext ||
                     (vifBuilderCorroborated && traits.vifOpcodesBuilt.contains("MPG")) ||
                     traits.bitbltbufMacroSequence || traits.dmaChcrStartKick ||
-                    traits.dmaSourceChainTagBuilder || traits.isRenderFrameEntry) {
+                    traits.dmaSourceChainTagBuilder || traits.isRenderFrameEntry ||
+                    "BLOCKER".equals(traits.knownCriticality)) {
                     traits.isTopPriorityFix = true;
                     if(!tags.contains("TOP_PRIORITY_FIX")) {
                         tags.add("TOP_PRIORITY_FIX");
@@ -2958,16 +3762,21 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     }
                 }
 
-                // v15: step1/override provenance tags.
+                // v11 (General v15): step1/override provenance tags.
                 if ("step1".equals(origin)) {
-                    if (rescueReason != null) tags.add("STEP1_RESCUED");
+                    if (step1LockedFlag) {
+                        // v11.1: explicit user lock - never rescued by any
+                        // later promote pass (isHardBoundStep1 honors this).
+                        tags.add("STEP1_LOCKED");
+                    } else if (rescueReason != null) tags.add("STEP1_RESCUED");
                     else if (step1KeptHostBoundary) {
                         tags.add("STEP1_BOUND_HOST_BOUNDARY");
-                        // v15.4: roster-backed keep is hard-bound too.
+                        // roster-backed keep is hard-bound too.
                         if (runtimeRosterLoaded && hasRuntimeHandler(funcName))
                             tags.add("STEP1_BOUND_ROSTER_HANDLER");
                     }
                     if (step1NameMismatchFlag) tags.add("STEP1_NAME_MISMATCH");
+                    if (step1TruncatedFlag) tags.add("STEP1_TRUNCATED_NAME");
                     if (outOfTextBinding) tags.add("OUT_OF_TEXT_BINDING");
                 }
                 if (inOverlayBlock) tags.add("OVERLAY_REGION");
@@ -2978,7 +3787,15 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 r.disposition=disposition; r.traits=traits; r.tags=tags;
                 r.origin=origin; r.step1Disposition=step1Disposition;
                 r.rescueReason=rescueReason;
+                r.asmText=capturedAsm; r.decompText=capturedDecomp; r.flowText=capturedFlow;
                 if(rescueReason!=null) r.rescuedBy="step1_keep_gate";
+                // v11.1: provenance detail - did this binding come from the
+                // step1 exporter or from a previous enricher run's additions?
+                if ("step1".equals(origin)) {
+                    boolean prev = step1EnricherPrevAddresses.contains(offset)
+                            || step1EnricherPrevNames.contains(funcName);
+                    r.step1Source = prev ? "enricher_prev" : "exporter";
+                }
                 results.add(r);
             }
 
@@ -2988,9 +3805,9 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             println(String.format("  v2 tags: SAFE=%d MMIO=%d ACC=%d SMC=%d SPR=%d VCALLMS=%d JTABLE=%d ORPHAN=%d",
                 safeLeafCount,mmioCount,accHazardCount,smcHazardCount,
                 sprSyncCount,vcallmsCount,jumpTableCount,orphanCount));
-            println(String.format("  v3 tags: CONV_VIOLATION=%d INIT_LARGE=%d DMA_TTE=%d IOP_RPC=%d PAD_POLL=%d THREAD_SYNC=%d",
+            println(String.format("  v3 tags: CONV_VIOLATION=%d INIT_LARGE=%d DMA_TTE=%d IOP_RPC=%d ARCHIVE_IO=%d PAD_POLL=%d THREAD_SYNC=%d",
                 conventionViolationCount,initLargeFuncCount,dmaTteRiskCount,
-                iopRpcCount,padPollLoopCount,threadSyncCount));
+                iopRpcCount,archiveIoCount,padPollLoopCount,threadSyncCount));
             println(String.format("  v4 tags: CTOR_FW=%d VTABLE_SET=%d A0_PASS=%d PROC_TERM=%d LIBGCC=%d GIF_P3=%d ZBUF_ALIAS=%d MPEG=%d DISPFB=%d VIF1_TAGHI=%d TAIL_INDIR=%d JALR_T9=%d",
                 ctorFieldWriterCount,vtableSetterCount,a0PassthroughCount,
                 procTerminatorCount,libgccIntrinsicCount,gifPath3HazardCount,
@@ -3009,10 +3826,22 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 dmaTagBuilderCount));
             println(String.format("  v7.1 tags: CTOR_MULTI=%d LAZY_INIT=%d BITBLTBUF_T4HH=%d",
                 ctorMultiFieldInitCount, lifecycleLazyInitCount, bitbltbufT4hhUploaderCount));
-            println(String.format("  Rules 140-150: COP2_DESTMASK=%d SINIT=%d UNCALLED_SINIT=%d ALLOC=%d LOCK_HOG=%d EABI_T0=%d PSMCT16_CLUT=%d JUMP_UNRES=%d COP2_SPECOPS=%d FPU_NONIEEE=%d OVERLAY=%d",
+            println(String.format("  v8 tags: CTOR_CRIT=%d CTOR_HIGH=%d CTOR_MED=%d CTOR_ASSIGN_GLOBAL=%d CTOR_VTABLE=%d CTOR_DUAL=%d VDISP_SITES=%d VDISP_FUNCS=%d PAD_MASK=%d NLOOP_RISK=%d FILE_SPRINTF=%d FRAME_CLK=%d VU0_HELPER=%d ASSET_UPLD=%d OVR_CLASS=%d OVR_RETIRE=%d DISPFB_VIA_SDK=%d DMA_KICK_VIA_SDK=%d RET2GLOBAL=%d AUTO_EXT_GLOBALS=%d CLASSES=%d",
+                ctorCriticalCount, ctorHighCount, ctorMediumCount, ctorAssignedGlobalCount,
+                ctorInstallsVtableCount, ctorDualCallModeCount, virtualDispatchSiteCount,
+                virtualDispatchFuncCount, padButtonMaskConsumerCount, gifNloopDoubleCountRiskCount,
+                filePathSprintfCount, frameClockDriverCount, sceVu0HelperCount,
+                assetUploadTraceFuncCount, overrideClassifiedCount, overrideRetireCount,
+                dispfbWriterViaSdkCallerCount, dmaKickViaSdkCallerCount,
+                returnWrittenToGlobalCount, autoExtendedGlobalsCount, classRegistry.size()));
+
+            println(String.format("  v10 tags: COP2_PARTIAL_DEST=%d STATIC_INIT=%d UNCALLED_SINIT=%d ALLOCATOR=%d LOCK_HOG=%d EABI_T0=%d PSMCT16_CLUT=%d",
                 cop2PartialDestFuncCount, staticInitializerFuncCount, uncalledStaticInitCount,
-                memoryAllocatorCount, guestLockHogCount, eabiArgT0Count, psmct16ClutUploaderCount,
-                computedJumpUnresolvedCount, cop2SpecialOpFuncCount, fpuNonIeeeCount, overlayLoaderCount));
+                memoryAllocatorCount, guestLockHogCount, eabiArgT0Count, psmct16ClutUploaderCount));
+
+            println(String.format("  v10.1 tags: COMPUTED_JUMP=%d UNRESOLVED=%d COP2_SPECIAL=%d FPU_NONIEE=%d OVERLAY=%d",
+                computedJumpSiteCount, computedJumpUnresolvedCount, cop2SpecialOpFuncCount,
+                fpuNonIeeeCount, overlayLoaderCount));
 
             // F21-prep: build reverse call-graph. After all FuncResults are
             // built and each carries its outgoing jalSites, fill every callee's
@@ -3031,11 +3860,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
 
-            // v15.5 Rule 161b: LAYERED dynamic-code loader detection. Real
-            // engines split the idiom across functions (Jak: load_and_link ->
-            // FileLoad [file evidence] + link_and_exec -> finish ->
-            // CacheFlush__FPvi -> FlushCache [icache flush]), so the
-            // same-body Rule 161 never fires. Post-pass over the call graph:
+            // v11 Rule 161b (General v15.5): LAYERED dynamic-code loader
+            // detection. Real engines split the idiom across functions
+            // (load -> FileLoad [file evidence] + link_and_exec ->
+            // CacheFlush -> FlushCache [icache flush]), so the same-body
+            // Rule 161 never fires. Post-pass over the call graph:
             //   flushReach = functions named FlushCache/iFlushCache, or with
             //     a direct callee prefix-matching FlushCache/iFlushCache/
             //     CacheFlush (catches mangled C++ wrappers), propagated UP
@@ -3044,7 +3873,15 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             //     itself, a direct callee, or a direct caller.
             // Intersection = suspected runtime code loader: tagged, counted,
             // and promoted out of STUB (never out of a hard step1 binding).
-            {
+            // For the game this should find nothing - a hit is a project-level
+            // red flag.
+            // v11.2 PRECISION GATE: only run the layered search when the ELF
+            // actually contains at least one overlay/exec callee anywhere
+            // (overlayLoaderCount>0). If nothing in the binary can execute
+            // loaded bytes (the game: overlay_loaders=0), runtime code loading is
+            // impossible and the flush+file intersection is pure asset-loader
+            // noise (the game streams from DATA.DAT/HD2 and flushes per DMA).
+            if (overlayLoaderCount > 0) {
                 Set<Long> flushReach = new HashSet<>();
                 for (FuncResult r : results) {
                     if (r.traits == null) continue;
@@ -3102,19 +3939,14 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     }
                 }
                 if (dynamicCodeLoaderCount > 0)
-                    println("  v15.5 Rule 161b: " + dynamicCodeLoaderCount
+                    println("  v11 Rule 161b: " + dynamicCodeLoaderCount
                         + " suspected dynamic-code loader(s) - this ELF likely loads EE code at runtime.");
             }
 
             // v4 Rule 39/40: BFS depth from MainLoop and entry/_start.
             // Build forward adjacency once from jalSites, then two BFS passes.
             // F28 wanted exactly this: "what functions live in the MainLoop subtree"
-            // - derived by hand last time.
-            // v11 (L): pre-scan function-pointer tables so their entries can
-            // augment fwd. Without it, BFS misses every function reached only
-            // via switch/dispatch table (FF1: ModeSlctInit, TitleCtrl chain,
-            // etc. all came up mainloop_depth=-1).
-            scanFunctionPointerTables(results, resultsByAddr);
+            // — derived by hand last time.
             Map<Long, List<Long>> fwd = new HashMap<>();
             for (FuncResult caller : results) {
                 if (caller.traits == null) continue;
@@ -3125,78 +3957,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     if (tgt == 0xFFFFFFFFL) continue;
                     lst.add(tgt);
                 }
-                // v11 (L): augment with function-pointer-table entries when
-                // caller has TABLE_DISPATCH_CALL OR holds a table-base const.
-                if (caller.traits.tableDispatchSites != null && !caller.traits.tableDispatchSites.isEmpty()) {
-                    for (String hexBase : caller.traits.tableDispatchSites) {
-                        try {
-                            long base = Long.parseLong(hexBase.replace("0x","").replace("0X",""), 16);
-                            List<Long> entries = functionPointerTables.get(base);
-                            if (entries == null) continue;
-                            for (Long e : entries) lst.add(e & 0xFFFFFFFFL);
-                        } catch (NumberFormatException ignore) {}
-                    }
-                }
             }
             if (mainLoopAddrOpt != null)
                 bfsAssignDepth(fwd, resultsByAddr, mainLoopAddrOpt, true);
             if (entryAddrOpt != null)
                 bfsAssignDepth(fwd, resultsByAddr, entryAddrOpt, false);
-            // v9 behavioral MainLoop fallback. After init-chain BFS, pick best
-            // candidate: reachable depth 1-4 from entry, backward branch,
-            // callee_count >= 8, byteSize >= 1500. Score by (callees * size).
-            // v12 (C1): run ALWAYS. If a name-matched ml exists, compute its
-            // score and only switch when behavioral scores >=2x higher. Avoids
-            // the Jak1 case where `main` matched but `KernelCheckAndDispatch`
-            // is the real frame-driver loop.
-            if (entryAddrOpt != null) {
-                FuncResult bestML = null; long bestScore = 0;
-                long nameScore = 0;
-                for (FuncResult r : results) {
-                    if (r.traits == null) continue;
-                    FuncTraits t = r.traits;
-                    if (t.initChainDepth < 1 || t.initChainDepth > 4) continue;
-                    if (!t.hasBackwardBranch) continue;
-                    // v11 (C): relaxed thresholds. FF1 main is 148 bytes / 14
-                    // callees; old gate (size>=1500, callees>=8) missed it.
-                    // New: callees>=6 OR (callees>=4 AND a frame-clock callee).
-                    if (t.calleeCount < 6 && !(t.calleeCount >= 4 && t.isFrameClockDriver))
-                        continue;
-                    long sizeScore = Math.max(t.byteSize, 64);
-                    long score = (long)t.calleeCount * sizeScore;
-                    if (t.isFrameClockDriver) score *= 4;
-                    // v12 (C3): kernel-shape bonus. A small driver loop that
-                    // calls another driver (depth-1 dispatcher) is strong.
-                    if (t.calleeCount >= 4 && t.hasBackwardBranch &&
-                        t.byteSize < 600 && t.callOps >= 2)
-                        score = (long)(score * 1.5);
-                    if (mainLoopAddrOpt != null &&
-                        (r.address & 0xFFFFFFFFL) == mainLoopAddrOpt) {
-                        nameScore = score;
-                        continue;
-                    }
-                    if (score > bestScore) { bestScore = score; bestML = r; }
-                }
-                boolean prefer = false;
-                if (mainLoopAddrOpt == null && bestML != null) prefer = true;
-                else if (bestML != null && bestScore >= nameScore * 2) prefer = true;
-                if (prefer && bestML != null) {
-                    long oldAddr = mainLoopAddrOpt == null ? -1 : mainLoopAddrOpt;
-                    mainLoopAddrOpt = bestML.address & 0xFFFFFFFFL;
-                    println(String.format("[MAINLOOP] Behavioral %s: %s @ 0x%08X (callees=%d size=%d depth=%d score=%d, name_score=%d, prev=0x%08X)",
-                        (oldAddr<0 ? "autodetect" : "OVERRIDE"),
-                        bestML.name, mainLoopAddrOpt, bestML.traits.calleeCount,
-                        bestML.traits.byteSize, bestML.traits.initChainDepth,
-                        bestScore, nameScore, oldAddr));
-                    bfsAssignDepth(fwd, resultsByAddr, mainLoopAddrOpt, true);
-                    Function mlFunc = funcManager.getFunctionAt(
-                        currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(mainLoopAddrOpt));
-                    if (mlFunc != null) {
-                        // v15.3 Rule 156: same depth-3 BFS as the up-front shield.
-                        buildMainLoopShield(mlFunc.getEntryPoint());
-                    }
-                }
-            }
             // v7.1 Rule 83: BFS from GS-bullseye render roots; populates
             // traits.drawingChainDepth.
             bfsAssignDrawingChainDepth(fwd, resultsByAddr, results);
@@ -3208,9 +3973,9 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 if(r.traits == null) continue;
                 int d = r.traits.drawingChainDepth;
                 if(d < 0 || d > 6) continue;
-                // v15: step1 bindings kept on HARD host-boundary evidence
-                // (syscall/SIF-RPC/IRX/IPU) are deliberate boundaries - render
-                // -chain proximity alone must not unwind them.
+                // v11 (General v15): step1 bindings kept on HARD host-boundary
+                // evidence (syscall/SIF-RPC/IRX/IPU) are deliberate boundaries
+                // - render-chain proximity alone must not unwind them.
                 if("STUB".equals(r.disposition) && !isHardBoundStep1(r)) {
                     r.disposition = "RECOMPILE";
                     removeAutoBindingEntries(newStubs, r);
@@ -3224,7 +3989,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             println(String.format("  v7.1 post: drawing_chain_funcs=%d (promoted_from_stub=%d)",
                 drawingChainCount, promotedFromStub));
 
-            // v4 Rule 28: POLL_RETURN_CONSUMER - a tiny returner is likely a
+            // v4 Rule 28: POLL_RETURN_CONSUMER — a tiny returner is likely a
             // poll target if any caller contains a backward branch. We can't
             // grep the caller's body cheaply here; use the proxy: caller has
             // hasBackwardBranch AND the callee has byteSize<60, returnPaths>=1,
@@ -3248,6 +4013,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             println(String.format("  v4 post: MAINLOOP_DEPTH set | INIT_DEPTH set | POLL_TARGET=%d",
                 pollTargetCount));
 
+            // v8 post-pass: build class registry, return-to-global tracking,
+            // ctor risk grading, asset upload traces, override classification,
+            // pad mask / vdispatch counters, SDK-caller depth-1 propagation.
+            runV8PostPasses(results, resultsByAddr, fwd, newStubs);
+
             // v7 Rule 80: runtime corroboration pass. Walks every function,
             // compares static bullseye predictions against merged GS evidence,
             // attaches RUNTIME_CONFIRMED / RUNTIME_DORMANT_GLOBAL /
@@ -3258,75 +4028,48 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     runtimeConfirmedCount, runtimeDormantCount, runtimeMenuOnlyCount,
                     tbpRuntimeConfirmedFuncCount, gsIrqSafeStubCount));
             } else {
-                println("  v7 post: GS evidence empty - corroboration skipped.");
+                println("  v7 post: GS evidence empty — corroboration skipped.");
             }
 
-            // v12 (A3): rewire callee-name flags using inferred names. For
-            // stripped binaries where Ghidra names a function FUN_xxxx but
-            // detectSyscallTrampoline recovered the kernel name, propagate
-            // that into every caller's flag set (PAD/FRAME/MC/etc.). Without
-            // this the firewall lists are inert on stripped builds.
-            int aliasMapSize = 0;
-            int reflagged = 0;
-            {
-                Map<Long,String> addr2inferred = new HashMap<>();
-                for(FuncResult r : results) {
-                    if(r.traits == null) continue;
-                    if(r.traits.inferredName != null) {
-                        addr2inferred.put(r.address & 0xFFFFFFFFL, r.traits.inferredName);
-                        aliasMapSize++;
-                    }
-                }
-                if(!addr2inferred.isEmpty()) {
-                    for(FuncResult r : results) {
-                        if(r.traits == null) continue;
-                        boolean changed = false;
-                        for(long[] site : r.traits.jalSites) {
-                            String cn = addr2inferred.get(site[1] & 0xFFFFFFFFL);
-                            if(cn == null) continue;
-                            if(!r.traits.calleeNames.contains(cn)) {
-                                r.traits.calleeNames.add(cn);
-                                changed = true;
-                            }
-                            if(PAD_POLL_CALLEES.contains(cn))    r.traits.callsPadPollCallee = true;
-                            if(FRAME_CLOCK_CALLEES.contains(cn)) r.traits.isFrameClockDriver = true;
-                            if(MC_SDK_CALLEES.contains(cn))     {r.traits.callsMcSdk = true; r.traits.isMcTransitionGate = true;}
-                            for(String s : DISPFB_SDK_CALLEES) if(cn.equals(s)) r.traits.writesDispfbViaSdk = true;
-                            for(String s : PATH3_KICK_API_CALLEES) if(cn.equals(s)) r.traits.path3KickViaDmaApi = true;
-                            if(cn.equals("sceSifCallRpc") || cn.equals("sceSifBindRpc"))
-                                r.traits.callsSifRpc = true;
-                            if(cn.startsWith("sceDmaSend") || cn.startsWith("sceDmaChain"))
-                                r.traits.callsDmaSend = true;
-                            if(cn.equals("sceSifLoadModule") || cn.equals("sceSifLoadStartModule"))
-                                r.traits.sifLoadModuleCallCount++;
-                            if(cn.equals("sceSifRebootIop"))
-                                r.traits.isIopRebootHandler = true;
-                            for(String p : AUDIO_CALLEE_PREFIXES)
-                                if(cn.startsWith(p)) { r.traits.isAudioRpcHandler = true; break; }
-                        }
-                        if(r.traits.sifLoadModuleCallCount >= 2) r.traits.isIrxLoader = true;
-                        if(changed) reflagged++;
-                    }
-                }
-            }
-            println(String.format("  v12 A3: inferred_syscall_names=%d, callers_reflagged=%d",
-                aliasMapSize, reflagged));
+            // ===== v9 post-passes =====
+            // Rule 128 function pointer tables (must run BEFORE module clusters
+            // so any discovered vtables seed the inferredClassName).
+            scanFunctionPointerTables(results, resultsByAddr);
+            // Rule 129 module clustering on jal edges
+            assignModuleIds(results);
+            // Rule 130 name-prefix module index
+            buildNamePrefixModules(results);
+            // Rule 134 tag the game call chain participants
+            tagCallChains(results);
+            // v12 Rules 165-177: RTT/Z VRAM-alias, audio/memcard/present hazards,
+            // perf-hot ranking. Runs after BFS depths + KNOWN tagging are final
+            // and BEFORE the Rule 78 noise gate clears tbpConstantsLoaded.
+            applyV12Rules(results);
+            // v13 Rules 178-188: render-mode/lighting/tailcall/RTT-leak + init-order.
+            applyV13Rules(results);
+            // v15 Rules 190-198: ADC/PRIM-class packer, allocator-family coherence,
+            // frame-pacing, view-matrix, object-array ctor, VU-exec hazard manifest.
+            applyV15Rules(results);
+            println(String.format("  v9 post: GIF_INLINE=%d BITBLTBUF_MACRO=%d CHCR_KICK=%d DMA_SRC_CHAIN=%d MMIO_RECOVERED=%d SYSCALL_TR=%d SYNC_WAIT=%d INF_SPIN=%d INF_FAIL=%d IRX=%d REBOOT=%d RENDER_ENTRY=%d STRUCT_INIT=%d DISPATCH_TGT=%d TABLE_CALL=%d HOST_WAIT=%d the game_KNOWN=%d DISC_SIDS=%d FPT_TABLES=%d MODULES=%d PREFIXES=%d",
+                gifTagInlineBuilderCount, bitbltbufMacroSeqCount, dmaChcrStartKickCount,
+                dmaSourceChainBuilderCount, compositeMmioRecoveryCount, syscallTrampolineCount,
+                backwardSyncWaitCount, infiniteSpinLoopCount, infiniteFailLoopCount,
+                irxLoaderCount, iopRebootHandlerCount, renderFrameEntryCount,
+                structInitializerCount, dispatchTableTargetCount, tableDispatchCallCount,
+                hostWaitCandidateCount, knownAddressMatched, discoveredRpcSidCount,
+                functionPointerTables.size(), moduleClusters.size(), namePrefixModules.size()));
 
-            // v8 Rule 92/94/96/97/99/100/102/111 etc. post-passes.
-            runV8PostPasses(results, resultsByAddr, newStubs);
-
-            // ===== v13 binding-consistency firewall =====
+            // ===== v11 binding-consistency firewall (General v13) =====
             // Runs after ALL tag/trait post-passes so it sees the final
             // evidence. A function the enricher itself flags as render-
             // critical / must-implement / init-chain / callback-target must
             // never stay in the BINDING stubs/skip arrays - those are consumed
             // by the recompiler, while force_recompile is only advisory.
             // SF3 benchmark failures this pass prevents:
-            //  - system_hard_init stubbed (init_chain_depth=4 was already
-            //    computed and ignored) -> game cannot boot;
-            //  - flPS2DmaInterrupt / flPS2VSyncCallback skipped while their
-            //    addresses are taken as callback arguments -> no rendering,
-            //    no frame flip;
+            //  - system-init stubbed (init_chain_depth already computed and
+            //    ignored) -> game cannot boot;
+            //  - DMA-interrupt / vsync callbacks skipped while their
+            //    addresses are taken as callback arguments -> no rendering;
             //  - same function simultaneously in stubs AND force_recompile.
             {
                 int rescued = 0;
@@ -3356,37 +4099,43 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     // v14: bare syscall trampolines (<=32 bytes, no calls) sit
                     // on every init chain by construction - the kernel handles
                     // them, so init-chain membership alone must not rescue
-                    // them (SF3: 13 SDK wrappers like ChangeThreadPriority
-                    // were needlessly recompiled). Address-taken / dispatch /
-                    // render evidence still rescues.
+                    // them. Address-taken / dispatch / render evidence still
+                    // rescues.
                     boolean syscallWrapperShape = t.hasSyscall &&
                             t.byteSize <= 32 && t.callOps == 0;
                     // v15: SIF RPC gateways sit on init chains by construction
                     // (every subsystem binds its RPC channels during boot) -
-                    // same logic as the v14 syscall-trampoline exclusion.
-                    // Init-chain membership alone must not rescue them;
-                    // address-taken / dispatch / render evidence still does.
+                    // same logic as the syscall-trampoline exclusion.
                     boolean rpcGatewayShape = t.callsSifRpc ||
-                            t.detectedRpcSid != 0 || !t.detectedRpcSids.isEmpty();
+                            t.detectedRpcSid != 0 || !t.discoveredRpcSids.isEmpty();
                     boolean onInitChain = t.initChainDepth >= 0 && t.initChainDepth <= 6;
                     boolean renderOrMustImpl = t.isTopPriorityFix || t.mustBeImplemented ||
-                            t.isRenderFrameEntry || t.isVu0MacroHelper ||
+                            t.isRenderFrameEntry || t.isSceVu0Helper ||
                             t.isBitbltbufT4hhUploader || t.isCtorMultiFieldInit ||
                             t.isSceGifPkFamily || t.path3Initiator ||
                             t.writesGifFifo || t.writesVif1Fifo || t.hasVcallms ||
-                            // v15.3 Rule 155: GS-dump corroboration - this
+                            // v12 Rule 166/169: in-place RTT writers and vf0-
+                            // dependent matrix inverses are render-critical
+                            // (G37/G44/G40); never leave them stubbed.
+                            t.isRttTarget || t.isVf0DependentInverse ||
+                            // v13 Rules 179/180/182: render-mode selectors, per-vertex
+                            // lighting terms, and RTT-no-restore writers are all
+                            // render-critical (G75-G82) - never leave them stubbed.
+                            t.isRenderModeSelector || t.isVertexLightingTerm ||
+                            t.isRttNoRestore || t.isConditionalInitOnGlobal ||
+                            t.isVtableTailcallThunk ||
+                            // v11 Rule 155: GS-dump corroboration - this
                             // function's TBP/PSM signature was observed in an
-                            // actual runtime capture; stubbing it provably
+                            // actual PCSX2 capture; stubbing it provably
                             // kills uploads that happen on real hardware.
                             r.tags.contains("RUNTIME_CONFIRMED");
                     boolean dispatchTarget = r.tags.contains("DISPATCH_TABLE_TARGET");
-                    // v15: step1 bindings kept on hard host-boundary evidence
-                    // are deliberate. v15.4: address-taken no longer unwinds
+                    // v15.4: step1 bindings kept on hard host-boundary
+                    // evidence are deliberate; address-taken no longer unwinds
                     // them either - PS2Recomp dispatch is address-keyed, so an
                     // indirect call through a taken pointer still lands on the
-                    // bound runtime handler (the FF1 rerun showed addressTaken
-                    // firing on EVERY 16-byte kernel wrapper: SetSyscall-style
-                    // vector installs take their addresses legitimately).
+                    // bound runtime handler (16-byte kernel wrappers take
+                    // their addresses legitimately, SetSyscall-style).
                     // Surface the conflict for review, keep the binding.
                     if(isHardBoundStep1(r)) {
                         if(addressTaken && !r.tags.contains("ADDRESS_TAKEN_CALLBACK"))
@@ -3411,11 +4160,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                         rescued++;
                     }
                 }
-                println("  v13 firewall: "+rescued+" stub/skip entries rescued to RECOMPILE "+
+                println("  v11 binding firewall: "+rescued+" stub/skip entries rescued to RECOMPILE "+
                         "(address-taken / dispatch-target / init-chain / render-critical).");
             }
 
-            // v15: step1 vetting summary.
+            // v11: step1 vetting summary.
             {
                 int s1kept=0, s1rescued=0, ovr=0;
                 for(FuncResult r : results) {
@@ -3423,15 +4172,21 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                         if(r.rescueReason!=null) s1rescued++; else s1kept++;
                     } else if("override".equals(r.origin)) ovr++;
                 }
-                println("  v15 step1 vetting: "+s1kept+" inherited bindings kept (host-boundary evidence), "
+                println("  v11 step1 vetting: "+s1kept+" inherited bindings kept (host-boundary evidence), "
                         +s1rescued+" rescued to RECOMPILE, "+ovr
                         +" override-bound - all now analyzed and included in the JSON.");
+                if(step1LockedKeptCount>0)
+                    println("  v11.1 lock: "+step1LockedKeptCount
+                            +" locked entries kept verbatim (keep gate bypassed).");
                 if(step1NameMismatchCount>0)
-                    println("  v15.2 Rule 151: "+step1NameMismatchCount
+                    println("  v11 Rule 151: "+step1NameMismatchCount
                             +" step1 name/address mismatches (stale or wrong-region input?) - forced RECOMPILE + review.");
+                if(step1TruncatedNameCount>0)
+                    println("  v11.2 Rule 151: "+step1TruncatedNameCount
+                            +" truncated mangled labels (e.g. __ct@addr) - NOT drift, address binds correctly, sent through normal gate.");
             }
 
-            // v15.3 Rule 153: handler-roster cross-check. Runs after every
+            // v11 Rule 153: handler-roster cross-check. Runs after every
             // promote pass so it sees FINAL stub dispositions. A stub routes
             // to a runtime handler BY NAME - no handler in the roster means
             // the call dies silently at runtime. We do not unbind (the stub
@@ -3441,8 +4196,8 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 for (FuncResult r : results) {
                     if (!"STUB".equals(r.disposition)) continue;
                     if (hasRuntimeHandler(r.name)) continue;
-                    // v15.5 Rule 160: trampolines bound by inferred syscall
-                    // name route to that handler, not the ELF symbol.
+                    // Rule 160: trampolines bound by inferred syscall name
+                    // route to that handler, not the ELF symbol.
                     if (r.traits != null && r.traits.inferredName != null
                         && hasRuntimeHandler(r.traits.inferredName)) continue;
                     if (!r.tags.contains("NO_RUNTIME_HANDLER")) {
@@ -3450,156 +4205,77 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                         noHandlerStubCount++;
                     }
                 }
-                println("  v15.3 Rule 153: roster="+runtimeHandlerNames.size()
+                println("  v11 Rule 153: roster="+runtimeHandlerNames.size()
                         +" handlers; "+noHandlerStubCount
                         +" bound stubs have NO matching runtime handler (-> native_impl_needed + review).");
             }
             if (overlayVetoCount>0 || outOfTextBindingCount>0)
-                println("  v15.3 Rule 158: overlay vetoes="+overlayVetoCount
+                println("  v11 Rule 158: overlay vetoes="+overlayVetoCount
                         +", out-of-text bindings flagged="+outOfTextBindingCount+".");
 
-            // v9: collect nop, patch, force_recompile from final result set.
-            // v12 (G1): patchInstrCandidates carries (pc, funcAddr, reasonMask)
-            // entries for backward-branch nop patches.
-            List<String> nopList = new ArrayList<>();
-            List<String> patchList = new ArrayList<>();
-            List<String> forceRecompList = new ArrayList<>();
-            // v14: native_impl_needed - stubbing/skipping these leaves a
-            // subsystem hole (IOP module load, SIF RPC service, audio/pad/mc
-            // gateway) that the recomp runtime must fill with a native
-            // implementation. Advisory only; surfaces what a stub silences.
-            List<String> nativeImplList = new ArrayList<>();
-            // v14: review - firewall-rescued entries and mixed IRX-init
-            // functions; the cases where the enricher overrode or refused a
-            // binding decision and a human should confirm.
-            List<String> reviewList = new ArrayList<>();
-            List<long[]> patchInstrCandidates = new ArrayList<>();
-            for(FuncResult r : results) {
-                if(r.traits == null) continue;
-                // v15: override-bound functions already have a hand-written
-                // handler - never emit them into advisory arrays.
-                if("OVERRIDE".equals(r.disposition)) continue;
-                String entry = r.name + "@" + hex(r.address);
-                // v12 (K): priority-sorted tag preview. Most actionable tags
-                // surface first (TOP_PRIORITY_FIX, BITBLTBUF_T4HH_UPLOADER,
-                // render bullseyes), so the 4-tag truncation never drops the
-                // most-important hint.
-                String tagComment = r.tags.isEmpty() ? "" :
-                    " # " + String.join(",", prioritizeTagsForComment(r.tags, 4));
-                // libgcc intrinsics are nop-stub candidates only if NOT inside
-                // call chain (auto: emit as nop here, runtime can override).
-                // We keep them in stubs by default; nop list reserved for true
-                // no-ops like __ct__ chained-stub returners.
-                if(r.traits.isLibgccIntrinsic && "STUB".equals(r.disposition)) {
-                    nopList.add(entry + tagComment);
-                }
-                // Patch candidates: convention-violation single-instruction fixes.
-                if(r.traits.writesToA1Buffer && r.traits.byteSize < 50) {
-                    patchList.add(entry + tagComment);
-                }
-                // force_recompile: must_be_implemented OR top-priority bullseye OR
-                // BITBLTBUF uploader / CTOR_MULTI_FIELD_INIT.
-                // v12 (K): also promote ARCHIVE_IO wrappers + render-path bullseyes.
-                boolean renderBullseye = r.traits.isSceGifPkFamily ||
-                                         r.traits.path3Initiator ||
-                                         r.traits.writesGifFifo ||
-                                         r.traits.writesVif1Fifo ||
-                                         (r.traits.accessesVuMicromem && r.traits.hasMutatingInstructions);
-                boolean archiveIo = r.traits.refsArchiveStrings && r.traits.calleeCount >= 2;
-                // v13: never emit a function into the advisory force_recompile
-                // list while it sits in the binding stubs/skip arrays. The v13
-                // firewall already rescued everything with hard evidence; what
-                // remains stubbed (e.g. pure IRX-loader shapes) must not be
-                // contradicted one section lower in the same TOML.
-                boolean boundToStubOrSkip = "STUB".equals(r.disposition) || "SKIP".equals(r.disposition);
-                if(!boundToStubOrSkip &&
-                   (r.traits.mustBeImplemented || r.traits.isTopPriorityFix ||
-                    r.traits.isBitbltbufT4hhUploader || r.traits.isCtorMultiFieldInit ||
-                    r.traits.isVu0MacroHelper || r.traits.isRenderFrameEntry ||
-                    renderBullseye || archiveIo)) {
-                    forceRecompList.add(entry + tagComment);
-                }
-                // v14: native_impl_needed collection. Two ways in:
-                //  (a) bound stub/skip whose traits show it fronted an IOP-side
-                //      subsystem (IRX loader string, SIF RPC, audio RPC) - the
-                //      stub is intentional but the subsystem now needs a host
-                //      implementation;
-                //  (b) recompiled RPC binder/IRX loader - the EE side will run,
-                //      but only works if the runtime services its RPC SIDs /
-                //      module loads natively.
-                boolean rpcGateway = r.traits.callsSifRpc ||
-                        r.traits.detectedRpcSid != 0 ||
-                        !r.traits.detectedRpcSids.isEmpty();
-                boolean iopSubsystemFront = r.traits.refsIopModuleString ||
-                        r.traits.isIrxLoader || r.traits.sifLoadModuleCallCount >= 1 ||
-                        r.traits.isAudioRpcHandler || r.traits.isIopRebootHandler;
-                // v15.3 Rule 153: stub with no matching runtime handler.
-                boolean noHandlerStub = r.tags.contains("NO_RUNTIME_HANDLER");
-                if((boundToStubOrSkip && (iopSubsystemFront || rpcGateway || noHandlerStub)) ||
-                   (!boundToStubOrSkip && (r.traits.isIrxLoader ||
-                        r.traits.detectedRpcSid != 0 || !r.traits.detectedRpcSids.isEmpty()))) {
-                    nativeImplList.add(entry + tagComment);
-                }
-                // v14: review collection - firewall rescues + mixed IRX-init
-                // shapes (IRX string present but too much other work to stub).
-                boolean pureLoaderShape = r.traits.refsIopModuleString &&
-                        r.traits.byteSize <= 200 && r.traits.calleeCount <= 4 &&
-                        !r.traits.accessesMMIO && !r.traits.writesIntcMask &&
-                        r.traits.dmaKickChannels.isEmpty();
-                boolean mixedIrxInit = r.traits.refsIopModuleString && !pureLoaderShape;
-                // v15: step1 rescues also go to review - the enricher overrode
-                // the input toml's binding and a human should confirm.
-                // v15.3: + Rule 153 handler-less stubs and Rule 158
-                // out-of-text bindings.
-                if(r.tags.contains("BINDING_FIREWALL_RESCUED") || mixedIrxInit ||
-                   r.tags.contains("STEP1_RESCUED") ||
-                   r.tags.contains("NO_RUNTIME_HANDLER") ||
-                   r.tags.contains("OUT_OF_TEXT_BINDING") ||
-                   // v15.4: kept-but-address-taken bindings - verify the
-                   // pointer use is a SetSyscall-style install, not a vtable.
-                   r.tags.contains("ADDRESS_TAKEN_CALLBACK")) {
-                    reviewList.add(entry + tagComment);
-                }
-                // v12 (G1): collect candidate patch instructions from hazard
-                // tags. Reason mask: 1=IFL, 2=ISL, 4=BBSW, 8=BWH.
-                long reason = 0;
-                if(r.traits.containsInfiniteFailLoop) reason |= 0x1;
-                if(r.traits.isInfiniteSpinLoop)       reason |= 0x2;
-                if(r.traits.isSyncWaitLoop)           reason |= 0x4;
-                if(r.traits.hasBusyWait)              reason |= 0x8;
-                if(reason != 0) {
-                    for(Long pc : r.traits.patchCandidatePcs) {
-                        patchInstrCandidates.add(new long[]{pc, r.address & 0xFFFFFFFFL, reason});
+            if (incrementalMode) {
+                // Modify the live config IN PLACE, only if the executable content
+                // (selectors/sections, ignoring comments + # TAG annotations)
+                // actually changed. Preserves the file untouched when there is no
+                // need; backs up the prior on a real delta.
+                File tmp = new File(outputDir, "config_auto_recomp.toml.new");
+                writeUnifiedConfig(tmp,configToml,newStubs,newSkips,results,resultsByAddr);
+                if (unifiedToml.exists() && configBodyEquals(tmp, unifiedToml)) {
+                    tmp.delete();
+                    println("[INCREMENTAL] "+unifiedToml.getName()
+                        +" unchanged - left in place (no modification needed).");
+                } else {
+                    File bak = new File(outputDir, "config_auto_recomp.prev.toml");
+                    if (bak.exists()) bak.delete();
+                    if (unifiedToml.exists()) unifiedToml.renameTo(bak);
+                    if (!tmp.renameTo(unifiedToml)) {
+                        java.nio.file.Files.copy(tmp.toPath(), unifiedToml.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                        tmp.delete();
                     }
+                    println("[INCREMENTAL] "+unifiedToml.getName()
+                        +" MODIFIED (delta applied); prior saved as config_auto_recomp.prev.toml.");
+                }
+            } else {
+                writeUnifiedConfig(unifiedToml,configToml,newStubs,newSkips,results,resultsByAddr);
+            }
+            // v8 Rule 109: diff against prior index/functions_index.json if present.
+            // Renames the old file to functions_index.prev.json before overwriting.
+            File priorJson = new File(indexDir, "functions_index.json");
+            Map<Long,String> priorCats = null;
+            if (priorJson.exists()) {
+                try {
+                    priorCats = loadPriorTriageMapCats(priorJson);
+                    File backup = new File(indexDir, "functions_index.prev.json");
+                    if (backup.exists()) backup.delete();
+                    priorJson.renameTo(backup);
+                    println(String.format("[DIFF] Backed up prior functions_index.json (%d funcs).",
+                        priorCats != null ? priorCats.size() : 0));
+                } catch (Exception ex) {
+                    println("[DIFF] Failed to load prior map: "+ex.getMessage());
+                    priorCats = null;
                 }
             }
-            // v9 T3 inline tags: append per-stub tag comment.
-            List<String> annotatedStubs = new ArrayList<>(newStubs);
-            List<String> annotatedSkips = new ArrayList<>(newSkips);
-            // v15.2: hand the advisory lists to the JSON writer - the JSON is
-            // the detailed source of truth; the TOML stays executable-only
-            // (unless EMIT_VERBOSE_TOML_ADVISORY).
-            advisoryNop = nopList;
-            advisoryPatch = patchList;
-            advisoryForceRecomp = forceRecompList;
-            advisoryNativeImpl = nativeImplList;
-            advisoryReview = reviewList;
-            advisoryPatchInstr = patchInstrCandidates;
-            // (keep raw lists for back-compat; comments handled inside writer)
-            writeUnifiedConfig(unifiedToml,configToml,annotatedStubs,annotatedSkips,
-                               nopList,patchList,forceRecompList,
-                               nativeImplList,reviewList,patchInstrCandidates);
+            this.priorTriageMapCats = priorCats;
             writeTriageJson(triageJson,results,elfHash,gpValue,totalFuncs,uncategorized);
+            // v14: per-function Markdown docs + the focused lookup indexes.
+            writeFunctionDocs(functionsDir, results, elfHash, gpValue);
+            writeLookupIndexes(indexDir, results, elfHash, gpValue);
+
+            // v11.3: auto-generate the post-regen COP2 dest-mask patch from this
+            // run's COP2 model. CANNOT run inside this Ghidra pass (it rewrites
+            // recomp/*.cpp that only exist AFTER ps2_recomp.exe regenerates), so
+            // it ships next to the triage output with RECOMP pre-filled and is
+            // listed in post_regen_steps.md - so the F51.8 fix can't be forgotten.
+            emitCop2FixScript(outputDir, results);
 
             println("\n[SUCCESS] Unified TOML : "+unifiedToml.getAbsolutePath());
-            println("[SUCCESS] Triage JSON  : "+triageJson.getAbsolutePath());
-            println("[SUCCESS] Text logs    : assembly.txt, decompiled.txt, flowchart.txt");
-            println("All 5 files saved to: "+outputDir.getAbsolutePath());
+            println("[SUCCESS] Function docs: functions/<addr>_<name>.md ("+results.size()+" files)");
+            println("[SUCCESS] Indexes      : index/{functions_index,calls_index,xrefs_index,tags_index,globals_index}.json");
+            println("[SUCCESS] Post-regen   : fix_cop2_destmask.py + post_regen_steps.md");
+            println("All files saved to: "+outputDir.getAbsolutePath());
 
         } finally {
-            asmWriter.close();
-            decompWriter.close();
-            flowWriter.close();
             decomp.dispose();
         }
     }
@@ -3710,7 +4386,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         if (cp.adRegs.contains("SIGNAL") || cp.adRegs.contains("FINISH") || cp.adRegs.contains("LABEL"))
             cp.signalFinishLabelSeen = true;
 
-        // priv regs (PMODE/IMR/CSR) - string hex form
+        // priv regs (PMODE/IMR/CSR) — string hex form
         String imrStr   = jsonStringField(s, "IMR");
         String pmodeStr = jsonStringField(s, "PMODE");
         if (imrStr   != null) cp.imr   = parseHexULong(imrStr);
@@ -3772,15 +4448,15 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     }
 
     /**
-     * Rule 80: per-function corroboration. Decoration only - no disposition
+     * Rule 80: per-function corroboration. Decoration only — no disposition
      * flip. Predictions checked:
-     *  * PSMT4HH_REFERENCE         <-> any checkpoint witness PSMT4HH (44)
-     *  * MICROCODE_UPLOADER / VIF_*_BUILDER <-> any path1/path2 witness
-     *  * PATH3_INITIATOR / GIF_PATH3_HAZARD <-> any path3 witness +
+     *  • PSMT4HH_REFERENCE         <-> any checkpoint witness PSMT4HH (44)
+     *  • MICROCODE_UPLOADER / VIF_*_BUILDER <-> any path1/path2 witness
+     *  • PATH3_INITIATOR / GIF_PATH3_HAZARD <-> any path3 witness +
      *                                          (prim_garbage in any cp for hazard)
-     *  * MPEG_DECODER_TRAP / IPU   <-> readfifo2 OR ipuActive
-     *  * TEX0_REG_WRITER + tbp constants <-> tex0_tbps_union / vram_tbps_union
-     *  * SIGNAL/FINISH/LABEL handler names <-> imrAllMaskedGsIrqs -> safe-stub
+     *  • MPEG_DECODER_TRAP / IPU   <-> readfifo2 OR ipuActive
+     *  • TEX0_REG_WRITER + tbp constants <-> tex0_tbps_union / vram_tbps_union
+     *  • SIGNAL/FINISH/LABEL handler names <-> imrAllMaskedGsIrqs → safe-stub
      * Status precedence:
      *  CONFIRMED > MENU_ONLY > DORMANT > INDETERMINATE
      */
@@ -3827,7 +4503,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             }
             if (t.writesTex0Reg) {
                 t.runtimeBullseyePredictions.add("TEX0_REG_WRITER");
-                // TEX0 writers are confirmed if game uploaded *any* tex data -
+                // TEX0 writers are confirmed if game uploaded *any* tex data —
                 // every PATH3-active capture qualifies.
                 t.runtimeWitness.put("TEX0_REG_WRITER", ev.anyPath3);
             }
@@ -3880,7 +4556,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             // RUNTIME_MENU_ONLY: PSMT4HH predicted AND only UI/menu checkpoints
             // witnessed it (no 3D-scene checkpoint witness).
             // v7.1 refinement: F32 showed BITBLTBUF.dpsm=0x2C uploads are NOT
-            // menu-only - they also occur during 3D scene loads. Same for any
+            // menu-only — they also occur during 3D scene loads. Same for any
             // function close to the render roots (drawing_chain_depth <= 3) or
             // explicitly tagged BITBLTBUF_T4HH_UPLOADER. Skipping the MENU_ONLY
             // tag in those cases prevents deprioritizing F32-critical uploaders.
@@ -4107,7 +4783,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
     // =========================================================
     // RULE 18 (v3 NEW): GAME OVERRIDE FILE PARSER
-    // Reads dc2_game_override.cpp and extracts every address that
+    // Reads game_override.cpp and extracts every address that
     // has already been manually bound. These are skipped entirely
     // so the triage report doesn't re-classify them as candidates.
     //
@@ -4115,15 +4791,22 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     //   bindAddressHandler(runtime, 0x00104288u, "memclr");
     //   runtime.registerFunction(0x0015C160u, nop_stub);
     // =========================================================
-    // Rule 98: enhanced 2-pass override parser. Pass 1 collects bindings.
-    // Pass 2 classifies handler bodies (nop_stub/constant_return/state_machine/probe/real_shim).
+    // Override binding -> classification (v8 Rule 98). Set when handler-name
+    // matches certain patterns OR when the helper body (best-effort) looks
+    // like a probe / nop / state machine / constant return.
+    private Map<Long, String> overrideKindByAddr = new HashMap<>();
+    // Override binding -> handler function name (3rd arg of bindAddressHandler).
+    private Map<Long, String> overrideHandlerNames = new HashMap<>();
+
     private void parseGameOverrideFile(File f) throws IOException {
         BufferedReader reader = utf8Reader(f);
+        // First pass: scan all lines into a list so we can inspect helper bodies.
         List<String> allLines = new ArrayList<>();
         String line;
         while((line = reader.readLine()) != null) allLines.add(line);
         reader.close();
 
+        // Pass 1: collect bindings.
         for(int i = 0; i < allLines.size(); i++) {
             String t = allLines.get(i).trim();
             if(!t.contains("bindAddressHandler") && !t.contains("registerFunction")) continue;
@@ -4133,19 +4816,25 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             gameOverrideAddresses.add(addr);
             if(name != null && !name.isEmpty()) gameOverrideNames.put(addr, name);
             gameOverrideImportedCount++;
+            // Extract handler symbol (the C++ identifier after the last comma).
             String handler = extractHandlerSymbol(t);
             if(handler != null) overrideHandlerNames.put(addr, handler);
         }
 
+        // Pass 2: best-effort classification of helper bodies.
+        // For each unique handler name, find its function body and inspect.
         for(Map.Entry<Long,String> e : overrideHandlerNames.entrySet()) {
-            String kind = classifyHandlerBody(e.getValue(), allLines);
+            String hn = e.getValue();
+            String kind = classifyHandlerBody(hn, allLines);
             overrideKindByAddr.put(e.getKey(), kind);
             overrideClassifiedCount++;
-            if("nop_stub".equals(kind) || "probe".equals(kind)) overrideRetireCount++;
+            if("nop_stub".equals(kind) || "probe".equals(kind))
+                overrideRetireCount++;
         }
     }
 
     private String extractHandlerSymbol(String line) {
+        // bindAddressHandler(0xADDR, "name", &handler) — return identifier after &.
         int amp = line.indexOf('&');
         if(amp < 0) return null;
         int end = amp + 1;
@@ -4160,11 +4849,13 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
     private String classifyHandlerBody(String handlerName, List<String> lines) {
         if(handlerName == null) return "real_shim";
+        // Heuristic name-based hints first.
         String lower = handlerName.toLowerCase();
         if(lower.contains("nop_stub") || lower.endsWith("_nop")) return "nop_stub";
         if(lower.contains("probe")) return "probe";
         if(lower.contains("state_machine") || lower.contains("state_step")) return "state_machine";
         if(lower.contains("const_return") || lower.endsWith("_zero")) return "constant_return";
+        // Body-scan: find a line `<retT> <handlerName>(...)` and look at next ~30 lines.
         int start = -1;
         for(int i = 0; i < lines.size(); i++) {
             String t = lines.get(i);
@@ -4178,15 +4869,18 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             }
         }
         if(start < 0) return "real_shim";
-        int bodyLines=0, returnsConst=0, callOps=0, traceLogs=0, conditionals=0;
-        for(int i = start; i < Math.min(start+60, lines.size()); i++) {
+        int bodyLines = 0, returnsConst = 0, callOps = 0, traceLogs = 0, conditionals = 0;
+        for(int i = start; i < Math.min(start + 60, lines.size()); i++) {
             String t = lines.get(i);
             if(t.contains("}") && bodyLines > 4) break;
             bodyLines++;
             if(t.matches(".*return\\s+\\d+.*")) returnsConst++;
             if(t.contains("(*ctx") || t.contains("ctx->")) callOps++;
-            if(t.contains("LOG")||t.contains("trace")||t.contains("println")||t.contains("getenv(")) traceLogs++;
-            if(t.contains("if(")||t.contains("if (")||t.contains("switch(")||t.contains("switch (")) conditionals++;
+            if(t.contains("[F4") || t.contains("[F49") || t.contains("LOG") || t.contains("trace") ||
+               t.contains("println") || t.contains("getenv("))
+                traceLogs++;
+            if(t.contains("if(") || t.contains("if (") || t.contains("switch(") || t.contains("switch ("))
+                conditionals++;
         }
         if(traceLogs > 0 && callOps == 0) return "probe";
         if(bodyLines <= 5 && returnsConst > 0 && callOps == 0) return "constant_return";
@@ -4230,7 +4924,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // RULE 9: PARSE STEP 1 CONFIG
     // =========================================================
     // =========================================================
-    // v15.3 Rule 153: RUNTIME-HANDLER ROSTER SCRAPE
+    // v11 Rule 153 (General v15.3): RUNTIME-HANDLER ROSTER SCRAPE
     // Walks a ps2xRuntime checkout and collects every handler name the
     // runtime actually implements. Sources of names:
     //   (a) `void Name(R5900Context& ...)`            - classic handler def
@@ -4296,20 +4990,39 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     private void parseStep1Config(File configFile) throws IOException {
         BufferedReader reader = utf8Reader(configFile);
         String line; boolean inStubs=false,inSkip=false;
+        // v11.1: `locked = [...]` array state + "previous enricher additions"
+        // marker zone (re-entrant input = our own earlier output).
+        boolean inLocked=false;
+        boolean enricherZone=false;
+        // v11.1: ignore everything inside an old [triage_advisory] section
+        // (pre-v11 runs emitted it into the TOML; advisory arrays must never
+        // be mistaken for binding arrays).
+        boolean inAdvisorySection=false;
         while ((line=reader.readLine())!=null) {
             String t=line.trim();
-            // v15.3 Rule 154: exporter-embedded ELF identity.
+            if (t.startsWith("[")) {
+                inAdvisorySection = t.startsWith("[triage_advisory]");
+                inStubs=false; inSkip=false; inLocked=false; enricherZone=false;
+                continue;
+            }
+            if (inAdvisorySection) continue;
+            // v11 Rule 154: exporter-embedded ELF identity.
             if (t.startsWith("elf_hash")) {
                 int q1=t.indexOf('"'),q2=t.lastIndexOf('"');
                 if (q1>=0 && q2>q1) step1ElfHash=t.substring(q1+1,q2).trim().toLowerCase();
                 continue;
             }
-            // v15.5: single-line arrays (`stubs = ["a@0x1", "b@0x2"]` or
-            // `stubs = []`) are valid TOML and appear in hand-edited and
-            // third-party exporter configs; the old line-based parser
-            // silently dropped every entry on such lines (and mis-tracked
-            // the open-array state). Inline entries are consumed here.
-            if (t.startsWith("stubs")||
+            // v11.1: previous-run additions marker. Entries below it (until
+            // the array closes) carry step1_source = "enricher_prev".
+            if (t.startsWith("# --- Triage Enricher")) { enricherZone=true; continue; }
+            // v11 (General v15.5 Bugfix T): single-line arrays
+            // (`stubs = ["a@0x1", "b@0x2"]` or `stubs = []`) are valid TOML
+            // and appear in hand-edited and third-party exporter configs; the
+            // old line-based parser silently dropped every entry on such
+            // lines (and mis-tracked the open-array state). Inline entries
+            // are consumed here. v11.1 adds the `locked` array.
+            boolean isLockedKey = t.startsWith("locked");
+            if (t.startsWith("stubs")||isLockedKey||
                 (t.startsWith("skip")&&!t.startsWith("skip_count"))) {
                 boolean stubsArr = t.startsWith("stubs");
                 if (t.contains("[") && t.contains("]")) {
@@ -4317,21 +5030,33 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     String body = t.substring(t.indexOf('[')+1, t.lastIndexOf(']'));
                     java.util.regex.Matcher m =
                         java.util.regex.Pattern.compile("\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(body);
-                    while (m.find()) addStep1Entry(m.group(1), stubsArr);
-                    inStubs=false; inSkip=false;
+                    while (m.find()) {
+                        if (isLockedKey) addLockedEntry(m.group(1));
+                        else addStep1Entry(m.group(1), stubsArr, false);
+                    }
+                    inStubs=false; inSkip=false; inLocked=false;
                 } else {
-                    inStubs=stubsArr; inSkip=!stubsArr;
+                    inLocked=isLockedKey;
+                    inStubs=!isLockedKey&&stubsArr;
+                    inSkip=!isLockedKey&&!stubsArr;
                 }
+                enricherZone=false;
                 continue;
             }
-            if (t.equals("]")||t.startsWith("]")){inStubs=false;inSkip=false;continue;}
-            if (!inStubs&&!inSkip) continue;
+            if (t.equals("]")||t.startsWith("]")){inStubs=false;inSkip=false;inLocked=false;enricherZone=false;continue;}
+            if (!inStubs&&!inSkip&&!inLocked) continue;
             int q1=t.indexOf('"'),q2=t.lastIndexOf('"');
             if (q1<0||q2<=q1) continue;
-            addStep1Entry(t.substring(q1+1,q2), inStubs);
+            String entry=t.substring(q1+1,q2);
+            if (inLocked) { addLockedEntry(entry); continue; }
+            addStep1Entry(entry, inStubs, enricherZone);
+            // v11.1 LOCK: trailing `# LOCKED` comment on a stub/skip line.
+            if (t.substring(q2+1).toUpperCase().contains("# LOCKED")
+                || t.substring(q2+1).toUpperCase().contains("#LOCKED"))
+                addLockedEntry(entry);
         }
         reader.close();
-        // v15.2 Rule 152: dual-binding hygiene - an address (or name) listed
+        // v11 Rule 152: dual-binding hygiene - an address (or name) listed
         // in BOTH stubs and skip is an input bug. Keep the stub (named
         // handler routing beats an error placeholder), drop the skip.
         {
@@ -4348,8 +5073,9 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
-    /** v15.5: shared step1 entry recorder ("name" or "name@0xADDR"). */
-    private void addStep1Entry(String entry, boolean isStubArray) {
+    /** v11: shared step1 entry recorder ("name" or "name@0xADDR").
+     *  v11.1: enricherPrev marks entries a PREVIOUS enricher run added. */
+    private void addStep1Entry(String entry, boolean isStubArray, boolean enricherPrev) {
         if (entry == null || entry.isEmpty()) return;
         String name; long addr = -1;
         int atIdx = entry.lastIndexOf("@0x");
@@ -4367,19 +5093,57 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             if (!name.isEmpty()) step1SkipNames.add(name);
             if (addr >= 0) step1SkipAddresses.add(addr);
         }
-        // v15.2 Rule 151: remember the expected name per address.
+        if (enricherPrev) {
+            if (!name.isEmpty()) step1EnricherPrevNames.add(name);
+            if (addr >= 0) step1EnricherPrevAddresses.add(addr);
+        }
+        // v11 Rule 151: remember the expected name per address.
         if (addr >= 0 && !name.isEmpty()) step1NameByAddr.putIfAbsent(addr, name);
+    }
+
+    /** v11.2: is `expected` a TRUNCATED form of the real ELF symbol rather
+     *  than a different function? step1 tokens bind by ADDRESS; the name is
+     *  only a label, and v9-era exporters truncated mangled C++ names
+     *  (`__ct@0xADDR` for `__ct__15mgCTexAnimeDataFv`, `SetStatus@0xADDR` for
+     *  `SetStatus__6CSceneFiii`). Such a token is NOT a wrong-region
+     *  mismatch - the address is correct. Detected when the real symbol
+     *  starts with the expected label and continues with the Itanium mangle
+     *  marker `__`. Genuine drift (different function) fails this and stays a
+     *  real Rule 151 mismatch. */
+    private static boolean isTruncatedNameOf(String expected, String actual) {
+        if (expected == null || actual == null) return false;
+        if (!actual.startsWith(expected)) return false;
+        if (actual.length() <= expected.length()) return false;
+        return actual.substring(expected.length()).startsWith("__");
+    }
+
+    /** v11.1: record a locked binding ("name" or "name@0xADDR"). Locked
+     *  entries bypass the keep gate and every rescue/promote pass. */
+    private void addLockedEntry(String entry) {
+        if (entry == null || entry.isEmpty()) return;
+        String name = entry; long addr = -1;
+        int atIdx = entry.lastIndexOf("@0x");
+        if (atIdx < 0) atIdx = entry.lastIndexOf("@0X");
+        if (atIdx >= 0) {
+            name = entry.substring(0, atIdx);
+            String hexStr = entry.substring(atIdx+3).replaceAll("[^0-9a-fA-F]","");
+            if (!hexStr.isEmpty())
+                try { addr = Long.parseLong(hexStr,16); } catch (NumberFormatException ignored) {}
+        }
+        if (!name.isEmpty()) step1LockedNames.add(name);
+        if (addr >= 0) step1LockedAddresses.add(addr & 0xFFFFFFFFL);
     }
 
     // =========================================================
     // RULE 11: MAINLOOP SHIELD
-    // v15.3 Rule 156: extended from depth-1 (direct callees only) to a
-    // depth-3 BFS, capped. Per-frame wrappers two hops below the loop (FF1:
-    // GameMain -> ModeIngame -> SceneDraw) were stub-eligible before. The
-    // shield only suppresses ENRICHER stub/skip decisions and feeds the
-    // step1 whitelist rescue; SDK boundaries with HARD evidence (syscall /
-    // SIF RPC / IRX / IPU) keep their stubs regardless - the step1 keep gate
-    // checks hard evidence BEFORE the whitelist (see step1KeepGateFailure).
+    // v11 Rule 156 (General v15.3): extended from depth-1 (direct callees
+    // only) to a depth-3 BFS, capped. Per-frame wrappers two hops below the
+    // loop (MainLoop -> SceneStep -> SceneDraw class chains) were
+    // stub-eligible before. The shield only suppresses ENRICHER stub/skip
+    // decisions and feeds the step1 whitelist rescue; SDK boundaries with
+    // HARD evidence (syscall / SIF RPC / IRX / IPU) keep their stubs
+    // regardless - the step1 keep gate checks hard evidence BEFORE the
+    // whitelist (see step1KeepGateFailure).
     // =========================================================
     private static final int MAINLOOP_SHIELD_DEPTH = 3;
     private static final int MAINLOOP_SHIELD_CAP   = 768;
@@ -4481,6 +5245,312 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             if(r == null || r.traits == null) continue;
             r.traits.drawingChainDepth = e.getValue();
             drawingChainCount++;
+        }
+    }
+
+    // =========================================================
+    // v8 POST-PASSES: ctor risk, class registry, return-to-global,
+    //                 asset upload traces, override classification,
+    //                 SDK-caller depth-1 propagation, frame clock drivers.
+    // =========================================================
+    private void runV8PostPasses(List<FuncResult> results,
+                                  Map<Long,FuncResult> byAddr,
+                                  Map<Long,List<Long>> fwd,
+                                  List<String> newStubs) {
+        // -------- Pass A: ctor call mode + return-to-global --------
+        // For every direct jal site, look at the caller's instructions just
+        // after the jal for `sw $v0, +imm($gp)`. If found, record on callee.
+        for(FuncResult caller : results) {
+            if(caller.traits == null) continue;
+            Function cf = funcManager.getFunctionAt(
+                currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(caller.address & 0xFFFFFFFFL));
+            if(cf == null) continue;
+            for(long[] site : caller.traits.jalSites) {
+                long callPc = site[0];
+                long target = site[1] & 0xFFFFFFFFL;
+                if(target == 0xFFFFFFFFL) continue;
+                FuncResult callee = byAddr.get(target);
+                if(callee == null || callee.traits == null) continue;
+                // Mark direct-jal observation on callee.
+                callee.traits.calledViaDirectJal = true;
+                // Examine 1-4 instructions immediately after the jal for sw $v0, +imm($gp).
+                try {
+                    Instruction jalInst = currentProgram.getListing().getInstructionAt(
+                        currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(callPc));
+                    if(jalInst == null) continue;
+                    Instruction probe = jalInst.getNext();
+                    int look = 0;
+                    while(probe != null && look < 4) {
+                        String mn = probe.getMnemonicString();
+                        if(mn != null) {
+                            String ml = mn.toLowerCase();
+                            if(ml.equals("sw") || ml.equals("sd")) {
+                                Object[] dop = probe.getOpObjects(0);
+                                Object[] aop = probe.getOpObjects(1);
+                                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                                boolean baseIsGp = false;
+                                long off = -1;
+                                if(aop != null) {
+                                    for(Object o : aop) {
+                                        if(o instanceof ghidra.program.model.lang.Register &&
+                                           ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("gp"))
+                                            baseIsGp = true;
+                                        else if(o instanceof ghidra.program.model.scalar.Scalar)
+                                            off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                                    }
+                                }
+                                if(src != null && src.equalsIgnoreCase("v0") && baseIsGp && off != -1) {
+                                    long norm = off & 0xFFFFFFFFL;
+                                    callee.traits.returnWrittenToGlobals.add(norm);
+                                    callee.traits.ctorAssignedToGlobal = true;
+                                    // Auto-extend known_globals if unknown.
+                                    if(!KNOWN_GP_OFFSETS.containsKey(norm) &&
+                                       !autoExtendedGlobals.containsKey(norm)) {
+                                        String guess = callee.traits.ctorClassName != null
+                                            ? callee.traits.ctorClassName + "_global"
+                                            : "g_unk_" + String.format("%08X", norm);
+                                        autoExtendedGlobals.put(norm, guess);
+                                        autoExtendedGlobalsCount++;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        probe = probe.getNext();
+                        look++;
+                    }
+                } catch(Exception ignore) {}
+            }
+        }
+        // v11.3: generalize the jr-$t9 caller proxy to ALL functions so the
+        // emitted `override_hookable` is meaningful for non-ctors too.
+        // registerFunction overrides are consulted ONLY for indirect jalr/jr $t9;
+        // a function with any direct-jal caller is not fully hookable that way
+        // (the G11 ReloadTexture / F51.8 COP2 gotcha). Same proxy Pass B uses.
+        for(FuncResult r : results) {
+            if(r.traits == null || r.traits.calledViaJrT9) continue;
+            for(long[] c : r.traits.callers) {
+                FuncResult caller = byAddr.get(c[0] & 0xFFFFFFFFL);
+                if(caller == null || caller.traits == null) continue;
+                if(caller.traits.indirectCallT9Count > 0) { r.traits.calledViaJrT9 = true; break; }
+            }
+        }
+        // -------- Pass B: ctor risk grading --------
+        // Caller mode classification — was a ctor reached only via direct jal,
+        // only via jalr $t9, or both?
+        for(FuncResult r : results) {
+            if(r.traits == null || !r.traits.isCtor) continue;
+            FuncTraits t = r.traits;
+            // Determine if any caller calls via jalr $t9 (indirect).
+            for(long[] c : t.callers) {
+                FuncResult caller = byAddr.get(c[0] & 0xFFFFFFFFL);
+                if(caller == null || caller.traits == null) continue;
+                // If caller has indirectCallT9Count>0 we *may* dispatch this
+                // ctor via $t9; not a strict proof but a useful proxy.
+                if(caller.traits.indirectCallT9Count > 0) t.calledViaJrT9 = true;
+            }
+            // Mode
+            if(t.calledViaDirectJal && t.calledViaJrT9) t.ctorCallMode = "dual";
+            else if(t.calledViaDirectJal)               t.ctorCallMode = "direct_only";
+            else if(t.calledViaJrT9)                    t.ctorCallMode = "indirect_only";
+            else                                        t.ctorCallMode = "unobserved";
+            // Risk tier
+            boolean autoStubLikely = !t.ctorInstallsVtable && !t.isCtorMultiFieldInit
+                                  && !t.ctorWritesA0Slot && t.byteSize < 60;
+            if(t.ctorAssignedToGlobal && ("dual".equals(t.ctorCallMode) || "direct_only".equals(t.ctorCallMode))
+                                       && autoStubLikely) {
+                t.ctorRiskTier = "CRITICAL"; ctorCriticalCount++;
+            } else if(t.ctorInstallsVtable && "dual".equals(t.ctorCallMode)) {
+                t.ctorRiskTier = "HIGH"; ctorHighCount++;
+            } else if(t.isCtorMultiFieldInit || t.ctorInstallsVtable || t.ctorAssignedToGlobal) {
+                t.ctorRiskTier = "MEDIUM"; ctorMediumCount++;
+            } else {
+                t.ctorRiskTier = "LOW";
+            }
+            if(t.ctorAssignedToGlobal) ctorAssignedGlobalCount++;
+            if(t.ctorInstallsVtable)   ctorInstallsVtableCount++;
+            if("dual".equals(t.ctorCallMode)) ctorDualCallModeCount++;
+            // Promote CRITICAL/HIGH ctors out of STUB.
+            // v11 (General v15.4): hard-bound step1 keeps are deliberate
+            // boundaries; surface conflicts via review, don't unwind.
+            if(("CRITICAL".equals(t.ctorRiskTier) || "HIGH".equals(t.ctorRiskTier)) &&
+               "STUB".equals(r.disposition) && !isHardBoundStep1(r)) {
+                r.disposition = "RECOMPILE";
+                removeAutoBindingEntries(newStubs, r);
+                noteStep1Rescue(r, "ctor risk " + t.ctorRiskTier + " (vtable/global-assigned ctor)",
+                                "v8_ctor_risk");
+            }
+            if(!r.tags.contains("CTOR_RISK_" + t.ctorRiskTier))
+                r.tags.add("CTOR_RISK_" + t.ctorRiskTier);
+        }
+        // -------- Pass C: class registry build --------
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            FuncTraits t = r.traits;
+            String cls = null;
+            if(t.isCtor) cls = t.ctorClassName;
+            else if(t.isDtor) cls = t.methodClassName;
+            else if(t.methodClassName != null) cls = t.methodClassName;
+            if(cls == null) continue;
+            ClassEntry ce = classRegistry.computeIfAbsent(cls, k -> { ClassEntry x = new ClassEntry(); x.className = k; return x; });
+            if(t.isCtor) {
+                ce.ctorAddresses.add(r.address & 0xFFFFFFFFL);
+                if(t.ctorInstallsVtable && t.ctorVtableAddr != 0)
+                    ce.vtableAddr = t.ctorVtableAddr;
+                for(Long g : t.returnWrittenToGlobals) {
+                    String label = KNOWN_GP_OFFSETS.get(g);
+                    if(label == null) label = autoExtendedGlobals.get(g);
+                    if(label == null) label = String.format("0x%08X", g);
+                    ce.globalHolders.add(label);
+                }
+                // Track instantiation sites (caller PCs).
+                for(long[] c : t.callers) ce.instantiationSites.add(c[1] & 0xFFFFFFFFL);
+                // Class risk = highest ctor risk
+                if(rankRisk(t.ctorRiskTier) > rankRisk(ce.riskTier))
+                    ce.riskTier = t.ctorRiskTier;
+            } else if(t.isDtor) {
+                ce.dtorAddress = r.address & 0xFFFFFFFFL;
+            } else if(t.methodName != null) {
+                ce.methodNames.add(t.methodName);
+                ce.methodAddrs.put(t.methodName, r.address & 0xFFFFFFFFL);
+                if(t.isVirtualDrawMethod) ce.hasVirtualDraw = true;
+            }
+        }
+        // Bump ctor risk to CRITICAL when class has virtual draw method.
+        for(FuncResult r : results) {
+            if(r.traits == null || !r.traits.isCtor) continue;
+            String cls = r.traits.ctorClassName;
+            if(cls == null) continue;
+            ClassEntry ce = classRegistry.get(cls);
+            if(ce != null && ce.hasVirtualDraw &&
+               (rankRisk(r.traits.ctorRiskTier) < rankRisk("HIGH"))) {
+                r.traits.ctorRiskTier = "HIGH";
+                if(!r.tags.contains("CTOR_RISK_HIGH")) r.tags.add("CTOR_RISK_HIGH");
+            }
+        }
+        // -------- Pass D: virtual dispatch site counters + tags --------
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            if(!r.traits.virtualDispatchSites.isEmpty()) {
+                virtualDispatchSiteCount += r.traits.virtualDispatchSites.size();
+                virtualDispatchFuncCount++;
+                if(!r.tags.contains("VIRTUAL_DISPATCH_SITE"))
+                    r.tags.add("VIRTUAL_DISPATCH_SITE");
+            }
+            if(r.traits.isPadButtonMaskConsumer) {
+                padButtonMaskConsumerCount++;
+                if(!r.tags.contains("PAD_BUTTON_MASK_CONSUMER"))
+                    r.tags.add("PAD_BUTTON_MASK_CONSUMER");
+            }
+            if(r.traits.gifNloopDoubleCountRisk) {
+                gifNloopDoubleCountRiskCount++;
+                if(!r.tags.contains("GIF_NLOOP_DOUBLE_COUNT_RISK"))
+                    r.tags.add("GIF_NLOOP_DOUBLE_COUNT_RISK");
+            }
+            if(!r.traits.filePathSprintfFormats.isEmpty()) {
+                filePathSprintfCount++;
+                if(!r.tags.contains("FILE_PATH_SPRINTF_SOURCE"))
+                    r.tags.add("FILE_PATH_SPRINTF_SOURCE");
+            }
+            if(r.traits.isFrameClockDriver) {
+                frameClockDriverCount++;
+                if(!r.tags.contains("FRAME_CLOCK_DRIVER"))
+                    r.tags.add("FRAME_CLOCK_DRIVER");
+            }
+            if(r.traits.isSceVu0Helper) {
+                sceVu0HelperCount++;
+                if(!r.tags.contains("SCEVU0_HELPER_MUSTIMPL"))
+                    r.tags.add("SCEVU0_HELPER_MUSTIMPL");
+                // Promote out of STUB - unless the runtime ships a verified
+                // handler for it (v15.4 roster-backed keep, e.g. SIMD-native
+                // sceVu0ApplyMatrix).
+                if("STUB".equals(r.disposition) && !isHardBoundStep1(r)) {
+                    r.disposition = "RECOMPILE";
+                    removeAutoBindingEntries(newStubs, r);
+                    noteStep1Rescue(r, "sceVu0 helper must be implemented (VU0 macro math)",
+                                    "v8_scevu0_helper");
+                }
+            }
+            if(!r.traits.returnWrittenToGlobals.isEmpty()) returnWrittenToGlobalCount++;
+        }
+        // -------- Pass E: asset upload traces (Rule 103) --------
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            if(!r.traits.writesBitbltbufReg && r.traits.assetUploadTagsHit.isEmpty()) continue;
+            for(String tag : r.traits.assetUploadTagsHit) {
+                List<long[]> bucket = assetUploadTraces.computeIfAbsent(tag, k -> new ArrayList<>());
+                bucket.add(new long[]{ r.address & 0xFFFFFFFFL, 0L });
+            }
+            if(!r.traits.assetUploadTagsHit.isEmpty()) {
+                assetUploadTraceFuncCount++;
+                if(!r.tags.contains("ASSET_UPLOAD_BULLSEYE"))
+                    r.tags.add("ASSET_UPLOAD_BULLSEYE");
+            }
+        }
+        // Uploader caller depth-1 / depth-2 markers.
+        Set<Long> uploaderSet = new HashSet<>();
+        for(FuncResult r : results)
+            if(r.traits != null && r.traits.isBitbltbufT4hhUploader)
+                uploaderSet.add(r.address & 0xFFFFFFFFL);
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            for(long[] site : r.traits.jalSites) {
+                long tgt = site[1] & 0xFFFFFFFFL;
+                if(uploaderSet.contains(tgt)) {
+                    r.traits.uploaderCallerDepth1 = true;
+                    if(!r.tags.contains("UPLOADER_CALLER_D1"))
+                        r.tags.add("UPLOADER_CALLER_D1");
+                    break;
+                }
+            }
+        }
+        // -------- Pass F0: stamp override classification on per-func traits --------
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            long addr = r.address & 0xFFFFFFFFL;
+            if(overrideKindByAddr.containsKey(addr)) {
+                r.traits.overrideKind = overrideKindByAddr.get(addr);
+                String k = r.traits.overrideKind;
+                r.traits.overrideRetireCandidate = "nop_stub".equals(k) || "probe".equals(k);
+                if(!r.tags.contains("OVERRIDE_" + (k == null ? "REAL_SHIM" : k.toUpperCase())))
+                    r.tags.add("OVERRIDE_" + (k == null ? "REAL_SHIM" : k.toUpperCase()));
+            }
+        }
+        // -------- Pass F: SDK-caller depth-1 propagation (Rule 111) --------
+        Set<Long> dispfbWriters = new HashSet<>();
+        Set<Long> dmaKickers    = new HashSet<>();
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            if(r.traits.writesDispfbReg || r.traits.writesDispfbViaSdk)
+                dispfbWriters.add(r.address & 0xFFFFFFFFL);
+            if(!r.traits.dmaKickChannels.isEmpty() || r.traits.path3KickViaDmaApi)
+                dmaKickers.add(r.address & 0xFFFFFFFFL);
+        }
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            for(long[] site : r.traits.jalSites) {
+                long tgt = site[1] & 0xFFFFFFFFL;
+                if(dispfbWriters.contains(tgt) && !r.traits.dispfbWriterViaSdkCallerDepth1) {
+                    r.traits.dispfbWriterViaSdkCallerDepth1 = true;
+                    dispfbWriterViaSdkCallerCount++;
+                }
+                if(dmaKickers.contains(tgt) && !r.traits.dmaKickViaSdkCallerDepth1) {
+                    r.traits.dmaKickViaSdkCallerDepth1 = true;
+                    dmaKickViaSdkCallerCount++;
+                }
+            }
+        }
+    }
+
+    // Risk-tier comparator helper.
+    private static int rankRisk(String tier) {
+        if(tier == null) return 0;
+        switch(tier) {
+            case "CRITICAL": return 3;
+            case "HIGH":     return 2;
+            case "MEDIUM":   return 1;
+            default:         return 0;
         }
     }
 
@@ -4625,17 +5695,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             if(FILE_OPEN_CALLEES.contains(cn)) traits.callsFileOpen=true;
             // v8 Rule 100: frame-clock driver detection
             if(FRAME_CLOCK_CALLEES.contains(cn)) traits.isFrameClockDriver=true;
-            // v11 (I): IRX module loader / IOP reboot detection.
-            if(IRX_LOAD_CALLEES.contains(cn) || cn.equals("_sceSifLoadModule"))
-                traits.sifLoadModuleCallCount++;
-            if(IOP_REBOOT_CALLEES.contains(cn))
-                traits.isIopRebootHandler = true;
-            // v12 (F2): behavioral MC gate - any call to a memory-card SDK fn.
-            if(MC_SDK_CALLEES.contains(cn))
-                traits.callsMcSdk = true;
         }
-        // v11 (I): >=2 sceSifLoadModule calls = IRX loader bootstrap.
-        if(traits.sifLoadModuleCallCount >= 2) traits.isIrxLoader = true;
         // v8 Rule 96: NLOOP double-count risk = open AND close in same function.
         if(traits.callsGifPacketOpen && traits.callsGifPacketClose)
             traits.gifNloopDoubleCountRisk = true;
@@ -4655,6 +5715,8 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             }
         }
 
+        // v8 Rule 108: C++ demangler for class/method extraction.
+        demangleAndPopulate(fname, traits);
         // v7 Rule 79: GS IRQ handler name shape (decided here so it's available
         // for the corroboration pass even on functions with empty callee sets).
         for(String frag : GS_IRQ_HANDLER_NAME_FRAGMENTS)
@@ -4679,13 +5741,15 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         // v4 Rule 31: libgcc 64-bit/FP intrinsic by name. Pattern:
         //   __[u]div/mod/mul/neg/abs/cmp(di|si|hi)[23]
         //   __(fix|float)(df|sf|si|di)(df|sf|si|di)
-        // Forced RECOMPILE downstream - auto-stub halts the runner on first call (F23a).
+        // Forced RECOMPILE downstream — auto-stub halts the runner on first call (F23a).
         if(fname.startsWith("__")) {
             String n=fname;
             if(n.matches("__(u?div|u?mod|mul|neg|abs|cmp)(di|si|hi|qi)[23]") ||
                n.matches("__(fix|float)(df|sf|si|di)(df|sf|si|di)"))
                 traits.isLibgccIntrinsic=true;
         }
+        // v8 Rule 88: also accept hardcoded exact-name list.
+        if(LIBGCC_EXACT_NAMES.contains(fname)) traits.isLibgccIntrinsic = true;
 
         // v4 Rule 34: MPEG / IPU / DVD callee scan (decoder trap)
         for(String cn : traits.calleeNames) {
@@ -4694,10 +5758,12 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             if(traits.callsMpegFamily) break;
         }
 
-        // v5 Rule 43: bullseye for the Path3 4HH guard. Match bare name or
-        // Ghidra-mangled `sceGifPkRefLoadImage_0xADDR`.
+        // v5 Rule 43 (v9.1 broadened): bullseye for the Path3 4HH guard. Match
+        // bare name, Ghidra-mangled `sceGifPkRefLoadImage_0xADDR`, OR the
+        // GCC2-mangled `sceGifPkRefLoadImage__FP12sceGifPacket...` suffix.
         if(fname.equals(SCE_GIF_PK_REF_LOAD_IMAGE) ||
-           fname.startsWith(SCE_GIF_PK_REF_LOAD_IMAGE+"_0x"))
+           fname.startsWith(SCE_GIF_PK_REF_LOAD_IMAGE+"_0x") ||
+           fname.startsWith(SCE_GIF_PK_REF_LOAD_IMAGE+"__"))
             traits.isSceGifPkRefLoadImage = true;
 
         // v5 Rule 45: sceGifPk*/sceVif1Pk* family roster
@@ -4712,15 +5778,12 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             if(traits.isAudioRpcHandler) break;
         }
 
-
         // v5 Rule 54: MC transition gate by name + small size
         for(String frag : MC_GATE_NAME_FRAGMENTS) {
             if(fname.contains(frag) && traits.byteSize < 200) {
                 traits.isMcTransitionGate = true; break;
             }
         }
-        // v12 (F2): behavioral MC gate - any function calling MC SDK.
-        if(traits.callsMcSdk) traits.isMcTransitionGate = true;
 
         // Rule 25: Thread sync point detection.
         // Pattern: contains a syscall instruction, has a backward branch (spin loop),
@@ -4752,61 +5815,16 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                ml.startsWith("vscl")||ml.startsWith("vdiv")||ml.startsWith("vmfir")||
                ml.startsWith("vmtir")||ml.contains("c2")) traits.usesCop2=true;
             if(ml.equals("lqc2")||ml.equals("sqc2")){traits.usesCop2=true;traits.quadwordVU++;}
-            // R16: VU0 macro instruction mix counter.
-            if(ml.startsWith("v")||ml.equals("qmtc2")||ml.equals("qmfc2")||
-               ml.equals("lqc2")||ml.equals("sqc2")||ml.equals("cfc2")||ml.equals("ctc2"))
-                traits.vu0MacroOps++;
-            // R19: float-compare cluster counter.
-            if(ml.startsWith("c.")) traits.floatCmpOps++;
-            // G3 v10: HI/LO consumer count.
-            if(ml.equals("mflo")||ml.equals("mfhi")||ml.equals("mthi")||ml.equals("mtlo")||
-               ml.equals("mflo1")||ml.equals("mfhi1"))
-                traits.hiLoOps++;
-            // G3 v10: opcode histogram - capped to top-N at emit.
-            traits.opcodeHistogram.merge(ml, 1, Integer::sum);
-            // v10 bonus: 64-bit GIF tag composition. `dsll32` followed within
-            // 3 instructions by an `ori` against the same register marks the
-            // bit-shift+merge half of SCE_GIF_SET_TAG.
-            if(ml.equals("dsll32") || ml.equals("dsrl32")) {
-                Instruction nx = inst.getNext();
-                int look = 0;
-                while(nx != null && look < 3) {
-                    String nmn = nx.getMnemonicString();
-                    if(nmn != null && nmn.equalsIgnoreCase("ori")) {
-                        traits.hasDsll32OrSequence = true;
-                        traits.buildsGifTag64 = true;
-                        break;
-                    }
-                    nx = nx.getNext();
-                    look++;
-                }
-            }
-            // v10 bonus: texture-upload chunk-size const (VIF1 LoadImage = 0x70000).
-            if(ml.equals("lui") || ml.equals("ori") || ml.equals("addiu") || ml.equals("li")) {
-                for(Object op : inst.getInputObjects()) {
-                    if(!(op instanceof ghidra.program.model.scalar.Scalar)) continue;
-                    long v = ((ghidra.program.model.scalar.Scalar)op).getUnsignedValue();
-                    if(v == 0x70000L || (ml.equals("lui") && v == 0x0007L)) {
-                        traits.loads70000Chunk = true;
-                        break;
-                    }
-                }
-            }
 
-            // ACC ops: all instructions that read or write the VU0 accumulator register.
-            // vmadda/vmsuba/vmula/vadda: write ACC. vmadd/vmsub/vopmsub: read ACC.
-            // [FIX] v3 was missing vmadda, vmsuba, vmula, vadda, vopmsub - the exact
-            // instructions listed in the phase5 table. Phase5 functions were mis-classified.
-            if(ml.startsWith("vmadda")||ml.startsWith("vmsuba")||ml.startsWith("vmula")||
-               ml.startsWith("vadda") ||ml.equals("vopmsub")||
-               ml.startsWith("madda") ||ml.startsWith("vmadd")||ml.startsWith("vmsub")||
-               ml.startsWith("madd"))
-                traits.accOps++;
-            if(ml.equals("sync.l")||ml.equals("sync.p")||ml.equals("sync")) traits.hasSyncInstr=true;
-            if(ml.equals("vcallms")||ml.equals("vcallmsr")) traits.hasVcallms=true;
-
-            // Rule 140: VU0-macro COP2 partial-destination write detection (F51.8
-            // root cause: recompiler emitted dest-component blend mask reversed).
+            // v10 Rule 140: VU0-macro COP2 PARTIAL-DESTINATION write detection.
+            // F51.8: the recompiler emitted the dest-component blend mask in
+            // reversed lane order; only PARTIAL-dest ops (.xy/.z/.xyz/...) were
+            // corrupted — full `.xyzw` masks are symmetric and were spared.
+            // Ghidra renders EE VU0-macro ops with the dest field as a `.<field>`
+            // suffix (e.g. "vftoi4.xy", "vadd.xyz", "vmul.xyzw"). We count any
+            // maskable arithmetic/convert op whose dest field is a strict subset
+            // of {x,y,z,w}. (Broadcast-source variants like "vmulx"/"vaddw" still
+            // start with the base family and carry the dest field in the suffix.)
             {
                 boolean cop2Maskable =
                     ml.startsWith("vadd")||ml.startsWith("vsub")||ml.startsWith("vmul")||
@@ -4834,8 +5852,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     }
                 }
             }
-            // Rule 147: COP2 special-op / latency hazards (vdiv/vsqrt/vrsqrt/
-            // vclipw/vrnext/vmr32/vwaitq/vopmsub/xgkick).
+
+            // v10.1 Rule 147: COP2 special-op / latency hazards beyond the Rule
+            // 140 dest-mask blends — the recompiler can mis-codegen these the same
+            // way it reversed the dest mask (F51.8 follow-up). All are EE COP2
+            // macro-mode mnemonics Ghidra disassembles.
             if(ml.startsWith("vdiv")||ml.startsWith("vsqrt")||ml.startsWith("vrsqrt"))
                 {traits.cop2SpecialOps.add("EFU_Q_LATENCY");traits.usesCop2=true;}
             if(ml.startsWith("vclip"))
@@ -4850,10 +5871,24 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 {traits.cop2SpecialOps.add("OUTER_PRODUCT");traits.usesCop2=true;}
             if(ml.startsWith("xgkick")||ml.equals("vxgkick"))
                 {traits.cop2SpecialOps.add("XGKICK");traits.usesCop2=true;}
-            // Rule 148: EE FPU non-IEEE semantics. ctc1/cfc1 write FPU control;
-            // div.s/sqrt.s/rsqrt.s diverge from host IEEE for denormals/NaN/rounding.
+
+            // v10.1 Rule 148: EE FPU non-IEEE semantics. ctc1/cfc1 set the FPU
+            // control/rounding; div.s/sqrt.s/rsqrt.s are soft on the EE FPU and
+            // diverge from host IEEE for denormals/NaN/rounding.
             if(ml.equals("ctc1")||ml.equals("cfc1")) traits.writesFpuControl=true;
             if(ml.equals("div.s")||ml.equals("sqrt.s")||ml.equals("rsqrt.s")) traits.usesFpuDivSqrt=true;
+
+            // ACC ops: all instructions that read or write the VU0 accumulator register.
+            // vmadda/vmsuba/vmula/vadda: write ACC. vmadd/vmsub/vopmsub: read ACC.
+            // [FIX] v3 was missing vmadda, vmsuba, vmula, vadda, vopmsub - the exact
+            // instructions listed in the phase5 table. Phase5 functions were mis-classified.
+            if(ml.startsWith("vmadda")||ml.startsWith("vmsuba")||ml.startsWith("vmula")||
+               ml.startsWith("vadda") ||ml.equals("vopmsub")||
+               ml.startsWith("madda") ||ml.startsWith("vmadd")||ml.startsWith("vmsub")||
+               ml.startsWith("madd"))
+                traits.accOps++;
+            if(ml.equals("sync.l")||ml.equals("sync.p")||ml.equals("sync")) traits.hasSyncInstr=true;
+            if(ml.equals("vcallms")||ml.equals("vcallmsr")) traits.hasVcallms=true;
 
             // [FIX v4] Folded from containsSyscall/containsCOP0:
             if(ml.equalsIgnoreCase("syscall")) traits.hasSyscall=true;
@@ -4887,19 +5922,20 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     traits.returnPaths++;
                 } else if(ft.isComputed()&&ft.isJump()&&!ft.isCall()) {
                     traits.hasJumpTable=true;
-                    // Rule 146: harvest Ghidra-resolved jump-table targets so the
-                    // recompiler can pre-populate computed-jump dispatch.
+                    // v10.1 Rule 146: harvest Ghidra-resolved jump-table targets so
+                    // the recompiler can pre-populate its computed-jump dispatch.
+                    // A switch site with zero resolved targets is the real risk set
+                    // (tagged COMPUTED_JUMP_UNRESOLVED downstream).
                     long sitePc = inst.getAddress().getOffset() & 0xFFFFFFFFL;
                     traits.computedJumpSwitchPcs.add(sitePc);
-                    List<Long> tgts = new ArrayList<>();
                     for(Reference jr : inst.getReferencesFrom()) {
-                        if(traits.computedJumpSwitchPcs.size() > 512) break;
+                        if(traits.computedJumpTargets.size() >= 512) break;
                         if(jr.getReferenceType().isJump()) {
-                            long t = jr.getToAddress().getOffset() & 0xFFFFFFFFL;
-                            if(t != sitePc) tgts.add(t);
+                            long tgt = jr.getToAddress().getOffset() & 0xFFFFFFFFL;
+                            if(tgt != sitePc)
+                                traits.computedJumpTargets.add(new long[]{sitePc, tgt});
                         }
                     }
-                    traits.computedJumpTargets.put(sitePc, tgts);
                 } else if(ft.isCall()||ft.isComputed()) {
                     // v4 Rule 37: terminal jr $reg used as a tail-call (e.g. jr $t9
                     // virtual dispatch at MenuCamInit F22). The recompiler may not
@@ -4913,7 +5949,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
 
-            // v4 Rule 38: jalr $t9 - PIC / vtable indirect call.
+            // v4 Rule 38: jalr $t9 — PIC / vtable indirect call.
             // v8 Rule 89: accept ANY jalr regardless of flow type; both $t9 PIC
             // and any other register are counted as indirect dispatch.
             if(ml.equals("jalr")) {
@@ -4922,7 +5958,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                         String rn = ((ghidra.program.model.lang.Register)op).getName().toLowerCase();
                         if(rn.equals("t9")) traits.indirectCallT9Count++;
                     }
-                // v8 Rule 94: virtual dispatch site capture - jalr $rX where the
+                // v8 Rule 94: virtual dispatch site capture — jalr $rX where the
                 // previous instruction (or one within 3) was `lw $rX, K($rY)`
                 // (K = vtable slot offset). Best-effort backward scan.
                 try {
@@ -4966,7 +6002,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 } catch(Exception ignore) {}
             }
 
-            // v8 Rule 97: pad button mask consumer - andi/and immediate matches
+            // v8 Rule 97: pad button mask consumer — andi/and immediate matches
             // a PS2 DUALSHOCK bit. Captures friendly name per immediate.
             if(ml.equals("andi") || ml.equals("and")) {
                 for(Object op : inst.getInputObjects()) {
@@ -5000,18 +6036,13 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             if((ml.startsWith("b")&&!ml.equals("break"))||ml.equals("beqz")||ml.equals("bnez")) {
                 traits.branchOps++;
                 for(ghidra.program.model.address.Address target:inst.getFlows()) {
-                    if(target.getOffset()<inst.getAddress().getOffset()) {
+                    if(target.getOffset()<inst.getAddress().getOffset())
                         traits.hasBackwardBranch=true;
-                        // v12 (G1): record the backward branch PC so the patches
-                        // emit pass can synthesise a candidate `[patches.instructions]`
-                        // entry to NOP the spin / wait loop.
-                        if(traits.patchCandidatePcs.size() < 4)
-                            traits.patchCandidatePcs.add(inst.getAddress().getOffset() & 0xFFFFFFFFL);
-                    }
                 }
             }
 
-            // v13: count all store forms (incl. sd/sq) for spin-loop gating.
+            // v11 (General v13): count all store forms (incl. sd/sq) for
+            // spin-loop gating.
             if(ml.equals("sw")||ml.equals("swc1")||ml.equals("sqc2")||ml.equals("sh")||
                ml.equals("sb")||ml.equals("sd")||ml.equals("sq")||ml.equals("sdc1"))
                 traits.storeOps++;
@@ -5046,7 +6077,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 // positive offset (< 0x200). For VTABLE_SETTER we additionally
                 // require that the stored register was written by a `lui+addiu`
                 // constant earlier in the same function (best-effort static check).
-                // Phase F22 mgCCamera ctor was nop_stubbed -> null vtable -> pc-zero.
+                // Phase F22 mgCCamera ctor was nop_stubbed → null vtable → pc-zero.
                 if(instrIdx<40 && (ml.equals("sw")||ml.equals("sd"))) {
                     boolean baseIsA0 = false;
                     long offset = -1;
@@ -5081,7 +6112,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 // it may be empty (indirect via register), in which case we record only
                 // a sentinel target = 0xFFFFFFFF so the count of call sites still lines up.
                 // v4 Rule 42: dedup (callSitePc,target) pairs. Ghidra sometimes returns
-                // duplicate flows for jalr through a switch / delay-slot quirk - that
+                // duplicate flows for jalr through a switch / delay-slot quirk — that
                 // is the root cause of the "GetMainStack=3, called from one site" F28
                 // anomaly. Use linear scan (jalSites stay short per function).
                 long callSitePc = inst.getAddress().getOffset();
@@ -5132,7 +6163,15 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                             String.format("0x%08X", inst.getAddress().getOffset()),
                             ml, baseReg, offsetHex, destReg
                         });
-
+                        // v5 Rule 55: gp-relative load/store -> map to the game named global
+                        if("gp".equalsIgnoreCase(baseReg)) {
+                            try {
+                                long off = Long.parseLong(offsetHex.replace("0x","").replace("-",""), 16);
+                                if(offsetHex.startsWith("-")) off = (-off) & 0xFFFFFFFFL;
+                                String lbl = KNOWN_GP_OFFSETS.get(off);
+                                if(lbl != null) traits.globalsTouched.add(lbl);
+                            } catch(NumberFormatException ignored) {}
+                        }
                     }
                 } catch(Exception ignore) {}
             }
@@ -5152,16 +6191,22 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                        (norm>=GIF_CHCR_BASE&&norm<=GIF_CHCR_END))
                         traits.touchesGifCtrl=true;
                     // v4 Rule 32/33/35 + v5 Rule 46/47/48: GS privileged register.
-                    // v11 fix (A): old code treated (norm - 0x12000000) as a
-                    // GIF A+D reg id. WRONG - those ids are payload encodings,
-                    // not MMIO offsets. 0x12000000 is PMODE (priv reg), not PRIM.
-                    // gsRegHits retained for backward compat reports but the
-                    // PRIM/TEX0/RGBAQ/ZBUF flag-setting moved to detectAdRegPayloadWriters
-                    // (post-scan) which inspects qword AD-mode store-imm pairs.
                     if(norm>=MMIO_GS_START&&norm<=MMIO_GS_END) {
                         long reg = (norm - MMIO_GS_START) & 0xFFFFL;
                         String name = KNOWN_GS_REGS.get(reg);
                         if(name!=null) traits.gsRegHits.add(name);
+                        if(ref.getReferenceType().isWrite()) {
+                            if(reg==GS_PRIM_REG)   traits.writesGsPrimReg = true;
+                            if(reg==GS_ZBUF_1||reg==GS_ZBUF_2) traits.writesZbufReg = true;
+                            if(reg==GS_DISPFB1||reg==GS_DISPFB2) traits.writesDispfbReg = true;
+                            // v12 Rule 166: GS FRAME reg (render-target setter)
+                            if(reg==0x4CL||reg==0x4DL) traits.writesFrameReg = true;
+                            // v5
+                            if(reg==GS_TEX0_1||reg==0x07L) traits.writesTex0Reg = true;
+                            if(reg==GS_RGBAQ_REG)  traits.writesRgbaqReg = true;
+                        }
+                        if(ref.getReferenceType().isRead() && reg==GS_PRIM_REG)
+                            traits.readsPrimReg = true;
                     }
                     // v5 Rule 49/50: any DMA channel CHCR (+0x00) / QWC (+0x20) / TADR (+0x30)
                     for(int chIdx=0; chIdx<DMA_CHANNEL_BASES.length; chIdx++) {
@@ -5172,9 +6217,23 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                             traits.dmaKickChannels.add(DMA_CHANNEL_NAMES[chIdx]);
                         else if((slot == 0x20 || slot == 0x30) && ref.getReferenceType().isWrite())
                             traits.dmaQwcTadrChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+                        // v11.3 Rule 162: sub-word STR kick — sb/sh into the CHCR
+                        // word (slot 0..3). A word-only IO dispatcher drops it
+                        // (G26: SendDMA kicks ch8 via `sb` to CHCR+1).
+                        if(slot <= 0x03 && ref.getReferenceType().isWrite() &&
+                           (ml.equals("sb")||ml.equals("sh"))) {
+                            traits.subwordDmaStrKick = true;
+                            traits.subwordKickChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+                        }
+                        // v11.3 Rule 162: fromSPR(8)/toSPR(9) scratchpad DMA
+                        // channel — the staged-packet copy path (G26).
+                        if((chIdx==8||chIdx==9) && ref.getReferenceType().isWrite()) {
+                            traits.programsSprDma = true;
+                            traits.sprDmaChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+                        }
                         break;
                     }
-                    // v5 Rule 44: PATH3 initiator - any write to GIF CHCR range
+                    // v5 Rule 44: PATH3 initiator — any write to GIF CHCR range
                     if(norm >= GIF_CHCR_BASE && norm <= GIF_CHCR_END &&
                        ref.getReferenceType().isWrite())
                         traits.path3Initiator = true;
@@ -5223,28 +6282,97 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     // Rule 74: SBUS comm regs
                     if(norm == SBUS_MSCOM || norm == SBUS_SMCOM)
                         traits.touchesSbus = true;
-                    // v11 (E): MSFLG/SMFLG too - same EE<->IOP comm block.
-                    if(norm == SBUS_MSFLG || norm == SBUS_SMFLG)
-                        traits.touchesSbusFlags = true;
-                    // v11 (E): peripheral category tagging.
-                    if(norm >= RCNT_RANGE_START && norm <= RCNT_RANGE_END)
-                        traits.accessesRcnt = true;
-                    if((norm >= VIF0_CTRL_START && norm <= VIF0_CTRL_END) ||
-                       (norm >= VIF1_CTRL_START && norm <= VIF1_CTRL_END))
-                        traits.accessesVifCtrl = true;
-                    if(norm >= DMAC_GLOBAL_START && norm <= DMAC_GLOBAL_END)
-                        traits.accessesDmacGlobal = true;
-                    if(norm == INTC_MASK_ADDR && ref.getReferenceType().isWrite())
-                        traits.writesIntcMask = true;
-                    if(norm == INTC_STAT_ADDR && ref.getReferenceType().isRead())
-                        traits.readsIntcStat = true;
-                    if(norm >= SIO_RANGE_START && norm <= SIO_RANGE_END)
-                        traits.accessesSio = true;
-                    if(norm >= DMAC_EXT_START && norm <= DMAC_EXT_END &&
-                       ref.getReferenceType().isWrite())
-                        traits.writesDmacEnable = true;
                 }
 
+                // ===== v6 Rule 67-73: lui-constant scan for VIF opcodes /
+                // DMAtag IDs / PSMT4HH PSM constant. Run only on `lui` and
+                // `ori` so cost stays bounded.
+                if(ml.equals("lui") || ml.equals("ori")) {
+                    for(Object op : inst.getInputObjects()) {
+                        if(!(op instanceof ghidra.program.model.scalar.Scalar)) continue;
+                        long c = ((ghidra.program.model.scalar.Scalar)op).getUnsignedValue();
+                        // v7 Rule 78: capture small positive immediates that fit
+                        // in TEX0.TBP / BITBLTBUF.DBP shape (14-bit, 1..0x3FFF).
+                        // Runtime intersection filters noise later.
+                        if(ml.equals("ori") && c > 0 && c <= 0x3FFFL)
+                            traits.tbpConstantsLoaded.add(c);
+                        // For lui, the immediate is the upper 16 bits of a 32-bit
+                        // word — the high byte is what we test against VIF opcodes.
+                        long highByte;
+                        if(ml.equals("lui")) {
+                            // c is a 16-bit immediate; the high byte of the full
+                            // 32-bit word is c>>8.
+                            highByte = (c >> 8) & 0xFFL;
+                        } else {
+                            // ori — full 16-bit immediate could BE the VIF opcode
+                            // if it's an ori-then-shift pattern. Test both halves.
+                            highByte = (c >> 8) & 0xFFL;
+                            // Also check the immediate directly for PSMT4HH etc.
+                            if(c == PSMT4HH || c == PSMT4HL || c == PSMT8H)
+                                traits.loadsPsm4hhConstant = true;
+                            // v8 Rule 87: PSMT8 (0x13) — current F43 T8 blocker.
+                            if(c == 0x13L) traits.loadsPsm4hhConstant = true;
+                            // v8 Rule 103: expected dbp constants
+                            if(EXPECTED_DBP_SET.contains(c)) {
+                                for(Object[] row : EXPECTED_UPLOADS) {
+                                    if(((Number)row[2]).longValue() == c)
+                                        traits.assetUploadTagsHit.add((String)row[0]);
+                                }
+                            }
+                        }
+                        // VIF opcode named hits
+                        String vifName = VIF_OPCODES.get(highByte);
+                        if(vifName != null) traits.vifOpcodesBuilt.add(vifName);
+                        // UNPACK family 0x60-0x7F (excluding 0x67 reserved)
+                        if(highByte >= 0x60L && highByte <= 0x7FL)
+                            traits.vifOpcodesBuilt.add("UNPACK");
+                        // DMAtag ID — bits[30:28] of upper 32-bit word.
+                        // For lui imm=0xIIII, the upper bits of the 32-bit word
+                        // are at bit 16+. So highByte covers bits 24-31; the ID
+                        // is bits 28-30 of the original word == bits 4-6 of
+                        // highByte. We match the canonical encodings as in
+                        // DMA_TAG_IDS.
+                        long tagPrefix = highByte & 0xF0L;
+                        String dmaName = DMA_TAG_IDS.get(tagPrefix);
+                        if(dmaName != null && ml.equals("lui"))
+                            traits.dmaTagIdsBuilt.add(dmaName);
+                        // Direct PSM constant via lui imm = 0x002C... pattern is
+                        // unusual; the more common case is `addiu $rN, $zero, 0x2C`
+                        // or `ori $rN, $zero, 0x2C` — covered by ori branch above.
+                    }
+                }
+                // Also catch `addiu $rN, $zero, 0x2C` for PSMT4HH (zero-base
+                // constant load).
+                if(ml.equals("addiu") || ml.equals("daddiu") || ml.equals("li")) {
+                    boolean srcZero = false;
+                    long imm = -1;
+                    for(Object op : inst.getInputObjects()) {
+                        if(op instanceof ghidra.program.model.lang.Register &&
+                           ((ghidra.program.model.lang.Register)op).getName().equalsIgnoreCase("zero"))
+                            srcZero = true;
+                        else if(op instanceof ghidra.program.model.scalar.Scalar)
+                            imm = ((ghidra.program.model.scalar.Scalar)op).getUnsignedValue();
+                    }
+                    if((srcZero || ml.equals("li")) && imm >= 0) {
+                        if(imm == PSMT4HH || imm == PSMT4HL || imm == PSMT8H)
+                            traits.loadsPsm4hhConstant = true;
+                        // v8 Rule 87: also match additional PSM codes used in the game.
+                        // 0x13 = PSMT8 (T8 textures, current F43 blocker target).
+                        // 0x14 = PSMT4. 0x02 = PSMCT16. 0x00 = PSMCT32.
+                        if(imm == 0x13L) traits.loadsPsm4hhConstant = true;
+                        // v7 Rule 78: TBP-shape constant via addiu/li (14-bit positive).
+                        if(imm > 0 && imm <= 0x3FFFL)
+                            traits.tbpConstantsLoaded.add(imm);
+                        // v8 Rule 103: expected dbp constants (T8 dbp=0x2720 etc).
+                        if(EXPECTED_DBP_SET.contains(imm)) {
+                            for(Object[] row : EXPECTED_UPLOADS) {
+                                if(((Number)row[2]).longValue() == imm) {
+                                    traits.assetUploadTagsHit.add((String)row[0]);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Rule 22: SID literal scan near sceSifBindRpc calls
                 // Look for lui+addiu pattern yielding a value matching a known SID
                 if(traits.callsSifRpc&&ref.getReferenceType().isData()) {
@@ -5254,136 +6382,23 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
 
-            // ===== v6 Rule 67-73 (FIXED v9): lui/ori/addiu/li constant scan.
-            // Was previously nested inside the per-Reference loop - fired only
-            // when Ghidra resolved the immediate to a memory ref. Pure constants
-            // (VIF opcodes, DMA tag IDs, PSM codes) have NO ref, so the scan was
-            // dead. Now top-level per-instruction.
-            //
-            // v9 fixes:
-            //  - REFE (DMA_TAG_IDS key 0x00) only matched when highByte >= 0x10,
-            //    avoiding false positive on every lui $rN, 0x00XX (very common).
-            //  - Const-load list (R11) captured per (pc, value, dest_reg).
-            if(ml.equals("lui") || ml.equals("ori") ||
-               ml.equals("addiu") || ml.equals("daddiu") || ml.equals("li")) {
-                long constImm = -1;
-                String destReg = null;
-                boolean srcZero = false;
-                Object[] dops = inst.getOpObjects(0);
-                if(dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    destReg = ((ghidra.program.model.lang.Register)dops[0]).getName();
-                for(Object op : inst.getInputObjects()) {
-                    if(op instanceof ghidra.program.model.scalar.Scalar)
-                        constImm = ((ghidra.program.model.scalar.Scalar)op).getUnsignedValue();
-                    else if(op instanceof ghidra.program.model.lang.Register &&
-                            ((ghidra.program.model.lang.Register)op).getName().equalsIgnoreCase("zero"))
-                        srcZero = true;
-                }
-                if(constImm >= 0) {
-                    // R11: emit raw const for downstream tooling.
-                    traits.constLoads.add(new long[]{
-                        inst.getAddress().getOffset(), constImm,
-                        destReg != null ? destReg.hashCode() : 0
-                    });
-                    if(destReg != null)
-                        traits.constLoadDestRegs.add(destReg);
-
-                    // R15: SPR const detect (0x7000 high-half via lui).
-                    if(ml.equals("lui") && constImm == 0x7000L)
-                        traits.usesSPR = true;
-
-                    if(ml.equals("lui") || ml.equals("ori")) {
-                        if(ml.equals("ori") && constImm > 0 && constImm <= 0x3FFFL)
-                            traits.tbpConstantsLoaded.add(constImm);
-                        long highByte;
-                        if(ml.equals("lui")) {
-                            highByte = (constImm >> 8) & 0xFFL;
-                        } else {
-                            highByte = (constImm >> 8) & 0xFFL;
-                            if(constImm == PSMT4HH || constImm == PSMT4HL ||
-                               constImm == PSMT8H || constImm == 0x13L)
-                                traits.loadsPsm4hhConstant = true;
-                        }
-                        // v11 fix (B): highByte=0 matches VIF NOP, which is
-                        // every `lui $r,0x0000` - 2,361 false positives on FF1.
-                        // Skip NOP; require highByte >= 0x01. Also require lui+ori
-                        // composite (constLoadDestRegs hit twice) OR a non-NOP
-                        // opcode value to confirm it's a real builder.
-                        if(highByte >= 0x01L) {
-                            String vifName = VIF_OPCODES.get(highByte);
-                            if(vifName != null) traits.vifOpcodesBuilt.add(vifName);
-                            if(highByte >= 0x60L && highByte <= 0x7FL)
-                                traits.vifOpcodesBuilt.add("UNPACK");
-                        }
-                        // v9 REFE-guard: require highByte >= 0x10 to suppress
-                        // the lui-of-0x00XX false-positive flood.
-                        if(ml.equals("lui") && highByte >= 0x10L) {
-                            long tagPrefix = highByte & 0xF0L;
-                            String dmaName = DMA_TAG_IDS.get(tagPrefix);
-                            if(dmaName != null) traits.dmaTagIdsBuilt.add(dmaName);
-                        }
-                        // R2 DMA_CHCR_START_KICK fingerprint: 0x101 (CHCR start
-                        // bit). Combined with mmio/data-ref base later.
-                        if(constImm == 0x101L) traits.loadsChcrStartConst = true;
+            // Rule 23 (v3): Archive I/O string reference detection
+            // v5 Rule 52/53: same scan picks up audio module strings + meswin
+            if(!traits.refsArchiveStrings || !traits.refsMeswinStrings || !traits.isAudioRpcHandler) {
+                for(Reference ref:inst.getReferencesFrom()) {
+                    Data data=getDataAt(ref.getToAddress());
+                    if(data!=null&&data.hasStringValue()) {
+                        String str=data.getDefaultValueRepresentation();
+                        if(!traits.refsArchiveStrings)
+                            for(String s:ARCHIVE_IO_STRINGS)
+                                if(str.contains(s)){traits.refsArchiveStrings=true;break;}
+                        if(!traits.refsMeswinStrings)
+                            for(String s:MESWIN_STRINGS)
+                                if(str.contains(s)){traits.refsMeswinStrings=true;break;}
+                        if(!traits.isAudioRpcHandler)
+                            for(String s:AUDIO_MODULE_STRINGS)
+                                if(str.contains(s)){traits.isAudioRpcHandler=true;break;}
                     }
-                    if(ml.equals("addiu") || ml.equals("daddiu") || ml.equals("li")) {
-                        if((srcZero || ml.equals("li"))) {
-                            if(constImm == PSMT4HH || constImm == PSMT4HL ||
-                               constImm == PSMT8H || constImm == 0x13L)
-                                traits.loadsPsm4hhConstant = true;
-                            if(constImm > 0 && constImm <= 0x3FFFL)
-                                traits.tbpConstantsLoaded.add(constImm);
-                            if(constImm == 0x101L) traits.loadsChcrStartConst = true;
-                        }
-                    }
-                }
-            }
-
-            // v5 Rule 52/53 + v9 R7/R8: scan all string refs.
-            //  - meswin / audio / archive-ext detection
-            //  - per-function string sample list (cap 16, len 80)
-            for(Reference ref:inst.getReferencesFrom()) {
-                Data data=getDataAt(ref.getToAddress());
-                if(data==null || !data.hasStringValue()) continue;
-                String str = data.getDefaultValueRepresentation();
-                if(str == null) continue;
-                if(!traits.refsMeswinStrings)
-                    for(String s:MESWIN_STRINGS)
-                        if(str.contains(s)){traits.refsMeswinStrings=true;break;}
-                if(!traits.isAudioRpcHandler)
-                    for(String s:AUDIO_MODULE_STRINGS)
-                        if(str.contains(s)){traits.isAudioRpcHandler=true;break;}
-                // R7: archive-extension fingerprint
-                for(String ext:ARCHIVE_EXTS) {
-                    if(str.contains(ext)) {
-                        traits.archiveStringExts.add(ext);
-                        traits.refsArchiveStrings=true;
-                    }
-                }
-                // v12 (E1): behavioral asset-name detector. Token-split on
-                // path separators / spaces / quotes; check each token against
-                // the uppercase basename + extension regex. Captures any
-                // SHORTNAME.EXT regardless of curated ext list.
-                String[] toks = str.split("[\\s/\\\\:\";]+");
-                for(String tok : toks) {
-                    if(tok.isEmpty() || tok.length() > 24) continue;
-                    if(ASSET_NAME_REGEX.matcher(tok).matches()) {
-                        traits.discoveredAssetPaths.add(tok);
-                        traits.refsArchiveStrings = true;
-                        if(traits.discoveredAssetPaths.size() >= 16) break;
-                    }
-                }
-                // v11 (I): capture IRX module paths inline.
-                String upper = str.toUpperCase();
-                if(upper.contains(".IRX") || upper.contains(".IMG")) {
-                    if(traits.irxModulePaths.size() < 16)
-                        traits.irxModulePaths.add(str);
-                }
-                // R8: sample up to 16 strings for engineer recovery
-                if(traits.stringRefs.size() < 16) {
-                    String trimmed = str.length() > 80 ? str.substring(0, 80) : str;
-                    if(!traits.stringRefs.contains(trimmed))
-                        traits.stringRefs.add(trimmed);
                 }
             }
 
@@ -5476,7 +6491,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         // stored value may be a runtime pointer (less risky to auto-stub).
         if(traits.ctorWritesA0Slot) {
             // hasShift24Pattern doesn't help here; check if the function had any
-            // lui ops - quick proxy via instruction iterator second pass would
+            // lui ops — quick proxy via instruction iterator second pass would
             // be expensive. Use the byteSize heuristic: ctor with body>40 bytes
             // almost always assigns a vtable.
             if(traits.byteSize >= 40) traits.ctorWritesVTablePointer = true;
@@ -5509,834 +6524,369 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         if(traits.writesBitbltbufReg && traits.loadsPsm4hhConstant)
             traits.isBitbltbufT4hhUploader = true;
 
-        // v8 Rule 88: libgcc intrinsic exact-name match.
-        if(LIBGCC_EXACT_NAMES.contains(fname))
-            traits.isLibgccIntrinsic = true;
-
-        // v8 Rule 108: GCC2 C++ demangler and population.
-        demangleAndPopulate(fname, traits);
-
-        // v8 Rule 92: ctor vtable install pattern check.
-        if(traits.isCtor) detectCtorVtableInstall(func, traits);
-
-        // v8 Rule 101: RPC fid capture.
-        if(traits.callsSifRpc) {
-            detectSifRpcFids(func, traits);
-            // Rule 139: aggressive lui+ori composite SID/FID tracking across all RPC sites.
-            detectDiscoveredSidsFids(func, traits);
+        // v8 Rule 92: vtable install pattern at start of ctor.
+        // `lui $rN, hi; addiu $rN, $rN, lo; sw $rN, 0($a0)` within first ~10 instrs.
+        if(traits.isCtor) {
+            detectCtorVtableInstall(func, traits);
+            // Sibling ctor calls — any jal target that is itself a __ct__.
+            for(String cn : traits.calleeNames) {
+                if(cn != null && cn.contains("__ct__")) {
+                    // Address resolved through jalSites pairs.
+                    for(long[] s : traits.jalSites) {
+                        long tgt = s[1] & 0xFFFFFFFFL;
+                        if(tgt != 0xFFFFFFFFL) traits.ctorSiblingCtorCalls.add(tgt);
+                    }
+                }
+            }
         }
 
-        // v8 Rule 99: filepath sprintf format capture.
-        if(traits.callsFileOpen) detectFilePathSprintfFormats(func, traits);
+        // v8 Rule 101: SIF RPC fid scan. If function calls sceSifCallRpc, scan
+        // the body for an `ori $a1, $zero, imm` / `addiu $a1, $zero, imm` /
+        // `li $a1, imm` literal in the 8 instructions preceding any jal site.
+        if(traits.callsSifRpc) {
+            detectSifRpcFids(func, traits);
+        }
 
-        // v9 R1: GIF tag inline builder detection.
+        // v8 Rule 99: file-open caller sprintf-source scan. Look for `%s` in any
+        // referenced string, AND a preceding sprintf-style callee.
+        if(traits.callsFileOpen) {
+            detectFilePathSprintfFormats(func, traits);
+        }
+
+        // ===== v9 detector pipeline =====
+        // Rule 113 GIFtag inline builder + R117/R118 stored opcode capture
         detectGifTagInlineBuilder(func, traits);
-        // v9 R4: BITBLTBUF macro sequence (4-store cluster with GS AD reg ids
-        // 0x50/0x51/0x52/0x53 in second 64-bit half).
+        // Rule 114 BITBLTBUF macro sequence — sharper than raw GS reg writes
         detectBitbltbufSequence(func, traits);
-        // v11 (A): generic A+D-payload writers - PRIM/RGBAQ/TEX0/ZBUF/DISPFB.
-        // Replaces broken MMIO-offset-as-reg-id detection.
-        detectAdRegImmediateStores(func, traits);
-        // v11 (F+G): source-chain DMA tag builder. Cross-instruction const
-        // tracker reconstructs lui+ori/li/or composites then flags tag-id
-        // high nibble stores. Catches sgdma.c `size | 0x30000000` REF idiom.
+        // Rule 115 DMA CHCR start kick — Path3 starter
+        detectDmaChcrStartKick(func, traits);
+        // Rule 116 DMA source-chain tag builder
         detectDmaSourceChainTagBuilder(func, traits);
-        // v12 (B1): composite-const MMIO range pass. Fold lui+ori|addiu pairs
-        // on same dest reg into 32-bit values and match against peripheral
-        // ranges. Recovers vu_micromem/vu_datamem/intc_*/sbus/dmac_global/sio
-        // accesses that Ghidra refs miss because the computed address never
-        // shows up as a memory Reference.
+        // Rule 119 composite MMIO recovery — catches hidden lui+ori MMIO writes
         detectCompositeMmioConsts(func, traits);
-        // v12 (A1+A2): infer syscall trampoline name from `syscall N; jr ra; nop`
-        // shape. Recovers SDK function names on stripped binaries (Jak3).
-        // v15.5: widened 24 -> 32 bytes to match syscallWrapperShape (Rule 159/160).
-        if(traits.byteSize <= 32 && traits.hasSyscall)
+        // v9.1 Rule A: sharpen A+D reg writer detection via const-tracked sd/sw.
+        detectAdRegImmediateStores(func, traits);
+        // v9.1: aggressive PSM constant scan covering reg-bag-shape composites.
+        if(!traits.loadsPsm4hhConstant) detectPsmConstantsAggressive(func, traits);
+        // Rule 120 syscall trampoline — names anonymous syscall stubs
+        if(traits.hasSyscall && traits.byteSize <= 64)
             detectSyscallTrampoline(func, traits);
-        // v15.5 Rule 161: dynamic-code loader (post-scan: needs both callee
-        // names and refsArchiveStrings). Calls a cache-flush family callee
-        // AND shows file/archive input in the same body - the canonical
-        // "read code from disc, FlushCache, execute" overlay / runtime-
-        // linker idiom (Jak klink: CacheFlush(code_start, code_size) after
-        // relocating a DGO; generic PS2 overlay loaders look identical).
-        // Any hit means the ELF loads EE code at runtime, so a static
-        // recompile of this ELF alone does NOT cover the whole game.
+        // v11.2 Rule 161 (General-tuned precision): dynamic-code loader. The
+        // canonical idiom is "read code from disc, FlushCache the I-cache,
+        // then EXECUTE the loaded bytes". The General-script trigger
+        // (cache-flush + file/archive evidence) over-fired on the game: the game
+        // streams every asset from DATA.DAT / DATA.HD2 and flushes the cache
+        // after each DMA, so 34 pure ASSET loaders were flagged as code
+        // loaders (the game is a single flat ELF with no runtime code loading -
+        // confirmed across 9 GS dumps; overlay_loaders=0). The fix: require
+        // EXECUTION evidence - an overlay/exec callee (LoadExecPS2 / ExecPS2
+        // / LoadModuleBuffer ...) in the SAME body. Asset loaders never call
+        // those, so the game -> 0; real overlay games (General use) still fire.
         {
-            boolean callsCacheFlush = false;
+            boolean callsCacheFlush = false, execsOverlay = false;
             for(String cn : traits.calleeNames) {
                 if(cn.equals("FlushCache") || cn.equals("iFlushCache")
                    || cn.equals("CacheFlush")
                    || cn.startsWith("FlushCache_0x") || cn.startsWith("iFlushCache_0x")
                    || cn.startsWith("CacheFlush_0x")) {
-                    callsCacheFlush = true; break;
+                    callsCacheFlush = true;
                 }
+                if(OVERLAY_LOADER_CALLEES.contains(cn)) execsOverlay = true;
             }
-            if(callsCacheFlush &&
+            // file/archive input still required - a flush+exec with no load is
+            // an in-place patcher, not a loader.
+            if(callsCacheFlush && execsOverlay &&
                (traits.callsFileOpen || traits.refsArchiveStrings))
                 traits.isDynamicCodeLoader = true;
         }
-        // v11 (H): file-format magic. Scan const_loads (already gathered) for
-        // any 32-bit constant matching FORMAT_MAGIC_CONSTS or its 16-bit halves.
-        for(long[] cl : traits.constLoads) {
-            long v = cl[1] & 0xFFFFFFFFL;
-            String hit = FORMAT_MAGIC_CONSTS.get(v);
-            if(hit != null) traits.formatMagicHits.add(hit);
-            String s = FORMAT_MAGIC_SHORTS.get(v & 0xFFFFL);
-            if(s != null) traits.formatMagicHits.add(s);
-        }
-        // v9 R16: VU0 macro helper - instruction mix.
-        if(traits.byteSize > 0) {
-            double frac = (double)traits.vu0MacroOps / Math.max(1, traits.byteSize / 4);
-            if(frac >= 0.30 && traits.vu0MacroOps >= 6) {
-                traits.isVu0MacroHelper = true;
-                traits.mustBeImplemented = true;
-            }
-        }
-        // v9 R17: C-style struct initializer. No name gate - purely behavioral.
-        if(!traits.isCtor && traits.ctorSlotsWritten.size() >= 5 &&
-           traits.calleeCount == 0 && traits.byteSize >= 50 && traits.byteSize <= 600 &&
-           traits.returnPaths >= 1)
-            traits.isStructInitializer = true;
-        // v9 R20: infinite spin-loop refine. Single backward branch to entry
-        // region + no callees + small size + no MMIO.
-        // v13: also require ZERO stores. A true idle/poll spin writes nothing;
-        // counted copy/clear loops (memcpy/memset/strcpy shapes) store every
-        // iteration. SF3 benchmark: the old rule emitted NOP-patch candidates
-        // for the backward branch of u16-copy and word-clear loops, which
-        // would corrupt data if an engineer enabled them.
-        if(traits.calleeCount == 0 && traits.byteSize <= 60 &&
-           traits.hasBackwardBranch && !traits.accessesMMIO && !traits.hasSyscall &&
-           traits.storeOps == 0)
-            traits.isInfiniteSpinLoop = true;
-        // v11 (J): backward-branch sync wait - function with a callee whose
-        // name matches a sync/bind/stat-poll pattern AND a backward branch
-        // AND small body. Catches the `while(sceXxxSync()){}` / `while(...<0){}`
-        // idiom that hasSyscall-based Rule 25 misses.
-        if(traits.hasBackwardBranch && traits.callOps >= 1 && traits.byteSize < 400) {
-            for(String cn : traits.calleeNames) {
-                if(cn == null) continue;
-                if(cn.endsWith("Sync") || cn.endsWith("SyncS") || cn.endsWith("Stat") ||
-                   cn.endsWith("CheckStat") || cn.endsWith("CheckStatRpc") ||
-                   cn.equals("sceSifBindRpc") || cn.equals("sceSifCallRpc") ||
-                   cn.equals("sceCdDiskReady") || cn.equals("sceDmaSync")) {
-                    traits.isSyncWaitLoop = true;
-                    break;
-                }
-            }
-        }
-        // v11 (J): infinite-fail loop - function contains a `while(1){}` after
-        // an SDK call that returned an error. Detect via SDK callee + >=2
-        // backward branches + tight body (<200 bytes). Coarse signal but
-        // enough to mark candidates for human review.
-        if(traits.hasBackwardBranch && traits.branchOps >= 4 && traits.byteSize < 200) {
-            for(String cn : traits.calleeNames) {
-                if(cn == null) continue;
-                if(cn.equals("sceSifBindRpc") || cn.equals("sceSifSyncIop") ||
-                   IOP_REBOOT_CALLEES.contains(cn) || IRX_LOAD_CALLEES.contains(cn)) {
-                    traits.containsInfiniteFailLoop = true;
-                    break;
-                }
-            }
-        }
+        // Rule 121 sync-wait loop class
+        detectSyncWaitLoop(func, traits);
+        // Rule 122/123 infinite spin / fail loop
+        if(traits.byteSize <= 600)
+            detectInfiniteLoops(func, traits);
+        // Rule 124/125 IRX loader + IOP reboot handler
+        detectIrxLoaderShape(func, traits);
+        // Rule 126 render frame entry name match
+        detectRenderFrameEntry(fname, traits);
+        // Rule 127 non-ctor struct initializer
+        detectStructInitializer(func, traits);
+        // Rule 131 stamp the game hardcoded role
+        stampKnownRole(func.getEntryPoint().getOffset() & 0xFFFFFFFFL, traits);
+        // Rule 139 discovered SIDs / FIDs
+        if(traits.callsSifRpc) detectDiscoveredSidsFids(func, traits);
 
-        // v10 G2: section / memory-block name containing function entry.
-        MemoryBlock blk = memory.getBlock(func.getEntryPoint());
-        if(blk != null) traits.sectionName = blk.getName();
-        // v10 cyclomatic proxy.
-        traits.cyclomaticProxy = traits.branchOps + traits.callOps - traits.returnPaths + 1;
+        // Update BITBLTBUF_T4HH_UPLOADER after v9 BITBLTBUF macro detection.
+        if(traits.bitbltbufMacroSequence && traits.loadsPsm4hhConstant)
+            traits.isBitbltbufT4hhUploader = true;
 
-        // Rule 140: any partial-dest COP2 op flags function for dest-mask review.
+        // ===== v10 detector pipeline (the game F47-F52) =====
+        // Rule 140: any partial-dest COP2 op flags the func for dest-mask review.
         if(traits.cop2PartialDestOps > 0) traits.cop2DestMaskVerify = true;
         // Rule 141: static-initializer install manifest (vtable/global writes).
         if(fname.startsWith("__sinit_")) {
             traits.isStaticInitializer = true;
             collectStaticInitManifest(func, traits);
+            // Uncalled == no call/flow xref (runs only via the global-ctors table).
             if(traits.xrefToCount == 0) traits.isUncalledStaticInit = true;
         }
-        // Rule 142: memory allocator / pool / placement-new - never auto-stub.
+        // Rule 142: memory allocator / pool / placement-new — never auto-stub.
         detectMemoryAllocator(fname, traits);
         // Rule 143: guest-execution-lock hog (thread yield-spin starver).
         detectGuestLockHog(fname, traits);
-        // Rule 144: MIPS EABI 5th-arg-in-$t0 read in prologue.
+        // Rule 144: MIPS EABI 5th-arg-in-$t0 read in the prologue.
         detectEabiArgT0(func, traits);
-        // Rule 145: PSMCT16 CLUT uploader (only meaningful for BITBLTBUF writers).
+        // Rule 145: PSMCT16 map-CLUT uploader (only meaningful for BITBLTBUF funcs).
         if(traits.writesBitbltbufReg) detectPsmct16ClutUploader(func, traits);
-        // Rule 150: EE code-overlay loader.
+        // Rule 150: EE code-overlay loader (flat-address-space assumption risk).
         for(String cn : traits.calleeNames)
-            if(cn != null && OVERLAY_LOADER_CALLEES.contains(cn))
-                { traits.isOverlayLoader = true; break; }
+            if(OVERLAY_LOADER_CALLEES.contains(cn)) { traits.isOverlayLoader = true; break; }
+
+        // ===== v13 detector pipeline (the game G53-G82) =====
+        // Rule 178: global-guarded configuration block (init-ordering gap).
+        detectConditionalInitOnGlobal(func, traits);
+        // Rule 181: terminal jr through a vtable slot (recompiler tail-call bug).
+        detectVtableTailcallThunk(func, traits);
+
+        // ===== v15 detector pipeline (the game G83-G115) =====
+        // Sets the firewalled scan-time booleans (190/191/196/197) that forceRecompile
+        // consults; the non-firewalled rosters/tags (192/193/195/194/184+) are derived
+        // later in applyV15Rules from these traits.
+        detectV15Signals(func, fname, traits);
+        // v15.1 Rule 199: VIF unpack decompression-state command bytes (PCSX2-grounded).
+        detectVifUnpackState(func, traits);
+        // v15.2 Rules 203/204: MMI SIMD ops + CFC2/CTC2 control-reg access (skill codegen classes).
+        detectCodegenClasses(func, traits);
 
         cache.put(key,traits);
         return traits;
     }
 
-    // v9 R1: GIF tag inline builder. Sliding window over body instructions
-    // looking for >=4 stores at +0/+8/+0x10/+0x18 to same base register where
-    // one of the stored 32-bit constant words has the GIF tag REGS-field
-    // shape 0x__0E____ (REGS=0x0E = A+D mode, most common). Also captures
-    // immediate values that match PACKED(0)/REGLIST(1)/IMAGE(2) in FLG slot.
-    private void detectGifTagInlineBuilder(Function func, FuncTraits traits) {
+    // v15.2 macro control-reg indices (15-vu1-gs-debugging §2.1, confirmed vs PCSX2 VU.h).
+    private static final Map<Long,String> COP2_CONTROL_REGS = new HashMap<>();
+    static {
+        COP2_CONTROL_REGS.put(16L,"STATUS"); COP2_CONTROL_REGS.put(17L,"MAC");
+        COP2_CONTROL_REGS.put(18L,"CLIP");   COP2_CONTROL_REGS.put(20L,"R");
+        COP2_CONTROL_REGS.put(21L,"I");      COP2_CONTROL_REGS.put(22L,"Q");
+        COP2_CONTROL_REGS.put(23L,"P");      COP2_CONTROL_REGS.put(26L,"TPC");
+        COP2_CONTROL_REGS.put(27L,"CMSAR0"); COP2_CONTROL_REGS.put(28L,"FBRST");
+        COP2_CONTROL_REGS.put(29L,"VPU_STAT"); COP2_CONTROL_REGS.put(31L,"CMSAR1");
+    }
+
+    // v15.2 Rule 203/204: flag the two recompiler codegen classes the skill names but no
+    // rule covered - EE MMI (128-bit SIMD integer) ops and CFC2/CTC2 VU0 control-reg access.
+    // Both are emitted as wrong C++ for some operand shapes SILENTLY; the map flags the
+    // functions so the AI can audit the whole class (10-agent-guardrails §2 L64).
+    private void detectCodegenClasses(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
-        // base reg -> last seen offset; tracks store cluster shapes.
-        Map<String, Set<Long>> baseOffsets = new HashMap<>();
-        // last 32-bit const seen per reg.
-        Map<String, Long> regConsts = new HashMap<>();
-        while(it.hasNext()) {
-            Instruction inst = it.next();
-            String mn = inst.getMnemonicString();
-            if(mn == null) continue;
-            String mll = mn.toLowerCase();
-            // Track lui/ori composite to recover full 32-bit const per dest reg.
-            if(mll.equals("lui")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
-            } else if(mll.equals("ori") || mll.equals("addiu")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                String src = null; long imm = 0;
-                for(Object o : inst.getInputObjects()) {
-                    if(o instanceof ghidra.program.model.lang.Register) {
-                        String rn = ((ghidra.program.model.lang.Register)o).getName();
-                        if(!rn.equalsIgnoreCase(dr)) src = rn;
-                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
-                    }
-                }
-                if(dr != null && src != null && regConsts.containsKey(src))
-                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
-            } else if(mll.equals("sw") || mll.equals("sd") || mll.equals("sq")) {
-                // store: src reg in opObjects(0), {scalar offset, base reg} in opObjects(1).
-                Object[] dop = inst.getOpObjects(0);
-                Object[] aop = inst.getOpObjects(1);
-                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
-                String base = null; long off = -1;
-                if(aop != null) for(Object o : aop) {
-                    if(o instanceof ghidra.program.model.lang.Register)
-                        base = ((ghidra.program.model.lang.Register)o).getName();
-                    else if(o instanceof ghidra.program.model.scalar.Scalar)
-                        off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
-                }
-                // G1 v10: stored-immediate VIF/DMA tag detection. Check ANY
-                // store of a const-tracked register against opcode tables,
-                // regardless of offset alignment.
-                if(src != null && regConsts.containsKey(src) &&
-                   off >= 0 && (off % 4) == 0) {
-                    long sval = regConsts.get(src) & 0xFFFFFFFFL;
-                    long hb   = (sval >> 24) & 0xFFL;
-                    String vn = VIF_OPCODES.get(hb);
-                    if(vn != null) traits.storedVifOpcodes.add(vn);
-                    if(hb >= 0x60L && hb <= 0x7FL)
-                        traits.storedVifOpcodes.add("UNPACK");
-                    if(hb >= 0x10L) {
-                        long tp = hb & 0xF0L;
-                        String dn = DMA_TAG_IDS.get(tp);
-                        if(dn != null) traits.storedDmaTagIds.add(dn);
-                    }
-                }
-                if(base == null || off < 0 || off > 0x40) continue;
-                Set<Long> offsets = baseOffsets.computeIfAbsent(base, k -> new LinkedHashSet<>());
-                offsets.add(off);
-                // Inspect stored const for GIFtag fingerprint.
-                if(src != null && regConsts.containsKey(src)) {
-                    long val = regConsts.get(src);
-                    // REGS field nibble at bits 28-30 of upper 32-bit half:
-                    // pattern val high byte 0x_E or value contains 0x0E____ shape.
-                    long highByte = (val >> 24) & 0xFFL;
-                    long nloop = val & 0x7FFFL;       // lower 15 bits
-                    if((highByte & 0x0FL) == 0x0EL || (val & 0xFFFFL) == 0x000EL) {
-                        traits.gifTagRegsFields.add(0x0EL);
-                        if(nloop > 0) traits.gifTagNloops.add(nloop);
-                    }
-                    // FLG bits 58:58 of qword (PACKED=0, REGLIST=1, IMAGE=2, IMAGE2=3).
-                    // For 32-bit halves, FLG is bits 26-27 of upper-half-of-qword-0.
-                    long flg = (val >> 26) & 0x3L;
-                    if(flg == 0 && (val & 0xFFFF0000L) != 0) traits.gifTagFlags.add("PACKED");
-                    if(flg == 1) traits.gifTagFlags.add("REGLIST");
-                    if(flg == 2) traits.gifTagFlags.add("IMAGE");
-                }
-            }
-        }
-        // Verdict: >=4 16-byte-stride store offsets to same base.
-        for(Set<Long> offsets : baseOffsets.values()) {
-            boolean has0=false, has8=false, has10=false, has18=false;
-            for(Long o : offsets) {
-                if(o == 0)    has0 = true;
-                if(o == 8)    has8 = true;
-                if(o == 0x10) has10 = true;
-                if(o == 0x18) has18 = true;
-            }
-            int cnt = (has0?1:0) + (has8?1:0) + (has10?1:0) + (has18?1:0);
-            if(cnt >= 3) {
-                traits.gifTagInlineBuilder = true;
-                break;
-            }
-        }
-    }
-
-    // v9 R4: BITBLTBUF macro sequence - 4 stores to qword buffer with second
-    // 64-bit half == GS A+D reg id 0x50/0x51/0x52/0x53 in immediate const.
-    private void detectBitbltbufSequence(Function func, FuncTraits traits) {
-        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
-        boolean seenBitblt=false, seenTrxpos=false, seenTrxreg=false, seenTrxdir=false;
-        Map<String, Long> regConsts = new HashMap<>();
-        while(it.hasNext()) {
-            Instruction inst = it.next();
-            String mn = inst.getMnemonicString();
-            if(mn == null) continue;
-            String mll = mn.toLowerCase();
-            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0) regConsts.put(dr, imm);
-            } else if(mll.equals("sd") || mll.equals("sw") || mll.equals("sq")) {
-                Object[] dop = inst.getOpObjects(0);
-                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
-                if(src != null && regConsts.containsKey(src)) {
-                    long v = regConsts.get(src);
-                    if(v == 0x50) seenBitblt = true;
-                    if(v == 0x51) seenTrxpos = true;
-                    if(v == 0x52) seenTrxreg = true;
-                    if(v == 0x53) seenTrxdir = true;
-                }
-            }
-        }
-        if(seenBitblt && seenTrxpos && seenTrxreg && seenTrxdir) {
-            traits.bitbltbufMacroSequence = true;
-            traits.writesBitbltbufReg = true;
-        }
-    }
-
-    // v11 (F+G): source-chain DMA tag builder. PS2 source-chain tags occupy
-    // the upper 64 bits of a qword with shape (size | (id<<28)) - REF=0x3,
-    // CNT=0x1, CALL=0x5, RET=0x6, END=0x7, REFS=0x4, REFE=0x0, NEXT=0x2.
-    // Encoded high nibble of 32-bit word: 0x10/0x30/0x50/etc. Pattern:
-    //   sw  $r1, +0($base)        ; tag-high word (size|id<<28)
-    //   sw  $r2, +4($base)        ; addr ptr (DMA addr; KSEG1 masked)
-    //   sw  zero,+8($base)        ; pad
-    //   sw  zero,+0xC($base)      ; pad
-    // Or via sd writing both halves in one quad-aligned pair. Tracks per-reg
-    // composite const from lui/ori/addiu; flags when a const matching tag-id
-    // high nibble is stored at offset 0 of any base.
-    private void detectDmaSourceChainTagBuilder(Function func, FuncTraits traits) {
-        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
-        Map<String, Long> regConsts = new HashMap<>();
-        while(it.hasNext()) {
-            Instruction inst = it.next();
-            String mn = inst.getMnemonicString();
-            if(mn == null) continue;
-            String mll = mn.toLowerCase();
-            if(mll.equals("lui")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
-            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("daddiu")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                String src = null; long imm = 0;
-                for(Object o : inst.getInputObjects()) {
-                    if(o instanceof ghidra.program.model.lang.Register) {
-                        String rn = ((ghidra.program.model.lang.Register)o).getName();
-                        if(!rn.equalsIgnoreCase(dr)) src = rn;
-                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
-                    }
-                }
-                if(dr != null && src != null && regConsts.containsKey(src))
-                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
-            } else if(mll.equals("li")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0) regConsts.put(dr, imm);
-            } else if(mll.equals("or")) {
-                // Common idiom: or $rN, $rA, $rB where one src is the size and
-                // other carries the tag-id high nibble. Combine if both tracked.
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long combined = 0; int seenSrc = 0;
-                for(Object o : inst.getInputObjects()) {
-                    if(o instanceof ghidra.program.model.lang.Register) {
-                        String rn = ((ghidra.program.model.lang.Register)o).getName();
-                        if(dr != null && rn.equalsIgnoreCase(dr)) continue;
-                        if(regConsts.containsKey(rn)) {
-                            combined |= regConsts.get(rn); seenSrc++;
-                        }
-                    }
-                }
-                if(dr != null && seenSrc >= 1)
-                    regConsts.put(dr, combined & 0xFFFFFFFFL);
-            } else if(mll.equals("sw") || mll.equals("sd")) {
-                Object[] dop = inst.getOpObjects(0);
-                Object[] aop = inst.getOpObjects(1);
-                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
-                long off = -1;
-                if(aop != null) for(Object o : aop)
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
-                // First-word slot: offset 0 or 8 (qword pair).
-                if(src != null && regConsts.containsKey(src) && off >= 0 && off <= 0x10) {
-                    long v = regConsts.get(src) & 0xFFFFFFFFL;
-                    long highByte = (v >> 24) & 0xFFL;
-                    // Source-chain id encoded in bits 30:28 of upper word, so
-                    // high byte is 0x_X where X = id<<4. Map 0x00/10/20/30/40/50/60/70.
-                    long idNib = highByte & 0xF0L;
-                    String name = null;
-                    if(highByte == 0x70L) name = "END";
-                    else if(highByte == 0x10L) name = "CNT";
-                    else if(highByte == 0x30L) name = "REF";
-                    else if(highByte == 0x40L) name = "REFS";
-                    else if(highByte == 0x50L) name = "CALL";
-                    else if(highByte == 0x60L) name = "RET";
-                    else if(highByte == 0x20L) name = "NEXT";
-                    // REFE (0x00) too ambiguous to flag without paired size.
-                    if(name == null && idNib != 0) name = DMA_TAG_IDS.get(idNib);
-                    if(name != null) {
-                        traits.dmaSourceChainTagBuilder = true;
-                        traits.dmaSourceChainTagIds.add(name);
-                    }
-                }
-            }
-        }
-    }
-
-    // v12 (A1+A2): Detect tiny syscall trampoline `addiu $v1,$zero,N; syscall;
-    // jr $ra; nop` (or variants without the immediate-load when N is already
-    // in $v1). Recovers the canonical kernel name on stripped builds. Sets
-    // traits.inferredName + traits.inferredSyscallImm for downstream re-mapping.
-    private void detectSyscallTrampoline(Function func, FuncTraits traits) {
-        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
-        long syscallImm = -1L;
-        Map<String,Long> regConsts = new HashMap<>();
-        int count = 0;
-        while(it.hasNext() && count < 6) {
-            Instruction inst = it.next();
-            count++;
-            String mn = inst.getMnemonicString();
-            if(mn == null) continue;
-            String mll = mn.toLowerCase();
-            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") || mll.equals("daddiu")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0) regConsts.put(dr.toLowerCase(), imm);
-            } else if(mll.equals("syscall")) {
-                // v15.5 fix: the $v1 constant is the architectural dispatch
-                // number on the EE and MUST win. The old code let any scalar
-                // in the syscall instruction's input objects overwrite it -
-                // Ghidra reports a spurious constant there, which mapped
-                // EVERY trampoline to imm 0x02/"SetGsCrt" on the Jak ELFs
-                // (li v1,0x74 / 0x5a / 0x5b all reported 0x02). The encoded
-                // code field is only a fallback when $v1 is unknown.
-                Long v1 = regConsts.get("v1");
-                if(v1 != null && v1 > 0) {
-                    syscallImm = v1 & 0xFFL;
-                } else {
-                    for(Object o : inst.getInputObjects())
-                        if(o instanceof ghidra.program.model.scalar.Scalar) {
-                            long s = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                            if(s > 0 && s <= 0xFFL) syscallImm = s;
-                        }
-                }
-                break;
-            }
-        }
-        if(syscallImm > 0) {
-            String nm = EE_SYSCALL_NAMES.get(syscallImm);
-            if(nm != null) {
-                traits.inferredName = nm;
-                traits.inferredSyscallImm = syscallImm;
-            } else {
-                traits.inferredSyscallImm = syscallImm;
-            }
-        }
-    }
-
-    // v12 (B1): composite-const MMIO range pass. Walk instructions, track full
-    // 32-bit constant per dest reg across lui+ori|addiu|or sequences. Each
-    // tracked value is matched against every documented peripheral range:
-    // IPU/GIF/VIF/DMAC FIFO + VU micro+data + SBUS + INTC + RCNT + SIO +
-    // DMAC global/ext + GS priv + DMA channel CHCR. Sets the matching trait
-    // flag so existing tag/counter logic fires. Crucial for engines where the
-    // synthesised address never resolves to a Ghidra memory Reference (which
-    // was the root cause of vu_micromem/sbus/intc/dmac_global=0 across Jak1-3).
-    private void detectCompositeMmioConsts(Function func, FuncTraits traits) {
-        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
-        Map<String, Long> regConsts = new HashMap<>();
-        while(it.hasNext()) {
-            Instruction inst = it.next();
-            String mn = inst.getMnemonicString();
-            if(mn == null) continue;
-            String mll = mn.toLowerCase();
-            if(mll.equals("lui")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0)
-                    regConsts.put(dr, (imm & 0xFFFFL) << 16);
-            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("daddiu")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                String src = null; long imm = 0;
-                for(Object o : inst.getInputObjects()) {
-                    if(o instanceof ghidra.program.model.lang.Register) {
-                        String rn = ((ghidra.program.model.lang.Register)o).getName();
-                        if(!rn.equalsIgnoreCase(dr)) src = rn;
-                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
-                    }
-                }
-                if(dr != null && src != null && regConsts.containsKey(src))
-                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
-            } else if(mll.equals("li")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0) regConsts.put(dr, imm);
-            }
-            // Match every tracked composite against MMIO ranges. Cheap - set
-            // dedup ensures we only flag each range once per function.
-            for(Long vBoxed : regConsts.values()) {
-                long v = vBoxed & 0xFFFFFFFFL;
-                if(v == 0) continue;
-                matchMmioRange(v, traits);
-            }
-        }
-    }
-
-    /** Helper: classify a 32-bit address into a peripheral range and stamp
-     *  the matching FuncTraits flag (plus add a label to compositeMmioRangesHit
-     *  for the JSON emit). Idempotent. */
-    private void matchMmioRange(long addr, FuncTraits traits) {
-        long norm = addr & 0x1FFFFFFFL;
-        // VU micro/data
-        if((norm >= VU0_MICRO_START && norm <= VU0_MICRO_END) ||
-           (norm >= VU1_MICRO_START && norm <= VU1_MICRO_END)) {
-            if(traits.compositeMmioRangesHit.add("VU_MICROMEM"))
-                traits.accessesVuMicromem = true;
-        }
-        if((norm >= VU0_DATA_START && norm <= VU0_DATA_END) ||
-           (norm >= VU1_DATA_START && norm <= VU1_DATA_END)) {
-            if(traits.compositeMmioRangesHit.add("VU_DATAMEM"))
-                traits.accessesVuDatamem = true;
-        }
-        // IPU
-        if(norm >= IPU_MMIO_START && norm < IPU_MMIO_END) {
-            if(traits.compositeMmioRangesHit.add("IPU_MMIO"))
-                traits.accessesIpuMmio = true;
-            if(norm == IPU_CMD)
-                traits.writesIpuCmd = true;
-        }
-        // GIF Path3 ctrl
-        if(norm == GIF_P3CNT || norm == GIF_P3TAG) {
-            traits.compositeMmioRangesHit.add("GIF_P3_CTRL");
-            traits.touchesGifP3Reg = true;
-        }
-        if((norm >= GIF_CTRL_BASE && norm <= GIF_CTRL_END) ||
-           (norm >= GIF_CHCR_BASE && norm <= GIF_CHCR_END)) {
-            traits.compositeMmioRangesHit.add("GIF_CTRL");
-            traits.touchesGifCtrl = true;
-        }
-        // FIFOs
-        if(norm >= GIF_FIFO_START && norm <= GIF_FIFO_END) {
-            traits.compositeMmioRangesHit.add("GIF_FIFO");
-            traits.writesGifFifo = true;
-        }
-        if(norm >= VIF1_FIFO_START && norm <= VIF1_FIFO_END) {
-            traits.compositeMmioRangesHit.add("VIF1_FIFO");
-            traits.writesVif1Fifo = true;
-        }
-        if(norm >= VIF0_FIFO_START && norm <= VIF0_FIFO_END) {
-            traits.compositeMmioRangesHit.add("VIF0_FIFO");
-            traits.writesVif0Fifo = true;
-        }
-        if(norm >= IPU_FIFO_START && norm <= IPU_FIFO_END) {
-            traits.compositeMmioRangesHit.add("IPU_FIFO");
-            traits.writesIpuFifo = true;
-        }
-        // VIF1 channel
-        if(norm >= VIF1_CHANNEL_BASE && norm <= VIF1_CHANNEL_END) {
-            traits.compositeMmioRangesHit.add("VIF1_CHANNEL");
-            traits.accessesVif1MMIO = true;
-        }
-        // DMA channels (CHCR base/QWC/TADR).
-        for(int chIdx=0; chIdx<DMA_CHANNEL_BASES.length; chIdx++) {
-            long base = DMA_CHANNEL_BASES[chIdx];
-            if(norm < base || norm > base + 0x3F) continue;
-            long slot = norm - base;
-            if(slot == 0x00)
-                traits.dmaKickChannels.add(DMA_CHANNEL_NAMES[chIdx]);
-            else if(slot == 0x20 || slot == 0x30)
-                traits.dmaQwcTadrChannels.add(DMA_CHANNEL_NAMES[chIdx]);
-            if(norm >= GIF_CHCR_BASE && norm <= GIF_CHCR_END)
-                traits.path3Initiator = true;
-            traits.compositeMmioRangesHit.add("DMA_CHAN_" + DMA_CHANNEL_NAMES[chIdx]);
-            break;
-        }
-        // GS privileged registers
-        if(norm >= GS_PRIV_START && norm <= GS_PRIV_END) {
-            long off = norm - GS_PRIV_START;
-            String nm = KNOWN_GS_PRIV_REGS.get(off);
-            if(nm != null) {
-                traits.gsPrivRegHits.add(nm);
-                traits.compositeMmioRangesHit.add("GS_PRIV_" + nm);
-                if(off == 0x70L || off == 0x90L) traits.writesDispfbReg = true;
-            }
-        }
-        // SBUS
-        if(norm == SBUS_MSCOM || norm == SBUS_SMCOM) {
-            traits.compositeMmioRangesHit.add("SBUS_COM");
-            traits.touchesSbus = true;
-        }
-        if(norm == SBUS_MSFLG || norm == SBUS_SMFLG) {
-            traits.compositeMmioRangesHit.add("SBUS_FLAG");
-            traits.touchesSbusFlags = true;
-        }
-        // INTC / RCNT / SIO / DMAC global+ext / VIF ctrl
-        if(norm >= RCNT_RANGE_START && norm <= RCNT_RANGE_END) {
-            traits.compositeMmioRangesHit.add("RCNT");
-            traits.accessesRcnt = true;
-        }
-        if((norm >= VIF0_CTRL_START && norm <= VIF0_CTRL_END) ||
-           (norm >= VIF1_CTRL_START && norm <= VIF1_CTRL_END)) {
-            traits.compositeMmioRangesHit.add("VIF_CTRL");
-            traits.accessesVifCtrl = true;
-        }
-        if(norm >= DMAC_GLOBAL_START && norm <= DMAC_GLOBAL_END) {
-            traits.compositeMmioRangesHit.add("DMAC_GLOBAL");
-            traits.accessesDmacGlobal = true;
-        }
-        if(norm == INTC_MASK_ADDR) {
-            traits.compositeMmioRangesHit.add("INTC_MASK");
-            traits.writesIntcMask = true;
-        }
-        if(norm == INTC_STAT_ADDR) {
-            traits.compositeMmioRangesHit.add("INTC_STAT");
-            traits.readsIntcStat = true;
-        }
-        if(norm >= SIO_RANGE_START && norm <= SIO_RANGE_END) {
-            traits.compositeMmioRangesHit.add("SIO");
-            traits.accessesSio = true;
-        }
-        if(norm >= DMAC_EXT_START && norm <= DMAC_EXT_END) {
-            traits.compositeMmioRangesHit.add("DMAC_EXT");
-            traits.writesDmacEnable = true;
-        }
-        // Generic MMIO bucket
-        if((norm >= MMIO_START && norm <= MMIO_END) ||
-           (norm >= MMIO_GS_START && norm <= MMIO_GS_END))
-            traits.accessesMMIO = true;
-        // Scratchpad
-        if(norm >= SPR_START && norm <= SPR_END)
-            traits.usesSPR = true;
-    }
-
-    // v11 (A): generic A+D-payload reg writer scanner. PRIM/RGBAQ/TEX0/ZBUF/etc.
-    // are A+D reg IDs written by storing a value tagged with the id in the upper
-    // qword half. Pattern matches detectBitbltbufSequence but covers the full
-    // A+D reg id space. Sets writesGsPrimReg / writesRgbaqReg / writesTex0Reg /
-    // writesZbufReg / writesDispfbReg via real payload evidence (not the bogus
-    // MMIO-offset reg id match the old code used).
-    private void detectAdRegImmediateStores(Function func, FuncTraits traits) {
-        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
-        Map<String, Long> regConsts = new HashMap<>();
-        Set<Long> adRegIdsStored = new LinkedHashSet<>(); // v13: distinct GS reg-id store evidence
-        while(it.hasNext()) {
-            Instruction inst = it.next();
-            String mn = inst.getMnemonicString();
-            if(mn == null) continue;
-            String mll = mn.toLowerCase();
-            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") || mll.equals("daddiu")) {
-                Object[] dops = inst.getOpObjects(0);
-                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0) regConsts.put(dr, imm);
-            } else if(mll.equals("sd") || mll.equals("sw") || mll.equals("sq")) {
-                Object[] dop = inst.getOpObjects(0);
-                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
-                if(src != null && regConsts.containsKey(src)) {
-                    long v = regConsts.get(src);
-                    if(v <= 0x6CL) adRegIdsStored.add(v);
-                }
-            }
-        }
-        // v13: storing a register that happens to hold 0 or 1 is among the most
-        // common operations in compiled code (`flag = 1`, `ptr = NULL`), so a
-        // single hit is meaningless - SF3 benchmark tagged 464 functions
-        // (incl. sceMcInit) as RGBAQ writers. A real A+D packet builder stores
-        // several distinct GS register ids (PRIM+RGBAQ+XYZ2, BITBLTBUF+TRXPOS+
-        // TRXREG+TRXDIR). Require >=2 distinct ids, or independent GIF-tag
-        // evidence in the same function, before stamping the writer flags.
-        if(adRegIdsStored.size() >= 2 || traits.gifTagInlineBuilder ||
-           traits.buildsGifTag64 || traits.bitbltbufMacroSequence) {
-            if(adRegIdsStored.contains(0x00L)) traits.writesGsPrimReg = true;
-            if(adRegIdsStored.contains(0x01L)) traits.writesRgbaqReg = true;
-            if(adRegIdsStored.contains(0x06L) || adRegIdsStored.contains(0x07L)) traits.writesTex0Reg = true;
-            if(adRegIdsStored.contains(0x4EL) || adRegIdsStored.contains(0x4FL)) traits.writesZbufReg = true;
-            if(adRegIdsStored.contains(0x59L) || adRegIdsStored.contains(0x5BL)) traits.writesDispfbReg = true;
-            if(adRegIdsStored.contains(0x50L)) traits.writesBitbltbufReg = true;
-        }
-    }
-
-    // v7.1 Rule 84: lifecycle-verb name match. Includes the F33 culprit
-    // Initialize__11mgCDrawPrim variants plus the broader category.
-    private static boolean isLifecycleVerbName(String name) {
-        if(name == null) return false;
-        if(name.startsWith("Initialize")) return true;
-        if(name.startsWith("Begin__"))    return true;
-        if(name.startsWith("Open"))       return true;
-        if(name.startsWith("Acquire"))    return true;
-        if(name.startsWith("Setup"))      return true;
-        if(name.startsWith("Reset"))      return true;
-        return false;
-    }
-
-    // v7.1 Rule 84: scan first ~8 instructions for `lw $rN, 0($a0)` followed by
-    // a branch-on-zero / branch-not-zero of the same register. This is the F33
-    // "if (this->manager == null) install manager" guard. False positive risk
-    // is low because the verb-name match restricts the search.
-    private boolean detectLifecycleLazyInit(Function func) {
-        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
-        String loadDestReg = null;
         int scanned = 0;
-        while(it.hasNext() && scanned < 8) {
-            Instruction inst = it.next();
-            scanned++;
-            String ml = inst.getMnemonicString();
-            if(ml == null) continue;
-            ml = ml.toLowerCase();
-            if(loadDestReg == null && (ml.equals("lw") || ml.equals("ld") || ml.equals("lwu"))) {
-                // dest is opObjects(0); base+offset in opObjects(1).
-                Object[] dop = inst.getOpObjects(0);
-                Object[] aop = inst.getOpObjects(1);
-                String destName = null;
-                boolean baseIsA0 = false;
-                long off = -1;
-                if(dop != null && dop.length > 0 &&
-                   dop[0] instanceof ghidra.program.model.lang.Register)
-                    destName = ((ghidra.program.model.lang.Register)dop[0]).getName();
-                if(aop != null) {
-                    for(Object o : aop) {
-                        if(o instanceof ghidra.program.model.lang.Register &&
-                           ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("a0"))
-                            baseIsA0 = true;
-                        else if(o instanceof ghidra.program.model.scalar.Scalar)
-                            off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext() && scanned < 6000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            // track small immediates so a ctc2 sourcing a const reg can name the index
+            if(m.equals("addiu")||m.equals("li")||m.equals("ori")||m.equals("daddiu")) {
+                String dr = regOf(inst.getOpObjects(0));
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            }
+            // --- Rule 203 MMI ---
+            String fam = mmiFamily(m);
+            if(fam != null) { traits.usesMmi = true; traits.mmiOpCount++; traits.mmiFamilies.add(fam); }
+            // --- Rule 204 CFC2/CTC2 ---
+            // Only indices 16-31 are the SPECIAL control regs (STATUS/MAC/CLIP/Q/...) the F51.8
+            // control-reg-map codegen class is about. Indices 0-15 are plain VI00-VI15 integer
+            // register copies (routine, not a codegen hazard) — they over-fired the rule, so
+            // skip them. An unresolved index stays flagged (could be a special reg).
+            if(m.equals("cfc2") || m.equals("ctc2")) {
+                long idx = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        long v = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                        if(v <= 31) idx = v;
                     }
+                if(idx < 0) {  // ctc2 source may be a tracked const reg
+                    for(Object o : inst.getInputObjects())
+                        if(o instanceof ghidra.program.model.lang.Register) {
+                            Long c = regConsts.get(((ghidra.program.model.lang.Register)o).getName());
+                            if(c != null && c <= 31) idx = c;
+                        }
                 }
-                if(destName != null && baseIsA0 && off == 0) loadDestReg = destName;
-                continue;
-            }
-            if(loadDestReg != null && (ml.equals("beq") || ml.equals("bne") ||
-                                       ml.equals("beqz") || ml.equals("bnez"))) {
-                for(Object o : inst.getInputObjects()) {
-                    if(o instanceof ghidra.program.model.lang.Register &&
-                       ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase(loadDestReg))
-                        return true;
+                if(idx >= 16) {
+                    traits.usesCop2ControlReg = true;
+                    traits.cop2ControlRegs.add(COP2_CONTROL_REGS.getOrDefault(idx, "idx"+idx));
+                } else if(idx < 0) {
+                    traits.usesCop2ControlReg = true;
+                    traits.cop2ControlRegs.add("unresolved");
                 }
-            }
-        }
-        return false;
-    }
-
-    // v8 Rule 108: hand-rolled GCC2-style C++ symbol demangler.
-    //   __ct__<N><className>F<args>          -> ctor
-    //   __dt__<N><className>F<args>          -> dtor
-    //   <method>__<N><className>F<args>      -> method
-    //   __sinit_<file>.cpp                   -> static init (left as-is)
-    // Populates traits.ctorClassName / traits.methodClassName / traits.methodName.
-    private void demangleAndPopulate(String fname, FuncTraits traits) {
-        if(fname == null) return;
-        // ctor
-        if(fname.startsWith("__ct__")) {
-            traits.isCtor = true;
-            traits.ctorClassName = extractClassNameFromMangled(fname.substring(6));
-            return;
-        }
-        if(fname.startsWith("__dt__")) {
-            traits.isDtor = true;
-            traits.methodClassName = extractClassNameFromMangled(fname.substring(6));
-            return;
-        }
-        // method__<N><class>F<args>
-        int idx = fname.indexOf("__");
-        if(idx > 0 && idx + 2 < fname.length()) {
-            char c = fname.charAt(idx + 2);
-            if(Character.isDigit(c)) {
-                String method = fname.substring(0, idx);
-                String rest = fname.substring(idx + 2);
-                String cls = extractClassNameFromMangled(rest);
-                if(cls != null) {
-                    traits.methodClassName = cls;
-                    traits.methodName = method;
-                    String mlower = method.toLowerCase();
-                    if(mlower.equals("draw") || mlower.equals("step") ||
-                       mlower.equals("update") || mlower.equals("render") ||
-                       mlower.equals("paint") || mlower.startsWith("draw") ||
-                       mlower.startsWith("step"))
-                        traits.isVirtualDrawMethod = true;
-                }
+                // idx 0-15 (VI00-VI15 read) is routine — not recorded.
             }
         }
     }
 
-    // Parses "<N><name>F<args>" or "<N><name>Fv" - returns the class name
-    // (the <name> portion). Tolerates trailing template marker missing.
-    private static String extractClassNameFromMangled(String s) {
-        if(s == null || s.isEmpty()) return null;
-        int i = 0;
-        while(i < s.length() && Character.isDigit(s.charAt(i))) i++;
-        if(i == 0) return null;
-        int n;
-        try { n = Integer.parseInt(s.substring(0, i)); }
-        catch(NumberFormatException ex) { return null; }
-        if(i + n > s.length()) return null;
-        return s.substring(i, i + n);
+    // v15.2 Rule 203: classify an EE R5900 MMI mnemonic into a family (null if not MMI).
+    // The MMI opcode space is the p-prefixed 128-bit SIMD integer ops plus the pipeline-1
+    // HI1/LO1 ops. `pref` is the one p-prefixed NON-MMI op (cache prefetch) - excluded.
+    private static String mmiFamily(String m) {
+        if(m.equals("pref")) return null;
+        if(m.equals("mult1")||m.equals("multu1")||m.equals("div1")||m.equals("divu1")
+           ||m.equals("madd1")||m.equals("maddu1")||m.equals("mfhi1")||m.equals("mflo1")
+           ||m.equals("mthi1")||m.equals("mtlo1")) return "PIPE1";
+        if(!m.startsWith("p") && !m.equals("qfsrv")) return null;
+        if(m.equals("qfsrv")) return "QFSRV";
+        if(m.startsWith("pext")||m.startsWith("pexc")||m.startsWith("pexe")) return "PEXT";
+        if(m.startsWith("pcpy")) return "PCPY";
+        if(m.startsWith("ppac")||m.startsWith("ppacb")) return "PPAC";
+        if(m.startsWith("pmfhl")||m.startsWith("pmthl")) return "PMFHL";
+        if(m.startsWith("pmadd")||m.startsWith("pmsub")||m.startsWith("phmadh")||m.startsWith("phmsbh"))
+            return "PMADD";
+        if(m.startsWith("pmult")||m.startsWith("pmulth")||m.startsWith("pdiv")||m.startsWith("pdivbw"))
+            return "PMULT";
+        if(m.startsWith("padd")||m.startsWith("psub")||m.startsWith("padsbh")) return "PADD";
+        if(m.startsWith("pmax")||m.startsWith("pmin")) return "PMINMAX";
+        if(m.startsWith("psll")||m.startsWith("psrl")||m.startsWith("psra")) return "PSHIFT";
+        if(m.startsWith("pand")||m.startsWith("por")||m.startsWith("pxor")||m.startsWith("pnor"))
+            return "PLOGIC";
+        if(m.startsWith("pcgt")||m.startsWith("pceq")) return "PCMP";
+        if(m.startsWith("pmfh")||m.startsWith("pmth")||m.startsWith("pmfl")||m.startsWith("pmtl"))
+            return "PHILO";
+        if(m.startsWith("pabs")||m.startsWith("plzcw")||m.startsWith("prot3w")||m.startsWith("pinteh")
+           ||m.startsWith("prev")||m.startsWith("pmulth")) return "PMISC";
+        // any remaining p-prefixed op is still an MMI op (catch-all, excl. pref above)
+        return "PMISC";
     }
 
-    // v8 Rule 92: vtable install detector - looks for lui+addiu+sw $rN, 0($a0).
+    // v15.1 Rule 199: VIF unpack decompression-state command builder. Const-scan for
+    // VIFcode command bytes (bits 24-31) that program the UNPACK decompression: STMOD
+    // (add-row / difference), STMASK (per-component write-mask incl. SKIP), STROW/STCOL
+    // (the row/col regs), STCYCL (fill-skip), and the ITOP/BASE/OFFSET double-buffer
+    // framing. Verified against pcsx2/Vif_Codes.cpp (vifCmdHandler) + Vif_Unpack.cpp
+    // (writeXYZW mode/mask). Recorded here; gated on independent VIF evidence + tagged
+    // in applyV15Rules (the v13 detector-gate philosophy avoids false positives on a
+    // bare 0x05000000-shaped constant).
+    private void detectVifUnpackState(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        while(it.hasNext() && scanned < 4000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            long v = -1;
+            if(m.equals("lui")) {
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        v = (((ghidra.program.model.scalar.Scalar)o).getUnsignedValue() & 0xFFFFL) << 16;
+            } else if(m.equals("ori") || m.equals("addiu") || m.equals("li") || m.equals("daddiu")) {
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        v = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue() & 0xFFFFFFFFL;
+            }
+            if(v < 0x01000000L) continue;
+            long cmd = (v >> 24) & 0xFFL;
+            String nm = null;
+            if(cmd == 0x01L) nm = "STCYCL";
+            else if(cmd == 0x02L) nm = "OFFSET";
+            else if(cmd == 0x03L) nm = "BASE";
+            else if(cmd == 0x04L) nm = "ITOP";
+            else if(cmd == 0x05L) nm = "STMOD";
+            else if(cmd == 0x06L) nm = "MSKPATH3";
+            else if(cmd == 0x20L) nm = "STMASK";
+            else if(cmd == 0x30L) nm = "STROW";
+            else if(cmd == 0x31L) nm = "STCOL";
+            if(nm != null) traits.vifUnpackStateCmds.add(nm);
+        }
+    }
+
+    // v15 name rosters for the structural detectors (Rules 190/196).
+    // Builder-specific tokens (NOT the bare class name "mgCVisualMDT", which also matched
+    // getters like Iam/GetMaterialNum/GetpMaterial — FP). These name the funcs that emit the
+    // selector packet: CreateRenderInfoPacket, the MDT builder, the visual-MDT Draw.
+    private static final String[] PRIM_SELECTOR_NAMES = {
+        "CreateRenderInfoPacket", "RenderInfoPacket", "MDTBuilder", "Draw__12mgCVisualMDT" };
+    private static final String[] VIEW_PROJ_NAMES = {
+        "Perspective", "LookAt", "SetView", "ViewMatrix", "ProjMatrix",
+        "Projection", "SetCamera", "CreateRenderInfoPacket" };
+    private static final java.util.Set<String> VIEW_PROJ_CALLEES = new java.util.HashSet<>(
+        java.util.Arrays.asList("mgPerspective", "mgLookAt", "mgSetView", "mgProjection",
+            "mgSetCamera", "sceVu0CameraMatrix", "mgSetProjection", "mgFrustum"));
+
+    // v15 Rule 190/191/196/197: per-function structural signals decoded over the
+    // course of G83-G115. One light instruction pass for the per-vertex kick add
+    // (0x800), the rest derived from already-collected traits + name rosters. Only
+    // the firewalled booleans are set here (so forceRecompile honours them); the
+    // tag/roster/counter work is done in applyV15Rules.
+    private void detectV15Signals(Function func, String fname, FuncTraits traits) {
+        long addr = func.getEntryPoint().getOffset() & 0xFFFFFFFFL;
+
+        // --- the per-vertex ADC strip-restart "+2048"/0x800 kick add (Rule 191) ---
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        while(it.hasNext() && scanned < 4000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            if(m.equals("addiu")||m.equals("addi")||m.equals("daddiu")||m.equals("ori")||
+               m.equals("addu")||m.equals("daddu")||m.equals("li")) {
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar &&
+                       (((ghidra.program.model.scalar.Scalar)o).getUnsignedValue() & 0xFFFFL) == 0x800L)
+                        traits.kickConstAddCount++;
+            }
+        }
+
+        // --- Rule 190 GIFTAG_PRIM_CLASS_SELECTOR ---
+        boolean primName = false;
+        for(String f : PRIM_SELECTOR_NAMES) if(fname.contains(f)) { primName = true; break; }
+        boolean buildsSelectorPacket = traits.gifTagInlineBuilder &&
+            (!traits.vifOpcodesBuilt.isEmpty() || !traits.storedVifOpcodes.isEmpty());
+        if(addr == 0x1404d0L || primName || (buildsSelectorPacket && traits.usesCop2))
+            traits.isPrimClassSelector = true;
+
+        // --- Rule 191 ADC_KICK_VERTEX_SOURCE ---
+        // An EE-side per-vertex geometry builder that controls the ADC/strip-restart bit.
+        // PRECISION: the bare 0x800/kick-const add is far too common (framebuffer width, page
+        // size) and over-fired on framebuffer/sound-init setters (sceGsSetDefDBuff, Init__6CSound,
+        // viBufReset). A real per-vertex ADC source either writes the XYZ2/XYZ3 register itself,
+        // OR emits a quadword vertex stream in a loop while building a GIF/PRIM packet. The
+        // kick-const add is kept only as the discriminator for the constant_kick sub-class.
+        boolean realVertexReg  = traits.writesXyz2Reg || traits.writesXyz3Reg;
+        boolean vertexEmitLoop = traits.hasBackwardBranch && traits.quadwordVU > 0
+            && traits.gifTagInlineBuilder && (traits.writesGsPrimReg || traits.writesRgbaqReg);
+        if(realVertexReg || vertexEmitLoop) {
+            traits.isAdcKickVertexSource = true;
+            if(traits.writesXyz2Reg && traits.writesXyz3Reg) traits.adcSource = "input_driven_xyz3";
+            else if(traits.writesXyz2Reg)                    traits.adcSource = "uniform_xyz2";
+            else if(traits.writesXyz3Reg)                    traits.adcSource = "no_kick_xyz3";
+            else                                              traits.adcSource =
+                traits.kickConstAddCount > 0 ? "constant_kick" : "vertex_emit_loop";
+        }
+
+        // --- Rule 196 VIEW_PROJECTION_MATRIX_WRITER ---
+        boolean vpName = false;
+        for(String f : VIEW_PROJ_NAMES) if(fname.contains(f)) { vpName = true; break; }
+        boolean vpCallee = false;
+        for(String cn : traits.calleeNames)
+            if(VIEW_PROJ_CALLEES.contains(cn) || cn.contains("MulMatrix")) { vpCallee = true; break; }
+        // A camera/view-matrix builder OFTEN calls matrix helpers (mgMulMatrix) rather than
+        // doing inline COP2 — requiring usesCop2 made this dead-fire (0 hits). G98/G99's
+        // CreateRenderInfoPacket builds the combined matrix via mgMulMatrix, no inline VU0.
+        if((vpName || vpCallee) &&
+           (traits.writesToGlobal || traits.isStructInitializer || traits.gifTagInlineBuilder || traits.usesCop2))
+            traits.isViewProjectionMatrixWriter = true;
+
+        // --- Rule 197 OBJECT_ARRAY_CTOR ---
+        boolean arrayCtorName = fname.contains("construct_new_array")
+            || (traits.allocatorKind != null && traits.allocatorKind.equals("array_ctor"));
+        boolean ctorLoopShape = (fname.contains("__ct__") || traits.isCtor || traits.isCtorMultiFieldInit)
+            && traits.hasBackwardBranch && (traits.readsEabiArgT0 || traits.callOps > 0);
+        if(arrayCtorName || ctorLoopShape)
+            traits.isObjectArrayCtor = true;
+    }
+
+    // v8 Rule 92: vtable install detector — looks for lui+addiu+sw $rN, 0($a0).
     private void detectCtorVtableInstall(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
         long hi = 0; String hiReg = null;
@@ -6402,67 +6952,143 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
-    // v8 Rule 101 / v11 (D): scan for $a1 immediate set just before
-    // sceSifCallRpc (FID) OR sceSifBindRpc (SID). Reconstructs lui+ori
-    // composite 32-bit immediate so SIDs like FF1's 0x19740512 (audio RPC)
-    // and 0x12358 (file loader RPC) are captured raw - independent of
-    // KNOWN_IOP_SIDS whitelist.
+    // v13 helpers: small operand extractors mirroring the existing detectors.
+    private static String regOf(Object[] ops) {
+        if(ops != null && ops.length > 0 && ops[0] instanceof ghidra.program.model.lang.Register)
+            return ((ghidra.program.model.lang.Register)ops[0]).getName();
+        return null;
+    }
+    private static String baseRegOf(Object[] memOps) {
+        if(memOps == null) return null;
+        for(Object o : memOps)
+            if(o instanceof ghidra.program.model.lang.Register)
+                return ((ghidra.program.model.lang.Register)o).getName();
+        return null;
+    }
+    private static long scalarOf(Object[] memOps) {
+        if(memOps == null) return 0;
+        for(Object o : memOps)
+            if(o instanceof ghidra.program.model.scalar.Scalar)
+                return ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+        return 0;
+    }
+    // gp-relative offset -> label (if a known the game global) else "gp"+hex token.
+    private String gpRelLabel(long signedOff) {
+        String lbl = KNOWN_GP_OFFSETS.get(signedOff & 0xFFFFFFFFL);
+        return lbl != null ? lbl : ("gp" + (signedOff < 0 ? "-" : "+") + Long.toHexString(Math.abs(signedOff)));
+    }
+
+    // v13 Rule 178: CONDITIONAL_INIT_ON_GLOBAL. Detect the G58/G81 shape
+    // `lw $rX, <global>; beq/beqz $rX,$zero,skip; <stores that configure an object>`.
+    // A global is loaded, branched-on-zero, and a block of >=2 config stores follows.
+    private void detectConditionalInitOnGlobal(Function func, FuncTraits traits) {
+        String fn = func.getName();
+        boolean nameGate = isLifecycleVerbName(fn)
+            || fn.contains("Init") || fn.contains("init") || fn.contains("Setup")
+            || fn.contains("Begin") || fn.contains("Assign") || fn.contains("Open")
+            || fn.contains("Create") || fn.contains("Reset");
+        if(!nameGate) return;
+        // regName -> guard token (set on a global load; cleared on overwrite).
+        Map<String,String> globalLoadReg = new HashMap<>();
+        Map<String,Long> luiHi = new HashMap<>();
+        String pendingGuard = null; int storeWindow = 0, slots = 0;
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        while(it.hasNext() && scanned < 600) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            String d0 = regOf(inst.getOpObjects(0));
+            if(m.equals("lui")) {
+                if(d0 != null) { luiHi.put(d0, (scalarOf(inst.getOpObjects(1)) & 0xFFFFL) << 16); globalLoadReg.remove(d0); }
+            } else if(m.equals("lw") || m.equals("lwu") || m.equals("ld")) {
+                Object[] mem = inst.getOpObjects(1);
+                String base = baseRegOf(mem); long off = scalarOf(mem);
+                if(d0 != null && base != null) {
+                    if(base.equalsIgnoreCase("gp")) globalLoadReg.put(d0, gpRelLabel(off));
+                    else if(luiHi.containsKey(base)) globalLoadReg.put(d0, "0x" + Long.toHexString((luiHi.get(base) + off) & 0xFFFFFFFFL));
+                    else globalLoadReg.remove(d0);
+                }
+            } else if(m.startsWith("beq") || m.startsWith("bne") || m.equals("beqz") || m.equals("bnez")) {
+                String token = null;
+                for(int oi=0; oi<2; oi++) { String r = regOf(inst.getOpObjects(oi)); if(r != null && globalLoadReg.containsKey(r)) token = globalLoadReg.get(r); }
+                if(token != null) { pendingGuard = token; storeWindow = 24; slots = 0; }
+            } else if(m.startsWith("sw") || m.startsWith("sd") || m.startsWith("sh") || m.startsWith("sb")) {
+                if(pendingGuard != null && storeWindow > 0) {
+                    String base = baseRegOf(inst.getOpObjects(1));
+                    if(base != null && !base.equalsIgnoreCase("sp")) slots++;
+                }
+            }
+            if(pendingGuard != null) {
+                if(--storeWindow <= 0) {
+                    if(slots >= 2) { traits.isConditionalInitOnGlobal = true; traits.guardGlobals.add(pendingGuard); traits.conditionalInitSlots += slots; }
+                    pendingGuard = null;
+                }
+            }
+            if(d0 != null && !m.equals("lui") && !m.equals("lw") && !m.equals("lwu") && !m.equals("ld"))
+                globalLoadReg.remove(d0); // reg redefined by a non-load
+        }
+        if(pendingGuard != null && slots >= 2) {
+            traits.isConditionalInitOnGlobal = true; traits.guardGlobals.add(pendingGuard); traits.conditionalInitSlots += slots;
+        }
+    }
+
+    // v13 Rule 181: VTABLE_TAILCALL_THUNK. Terminal `jr $rX` (rX != ra/t9) where $rX
+    // was loaded from `*(objptr + K)` (a vtable slot). G59 recompiler tail-call bug.
+    private void detectVtableTailcallThunk(Function func, FuncTraits traits) {
+        Map<String,Long> slotReg = new HashMap<>();   // reg -> small vtable slot offset
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        while(it.hasNext() && scanned < 4000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            String d0 = regOf(inst.getOpObjects(0));
+            if(m.equals("lw") || m.equals("lwu") || m.equals("ld")) {
+                Object[] mem = inst.getOpObjects(1);
+                String base = baseRegOf(mem); long off = scalarOf(mem);
+                if(d0 != null && base != null && !base.equalsIgnoreCase("sp")
+                   && !base.equalsIgnoreCase("gp") && off >= 0 && off < 0x400)
+                    slotReg.put(d0, off);
+                else if(d0 != null) slotReg.remove(d0);
+            } else if(m.equals("jr")) {
+                String r = d0;
+                if(r != null && !r.equalsIgnoreCase("ra") && !r.equalsIgnoreCase("t9")
+                   && slotReg.containsKey(r)) {
+                    traits.isVtableTailcallThunk = true;
+                    traits.tailcallVtableSlots.add(slotReg.get(r));
+                }
+            } else if(d0 != null) {
+                slotReg.remove(d0); // reg redefined
+            }
+        }
+    }
+
+    // v8 Rule 101: scan for $a1 immediate set just before sceSifCallRpc.
     private void detectSifRpcFids(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
         long lastA1 = -1;
-        long luiHiA1 = -1;  // upper 16 bits assembled from `lui $a1, hi`
         while(it.hasNext()) {
             Instruction inst = it.next();
             String mn = inst.getMnemonicString();
             if(mn == null) continue;
             String mll = mn.toLowerCase();
-            if(mll.equals("lui")) {
+            if(mll.equals("addiu") || mll.equals("ori") || mll.equals("li")) {
                 Object[] dop = inst.getOpObjects(0);
                 String dr = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
                     ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
-                long imm = -1;
-                for(Object o : inst.getInputObjects())
-                    if(o instanceof ghidra.program.model.scalar.Scalar)
-                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && dr.equalsIgnoreCase("a1") && imm >= 0) {
-                    luiHiA1 = (imm & 0xFFFFL) << 16;
-                    lastA1 = luiHiA1;
-                }
-            } else if(mll.equals("addiu") || mll.equals("ori") || mll.equals("li") || mll.equals("daddiu")) {
-                Object[] dop = inst.getOpObjects(0);
-                String dr = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
-                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
-                boolean readsA1 = false;
                 long imm = -1;
                 for(Object o : inst.getInputObjects()) {
-                    if(o instanceof ghidra.program.model.lang.Register) {
-                        if(((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("a1"))
-                            readsA1 = true;
-                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
                         imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                    }
                 }
-                if(dr != null && dr.equalsIgnoreCase("a1") && imm >= 0) {
-                    if(readsA1 && luiHiA1 >= 0)
-                        lastA1 = (luiHiA1 + imm) & 0xFFFFFFFFL;
-                    else
-                        lastA1 = imm;
-                }
+                if(dr != null && dr.equalsIgnoreCase("a1") && imm >= 0) lastA1 = imm;
             } else if(mll.equals("jal") || mll.equals("jalr")) {
                 for(ghidra.program.model.address.Address tgt : inst.getFlows()) {
                     Function t = funcManager.getFunctionAt(tgt);
-                    if(t == null || lastA1 < 0) continue;
-                    String tn = t.getName();
-                    if(tn.equals("sceSifCallRpc")) {
+                    if(t != null && t.getName().equals("sceSifCallRpc") && lastA1 >= 0)
                         traits.detectedRpcFids.add(lastA1);
-                    } else if(tn.equals("sceSifBindRpc")) {
-                        // Capture raw SID regardless of whitelist.
-                        traits.detectedRpcSid = lastA1;
-                        traits.detectedRpcSids.add(lastA1);
-                    }
                 }
-                // Reset between calls so cross-call register state doesn't leak.
-                lastA1 = -1; luiHiA1 = -1;
             }
         }
     }
@@ -6489,8 +7115,242 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
-    // Rule 141: __sinit_* static-initializer manifest. Scans body for stores of
-    // pointer-shaped constants (>=0x00100000) and records what each install does.
+    // v8 Rule 108: hand-rolled GCC2-style C++ symbol demangler.
+    //   __ct__<N><className>F<args>          -> ctor
+    //   __dt__<N><className>F<args>          -> dtor
+    //   <method>__<N><className>F<args>      -> method
+    //   __sinit_<file>.cpp                   -> static init (left as-is)
+    // Populates traits.ctorClassName / traits.methodClassName / traits.methodName.
+    private void demangleAndPopulate(String fname, FuncTraits traits) {
+        if(fname == null) return;
+        // ctor
+        if(fname.startsWith("__ct__")) {
+            traits.isCtor = true;
+            traits.ctorClassName = extractClassNameFromMangled(fname.substring(6));
+            return;
+        }
+        if(fname.startsWith("__dt__")) {
+            traits.isDtor = true;
+            traits.methodClassName = extractClassNameFromMangled(fname.substring(6));
+            return;
+        }
+        // method__<N><class>F<args>
+        int idx = fname.indexOf("__");
+        if(idx > 0 && idx + 2 < fname.length()) {
+            char c = fname.charAt(idx + 2);
+            if(Character.isDigit(c)) {
+                String method = fname.substring(0, idx);
+                String rest = fname.substring(idx + 2);
+                String cls = extractClassNameFromMangled(rest);
+                if(cls != null) {
+                    traits.methodClassName = cls;
+                    traits.methodName = method;
+                    String mlower = method.toLowerCase();
+                    if(mlower.equals("draw") || mlower.equals("step") ||
+                       mlower.equals("update") || mlower.equals("render") ||
+                       mlower.equals("paint") || mlower.startsWith("draw") ||
+                       mlower.startsWith("step"))
+                        traits.isVirtualDrawMethod = true;
+                }
+            }
+        }
+    }
+
+    // Parses "<N><name>F<args>" or "<N><name>Fv" — returns the class name
+    // (the <name> portion). Tolerates trailing template marker missing.
+    private static String extractClassNameFromMangled(String s) {
+        if(s == null || s.isEmpty()) return null;
+        int i = 0;
+        while(i < s.length() && Character.isDigit(s.charAt(i))) i++;
+        if(i == 0) return null;
+        int n;
+        try { n = Integer.parseInt(s.substring(0, i)); }
+        catch(NumberFormatException ex) { return null; }
+        if(i + n > s.length()) return null;
+        return s.substring(i, i + n);
+    }
+
+    // v7.1 Rule 84: lifecycle-verb name match. Includes the F33 culprit
+    // Initialize__11mgCDrawPrim variants plus the broader category.
+    private static boolean isLifecycleVerbName(String name) {
+        if(name == null) return false;
+        if(name.startsWith("Initialize")) return true;
+        if(name.startsWith("Begin__"))    return true;
+        if(name.startsWith("Open"))       return true;
+        if(name.startsWith("Acquire"))    return true;
+        if(name.startsWith("Setup"))      return true;
+        if(name.startsWith("Reset"))      return true;
+        return false;
+    }
+
+    // v7.1 Rule 84: scan first ~8 instructions for `lw $rN, 0($a0)` followed by
+    // a branch-on-zero / branch-not-zero of the same register. This is the F33
+    // "if (this->manager == null) install manager" guard. False positive risk
+    // is low because the verb-name match restricts the search.
+    private boolean detectLifecycleLazyInit(Function func) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        String loadDestReg = null;
+        int scanned = 0;
+        while(it.hasNext() && scanned < 8) {
+            Instruction inst = it.next();
+            scanned++;
+            String ml = inst.getMnemonicString();
+            if(ml == null) continue;
+            ml = ml.toLowerCase();
+            if(loadDestReg == null && (ml.equals("lw") || ml.equals("ld") || ml.equals("lwu"))) {
+                // dest is opObjects(0); base+offset in opObjects(1).
+                Object[] dop = inst.getOpObjects(0);
+                Object[] aop = inst.getOpObjects(1);
+                String destName = null;
+                boolean baseIsA0 = false;
+                long off = -1;
+                if(dop != null && dop.length > 0 &&
+                   dop[0] instanceof ghidra.program.model.lang.Register)
+                    destName = ((ghidra.program.model.lang.Register)dop[0]).getName();
+                if(aop != null) {
+                    for(Object o : aop) {
+                        if(o instanceof ghidra.program.model.lang.Register &&
+                           ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("a0"))
+                            baseIsA0 = true;
+                        else if(o instanceof ghidra.program.model.scalar.Scalar)
+                            off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(destName != null && baseIsA0 && off == 0) loadDestReg = destName;
+                continue;
+            }
+            if(loadDestReg != null && (ml.equals("beq") || ml.equals("bne") ||
+                                       ml.equals("beqz") || ml.equals("bnez"))) {
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register &&
+                       ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase(loadDestReg))
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // =========================================================
+    // v9 DETECTORS (ported from General v11/v12)
+    // =========================================================
+
+    // v9 Rule 113: GIFtag inline builder. 4-stride store cluster (0/8/0x10/0x18)
+    // to same base + per-reg lui+ori composite tracking for embedded GIFtag
+    // REGS/FLG/NLOOP encoding. Also feeds Rule 117/118 stored-immediate captures.
+    private void detectGifTagInlineBuilder(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String, Set<Long>> baseOffsets = new HashMap<>();
+        Map<String, Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
+            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                String src = null; long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(!rn.equalsIgnoreCase(dr)) src = rn;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(dr != null && src != null && regConsts.containsKey(src))
+                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
+            } else if(mll.equals("li")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            } else if(mll.equals("sw") || mll.equals("sd") || mll.equals("sq")) {
+                Object[] dop = inst.getOpObjects(0);
+                Object[] aop = inst.getOpObjects(1);
+                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                String base = null; long off = -1;
+                if(aop != null) for(Object o : aop) {
+                    if(o instanceof ghidra.program.model.lang.Register)
+                        base = ((ghidra.program.model.lang.Register)o).getName();
+                    else if(o instanceof ghidra.program.model.scalar.Scalar)
+                        off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                }
+                // R117/R118 stored VIF/DMA tag immediates.
+                if(src != null && regConsts.containsKey(src) && off >= 0 && (off % 4) == 0) {
+                    long sval = regConsts.get(src) & 0xFFFFFFFFL;
+                    long hb = (sval >> 24) & 0xFFL;
+                    String vn = VIF_OPCODES.get(hb);
+                    if(vn != null) traits.storedVifOpcodes.add(vn);
+                    if(hb >= 0x60L && hb <= 0x7FL) traits.storedVifOpcodes.add("UNPACK");
+                    if(hb >= 0x10L) {
+                        long tp = hb & 0xF0L;
+                        String dn = DMA_TAG_IDS.get(tp);
+                        if(dn != null) traits.storedDmaTagIds.add(dn);
+                    }
+                    // Const-load capture for table-dispatch resolution.
+                    if(traits.constLoads.size() < 24)
+                        traits.constLoads.add(new long[]{ inst.getAddress().getOffset() & 0xFFFFFFFFL, sval });
+                }
+                if(base == null || off < 0 || off > 0x40) continue;
+                Set<Long> offsets = baseOffsets.computeIfAbsent(base, k -> new LinkedHashSet<>());
+                offsets.add(off);
+                if(src != null && regConsts.containsKey(src)) {
+                    long val = regConsts.get(src);
+                    long highByte = (val >> 24) & 0xFFL;
+                    long nloop = val & 0x7FFFL;
+                    if((highByte & 0x0FL) == 0x0EL || (val & 0xFFFFL) == 0x000EL) {
+                        traits.gifTagRegsFields.add(0x0EL);
+                        if(nloop > 0) traits.gifTagNloops.add(nloop);
+                    }
+                    long flg = (val >> 26) & 0x3L;
+                    if(flg == 0 && (val & 0xFFFF0000L) != 0) traits.gifTagFlags.add("PACKED");
+                    if(flg == 1) traits.gifTagFlags.add("REGLIST");
+                    if(flg == 2) traits.gifTagFlags.add("IMAGE");
+                }
+            }
+        }
+        for(Set<Long> offsets : baseOffsets.values()) {
+            boolean h0=false, h8=false, h10=false, h18=false;
+            for(Long o : offsets) {
+                if(o == 0L)    h0=true;
+                if(o == 8L)    h8=true;
+                if(o == 0x10L) h10=true;
+                if(o == 0x18L) h18=true;
+            }
+            int cnt = (h0?1:0)+(h8?1:0)+(h10?1:0)+(h18?1:0);
+            if(cnt >= 3) { traits.gifTagInlineBuilder = true; break; }
+        }
+    }
+
+    // =========================================================
+    // v10 DETECTORS (the game F47-F52 retrospective)
+    // =========================================================
+
+    // v10 Rule 141: static-initializer (__sinit_*) install manifest. Tracks
+    // lui/addiu/ori/li composite constants per register and records every store
+    // of a pointer-looking constant (a mapped .text/.data address — typically a
+    // vtable or global object pointer) to a slot. This is exactly what a
+    // __sinit_* runs, and these writes are LOST when the headless port does not
+    // drive the global-ctors table (F50.4 MainScene+0x10548=__vt__6CScene;
+    // F50.7 CRandomCircle/CGeoStone) → the global's vtable pointer stays null
+    // and the next virtual dispatch silently no-ops. The runtime side can replay
+    // this manifest (idempotent write_u32) to repair un-run static init.
     private void collectStaticInitManifest(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
         Map<String,Long> regConsts = new HashMap<>();
@@ -6544,13 +7404,13 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                         off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
                 if(src != null && regConsts.containsKey(src)) {
                     long val = regConsts.get(src) & 0xFFFFFFFFL;
-                    if(val >= 0x00100000L) {
+                    if(val >= 0x00100000L) {   // EE load base; below this is not a pointer
                         Address va = toAddr(val);
                         boolean mapped;
                         try { mapped = memory.contains(va); } catch(Exception e) { mapped = false; }
                         if(mapped) {
-                            traits.staticInitInstalls.add(String.format("0x%08X->0x%08X@+0x%X",
-                                inst.getAddress().getOffset() & 0xFFFFFFFFL, val, off & 0xFFFFFFFFL));
+                            traits.staticInitInstalls.add(new long[]{
+                                inst.getAddress().getOffset() & 0xFFFFFFFFL, val, off & 0xFFFFFFFFL });
                             ghidra.program.model.symbol.Symbol s = symtab.getPrimarySymbol(va);
                             if(s != null && s.getName().startsWith("__vt__"))
                                 traits.staticInitInstallsVtable = true;
@@ -6561,22 +7421,31 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
-    // Rule 142: memory allocator / pool / placement-new - never auto-stub.
+    // v10 Rule 142: memory allocator / pool initializer / placement-new. F50.1/
+    // F50.2: auto-stubbing one of these to `setReturnS32(0)` leaves the pool
+    // uncreated, Alloc returns 0, and constructing on the null pointer produces a
+    // garbage vtable PC deep in an init chain (looks like a bad-ctor crash, isn't
+    // one). These must never be auto-stubbed.
     private void detectMemoryAllocator(String fname, FuncTraits traits) {
         String low = fname.toLowerCase();
-        if(fname.contains("memoryInit"))          { traits.isMemoryAllocator=true; traits.allocatorKind="pool_init";     return; }
-        if(fname.contains("construct_new_array")) { traits.isMemoryAllocator=true; traits.allocatorKind="array_ctor";    return; }
+        if(fname.contains("memoryInit"))            { traits.isMemoryAllocator=true; traits.allocatorKind="pool_init";     return; }
+        if(fname.contains("construct_new_array"))   { traits.isMemoryAllocator=true; traits.allocatorKind="array_ctor";    return; }
         if(fname.startsWith("__nw__")||fname.startsWith("__nwa__"))
-                                                  { traits.isMemoryAllocator=true; traits.allocatorKind="placement_new"; return; }
+                                                    { traits.isMemoryAllocator=true; traits.allocatorKind="placement_new"; return; }
         if(fname.contains("stAlloc")||fname.contains("GetMainStack")||fname.contains("stSetBuffer"))
-                                                  { traits.isMemoryAllocator=true; traits.allocatorKind="stack";         return; }
+                                                    { traits.isMemoryAllocator=true; traits.allocatorKind="stack";          return; }
         if(fname.contains("SetHeapMem")||fname.contains("SetTableBuffer"))
-                                                  { traits.isMemoryAllocator=true; traits.allocatorKind="pool_init";     return; }
-        if(low.startsWith("alloc")||low.contains("alloc__"))
-                                                  { traits.isMemoryAllocator=true; traits.allocatorKind="alloc"; }
+                                                    { traits.isMemoryAllocator=true; traits.allocatorKind="pool_init";     return; }
+        // Generic Alloc verb. the game demangled form: `Alloc__9mgCMemoryFi`.
+        if(low.startsWith("alloc")||low.contains("alloc__")||fname.contains("__9mgCMemory"))
+                                                    { traits.isMemoryAllocator=true; traits.allocatorKind="alloc"; }
     }
 
-    // Rule 143: guest-execution-lock hog - thread yield/spin without releasing mutex.
+    // v10 Rule 143: guest-execution-lock hog. F49.5/F50: a guest thread that
+    // spins without yielding the single m_guestExecutionMutex starves every other
+    // guest thread (the GamePadStep -> SwitchGamePadThread / RotateThreadReadyQueue
+    // syscall-0x2B loop caused the menu→dungeon deadlock). Such yield/spin
+    // functions MUST release the lock (GuestExecutionReleaseScope).
     private void detectGuestLockHog(String fname, FuncTraits traits) {
         boolean spinShape = traits.isInfiniteSpinLoop || traits.isSyncWaitLoop
                          || (traits.hasBackwardBranch && traits.byteSize < 400);
@@ -6586,7 +7455,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         if(spinShape && threadName) traits.isGuestLockHogCandidate = true;
     }
 
-    // Rule 144: MIPS EABI 5th-arg ($t0) read before define in prologue.
+    // v10 Rule 144: MIPS EABI 5th-argument detection. F50.1/F50.2: the game passes the
+    // 5th integer arg in $t0 ($a4), not on the stack. A function that READS $t0
+    // before defining it in its prologue is consuming an incoming EABI arg — a
+    // signal that any runtime/CRT override must read $t0, not a stack slot.
     private void detectEabiArgT0(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
         int scanned = 0; boolean t0Defined = false;
@@ -6595,9 +7467,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             for(Object o : inst.getInputObjects()) {
                 if(o instanceof ghidra.program.model.lang.Register &&
                    ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("t0")) {
-                    if(!t0Defined) { traits.readsEabiArgT0 = true; return; }
+                    if(!t0Defined) traits.readsEabiArgT0 = true;
                 }
             }
+            if(traits.readsEabiArgT0) break;
             Object[] dop = inst.getOpObjects(0);
             String dr = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
                 ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
@@ -6605,7 +7478,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
-    // Rule 145: PSMCT16 CLUT uploader - BITBLTBUF writer that loads dpsm=0x2.
+    // v10 Rule 145: PSMCT16 map-CLUT uploader. F50.8-F50.11: the dungeon map
+    // texture subsystem (tbp=0x2580 / CLUT cbp=0x2980 PSMCT16) is separate from
+    // mgCTextureManager and its PSMCT16 CLUT (dpsm=0x2) is NEVER transferred to
+    // VRAM → empty CLUT → black. Only invoked for BITBLTBUF-writing functions
+    // (0x02 is otherwise too common to be a useful signal on its own).
     private void detectPsmct16ClutUploader(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
         while(it.hasNext()) {
@@ -6628,10 +7505,634 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         if(traits.loadsPsmct16Const) traits.isPsmct16ClutUploader = true;
     }
 
-    // Rule 139: aggressive lui+ori composite SID/FID tracking across all sceSifCallRpc/BindRpc sites.
+    // v9 Rule 114: BITBLTBUF macro sequence. Const-tracked store of 0x50/0x51/
+    // 0x52/0x53 (BITBLTBUF/TRXPOS/TRXREG/TRXDIR A+D ids) in same function.
+    private void detectBitbltbufSequence(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        boolean s50=false,s51=false,s52=false,s53=false;
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            } else if(mll.equals("sw") || mll.equals("sd") || mll.equals("sq")) {
+                Object[] dop = inst.getOpObjects(0);
+                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                if(src != null && regConsts.containsKey(src)) {
+                    long v = regConsts.get(src);
+                    if(v == 0x50L) s50 = true;
+                    if(v == 0x51L) s51 = true;
+                    if(v == 0x52L) s52 = true;
+                    if(v == 0x53L) s53 = true;
+                }
+            }
+        }
+        // v9.1: strict (all 4) OR loose (3 of 4 including 0x50 BITBLTBUF).
+        int cnt = (s50?1:0)+(s51?1:0)+(s52?1:0)+(s53?1:0);
+        if(s50 && cnt >= 3) {
+            traits.bitbltbufMacroSequence = true;
+            traits.writesBitbltbufReg = true;
+        }
+    }
+
+    // v9 Rule 115: DMA_CHCR_START_KICK. Loads const 0x101 (STR | TIE) AND
+    // touches a known DMA channel CHCR address.
+    private void detectDmaChcrStartKick(Function func, FuncTraits traits) {
+        boolean loaded101 = false;
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm == DMA_CHCR_START_CONST) {
+                    regConsts.put(dr, imm); loaded101 = true;
+                }
+            }
+        }
+        traits.loadsChcrStartConst = loaded101;
+        // v9.1: dmaKickChannels often empty because raw-MMIO scan misses
+        // composite addrs. Fall back to dmaTagIdsBuilt OR storedDmaTagIds
+        // OR touchesGifCtrl as kick-context indicator.
+        if(loaded101 && (!traits.dmaKickChannels.isEmpty()
+                       || !traits.dmaTagIdsBuilt.isEmpty()
+                       || !traits.storedDmaTagIds.isEmpty()
+                       || traits.touchesGifCtrl
+                       || traits.path3Initiator))
+            traits.dmaChcrStartKick = true;
+    }
+
+    // v9 Rule 116: DMA source-chain tag builder. Stores const with high nibble
+    // matching CNT/REF/REFS/CALL/RET/END at offset 0 of any base.
+    private void detectDmaSourceChainTagBuilder(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
+            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                String src = null; long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(!rn.equalsIgnoreCase(dr)) src = rn;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(dr != null && src != null && regConsts.containsKey(src))
+                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
+            } else if(mll.equals("li")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            } else if(mll.equals("sw") || mll.equals("sd")) {
+                Object[] dop = inst.getOpObjects(0);
+                Object[] aop = inst.getOpObjects(1);
+                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                long off = -1;
+                if(aop != null) for(Object o : aop)
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                if(src != null && regConsts.containsKey(src) && off >= 0 && off <= 0x10) {
+                    long v = regConsts.get(src) & 0xFFFFFFFFL;
+                    long highByte = (v >> 24) & 0xFFL;
+                    String name = null;
+                    if(highByte == 0x70L)      name = "END";
+                    else if(highByte == 0x10L) name = "CNT";
+                    else if(highByte == 0x30L) name = "REF";
+                    else if(highByte == 0x40L) name = "REFS";
+                    else if(highByte == 0x50L) name = "CALL";
+                    else if(highByte == 0x60L) name = "RET";
+                    else if(highByte == 0x20L) name = "NEXT";
+                    if(name != null) {
+                        traits.dmaSourceChainTagBuilder = true;
+                        traits.dmaSourceChainTagIds.add(name);
+                    }
+                }
+            }
+        }
+    }
+
+    // v9 Rule 119: composite MMIO recovery. lui+ori|addiu|or per reg tracking,
+    // matched against every documented EE peripheral range. Sets the corresponding
+    // FuncTraits flag so existing tag/counter logic fires.
+    private void detectCompositeMmioConsts(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
+            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                String src = null; long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(!rn.equalsIgnoreCase(dr)) src = rn;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar) {
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+                    }
+                }
+                if(dr != null && src != null && regConsts.containsKey(src))
+                    regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
+            } else if(mll.equals("li")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            }
+            for(Long vB : regConsts.values()) {
+                long v = vB & 0xFFFFFFFFL;
+                if(v == 0) continue;
+                matchMmioRange(v, traits);
+            }
+        }
+    }
+
+    /** Classify 32-bit composite address into a peripheral range and stamp the
+     *  matching FuncTraits flag. Idempotent via compositeMmioRangesHit. */
+    private void matchMmioRange(long addr, FuncTraits traits) {
+        long norm = addr & 0x1FFFFFFFL;
+        if((norm >= VU0_MICRO_START && norm <= VU0_MICRO_END) ||
+           (norm >= VU1_MICRO_START && norm <= VU1_MICRO_END)) {
+            if(traits.compositeMmioRangesHit.add("VU_MICROMEM"))
+                traits.accessesVuMicromem = true;
+        }
+        if((norm >= VU0_DATA_START && norm <= VU0_DATA_END) ||
+           (norm >= VU1_DATA_START && norm <= VU1_DATA_END)) {
+            if(traits.compositeMmioRangesHit.add("VU_DATAMEM"))
+                traits.accessesVuDatamem = true;
+        }
+        if(norm >= IPU_MMIO_START && norm < IPU_MMIO_END) {
+            traits.compositeMmioRangesHit.add("IPU_MMIO");
+            traits.accessesIpuMmio = true;
+            if(norm == IPU_CMD) traits.writesIpuCmd = true;
+        }
+        if(norm == GIF_P3CNT || norm == GIF_P3TAG) {
+            traits.compositeMmioRangesHit.add("GIF_P3_CTRL");
+            traits.touchesGifP3Reg = true;
+        }
+        if((norm >= GIF_CTRL_BASE && norm <= GIF_CTRL_END) ||
+           (norm >= GIF_CHCR_BASE && norm <= GIF_CHCR_END)) {
+            traits.compositeMmioRangesHit.add("GIF_CTRL");
+            traits.touchesGifCtrl = true;
+        }
+        if(norm >= GIF_FIFO_START && norm <= GIF_FIFO_END) {
+            traits.compositeMmioRangesHit.add("GIF_FIFO");
+            traits.writesGifFifo = true;
+        }
+        if(norm >= VIF1_FIFO_START && norm <= VIF1_FIFO_END) {
+            traits.compositeMmioRangesHit.add("VIF1_FIFO");
+            traits.writesVif1Fifo = true;
+        }
+        if(norm >= VIF0_FIFO_START && norm <= VIF0_FIFO_END) {
+            traits.compositeMmioRangesHit.add("VIF0_FIFO");
+            traits.writesVif0Fifo = true;
+        }
+        if(norm >= IPU_FIFO_START && norm <= IPU_FIFO_END) {
+            traits.compositeMmioRangesHit.add("IPU_FIFO");
+        }
+        if(norm >= VIF1_CHANNEL_BASE && norm <= VIF1_CHANNEL_END) {
+            traits.compositeMmioRangesHit.add("VIF1_CHANNEL");
+            traits.accessesVif1MMIO = true;
+        }
+        for(int chIdx=0; chIdx<DMA_CHANNEL_BASES.length; chIdx++) {
+            long base = DMA_CHANNEL_BASES[chIdx];
+            if(norm < base || norm > base + 0x3F) continue;
+            long slot = norm - base;
+            if(slot == 0x00)
+                traits.dmaKickChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+            else if(slot == 0x20 || slot == 0x30)
+                traits.dmaQwcTadrChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+            // v11.3 Rule 162: fromSPR(8)/toSPR(9) DMA channel built via a tracked
+            // lui/ori constant (e.g. SendDMA@0x13e3d0 stores gp-cached 0x1000D000).
+            if(chIdx==8||chIdx==9) {
+                traits.programsSprDma = true;
+                traits.sprDmaChannels.add(DMA_CHANNEL_NAMES[chIdx]);
+            }
+            if(norm >= GIF_CHCR_BASE && norm <= GIF_CHCR_END)
+                traits.path3Initiator = true;
+            traits.compositeMmioRangesHit.add("DMA_CHAN_" + DMA_CHANNEL_NAMES[chIdx]);
+            break;
+        }
+        if(norm >= GS_PRIV_START && norm <= GS_PRIV_END) {
+            long off = norm - GS_PRIV_START;
+            String nm = KNOWN_GS_PRIV_REGS.get(off);
+            if(nm != null) {
+                traits.gsPrivRegHits.add(nm);
+                traits.compositeMmioRangesHit.add("GS_PRIV_" + nm);
+                if(off == 0x70L || off == 0x90L) traits.writesDispfbReg = true;
+            }
+        }
+        if(norm == SBUS_MSCOM || norm == SBUS_SMCOM) {
+            traits.compositeMmioRangesHit.add("SBUS_COM");
+            traits.touchesSbus = true;
+        }
+        if(norm == SBUS_MSFLG || norm == SBUS_SMFLG) {
+            traits.compositeMmioRangesHit.add("SBUS_FLAG");
+            traits.touchesSbusFlags = true;
+        }
+        if(norm >= RCNT_RANGE_START && norm <= RCNT_RANGE_END) {
+            traits.compositeMmioRangesHit.add("RCNT");
+            traits.accessesRcnt = true;
+        }
+        if((norm >= VIF0_CTRL_START && norm <= VIF0_CTRL_END) ||
+           (norm >= VIF1_CTRL_START && norm <= VIF1_CTRL_END)) {
+            traits.compositeMmioRangesHit.add("VIF_CTRL");
+            traits.accessesVifCtrl = true;
+        }
+        if(norm >= DMAC_GLOBAL_START && norm <= DMAC_GLOBAL_END) {
+            traits.compositeMmioRangesHit.add("DMAC_GLOBAL");
+            traits.accessesDmacGlobal = true;
+        }
+        if(norm == INTC_MASK_ADDR) {
+            traits.compositeMmioRangesHit.add("INTC_MASK");
+            traits.writesIntcMask = true;
+        }
+        if(norm == INTC_STAT_ADDR) {
+            traits.compositeMmioRangesHit.add("INTC_STAT");
+            traits.readsIntcStat = true;
+        }
+        if(norm >= SIO_RANGE_START && norm <= SIO_RANGE_END) {
+            traits.compositeMmioRangesHit.add("SIO");
+            traits.accessesSio = true;
+        }
+        if(norm >= DMAC_EXT_START && norm <= DMAC_EXT_END) {
+            traits.compositeMmioRangesHit.add("DMAC_EXT");
+            traits.writesDmacEnable = true;
+        }
+        if((norm >= MMIO_START && norm <= MMIO_END) ||
+           (norm >= MMIO_GS_START && norm <= MMIO_GS_END))
+            traits.accessesMMIO = true;
+        if(norm >= SPR_START && norm <= SPR_END)
+            traits.usesSPR = true;
+    }
+
+    // v9 Rule 120: syscall trampoline shape (addiu $v1,$zero,N; syscall; jr ra).
+    private void detectSyscallTrampoline(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        long syscallImm = -1L;
+        Map<String,Long> regConsts = new HashMap<>();
+        int count = 0;
+        while(it.hasNext() && count < 6) {
+            Instruction inst = it.next(); count++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr.toLowerCase(), imm);
+            } else if(mll.equals("syscall")) {
+                // v11 fix (General v15.5 Bugfix V): the $v1 constant is the
+                // architectural dispatch number on the EE and MUST win. The
+                // old code let any scalar in the syscall instruction's input
+                // objects overwrite it - Ghidra reports a spurious constant
+                // there, which mapped EVERY trampoline to imm 0x02 on the Jak
+                // ELFs (li v1,0x74 / 0x5a / 0x5b all reported 0x02). The
+                // encoded code field is only a fallback when $v1 is unknown.
+                Long v1 = regConsts.get("v1");
+                if(v1 != null && v1 > 0) {
+                    syscallImm = v1 & 0xFFL;
+                } else {
+                    for(Object o : inst.getInputObjects())
+                        if(o instanceof ghidra.program.model.scalar.Scalar) {
+                            long s = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                            if(s > 0 && s <= 0xFFL) syscallImm = s;
+                        }
+                }
+                break;
+            }
+        }
+        if(syscallImm > 0) {
+            String nm = EE_SYSCALL_NAMES.get(syscallImm);
+            traits.inferredSyscallImm = syscallImm;
+            if(nm != null) traits.inferredName = nm;
+        }
+    }
+
+    // v9 Rule 122/123 (v9.1 loosened): infinite spin = small body, has backward
+    // branch, no `jr ra` return. F27 evidence: entry_0x100008 inlines MainLoop
+    // and never returns — original 1-2-BB + self-branch shape missed it.
+    // Also: backward branch into break/syscall/nop-only block (fail loop).
+    private void detectInfiniteLoops(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        long entryPc = func.getEntryPoint().getOffset();
+        int branchCount = 0;
+        boolean selfBranchSeen = false;
+        boolean failBranchSeen = false;
+        boolean backwardBranchSeen = false;
+        boolean returnSeen = false;
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            // jr ra terminator detection (function returns somewhere).
+            if(mll.equals("jr")) {
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.lang.Register &&
+                       ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("ra"))
+                        returnSeen = true;
+            }
+            if(!(mll.startsWith("b") || mll.equals("j") || mll.equals("jal"))) continue;
+            if(mll.startsWith("bal")) continue;
+            ghidra.program.model.address.Address[] flows = inst.getFlows();
+            if(flows == null || flows.length == 0) continue;
+            branchCount++;
+            for(ghidra.program.model.address.Address fa : flows) {
+                long ft = fa.getOffset();
+                if(ft == entryPc || ft == inst.getAddress().getOffset()) selfBranchSeen = true;
+                if(ft < inst.getAddress().getOffset() && (ft >= entryPc) &&
+                   func.getBody().contains(fa)) {
+                    backwardBranchSeen = true;
+                    if(traits.patchCandidatePcs.size() < 32)
+                        traits.patchCandidatePcs.add(inst.getAddress().getOffset() & 0xFFFFFFFFL);
+                    try {
+                        Instruction probe = currentProgram.getListing().getInstructionAt(fa);
+                        int look = 0;
+                        boolean onlyTrivial = true;
+                        while(probe != null && look < 4) {
+                            String pm = probe.getMnemonicString();
+                            if(pm == null) break;
+                            String pml = pm.toLowerCase();
+                            if(!(pml.equals("nop") || pml.equals("break") || pml.equals("syscall") ||
+                                 pml.startsWith("b") || pml.equals("j"))) {
+                                onlyTrivial = false; break;
+                            }
+                            probe = probe.getNext(); look++;
+                        }
+                        if(onlyTrivial) failBranchSeen = true;
+                    } catch(Exception ignore) {}
+                }
+            }
+        }
+        // v9.1: strict shape (≤2 branches + self-target) OR loose shape (backward
+        // branch + no jr ra reachable). Loose form catches F27 inlined-MainLoop class.
+        // v11 (General v13): also require ZERO stores. A true idle/poll spin
+        // writes nothing; counted copy/clear loops (memcpy/memset/strcpy
+        // shapes) store every iteration. SF3 benchmark: the old rule emitted
+        // NOP-patch candidates for the backward branch of u16-copy and
+        // word-clear loops, which would corrupt data if an engineer enabled
+        // them.
+        if(traits.storeOps == 0 &&
+           ((branchCount <= 2 && selfBranchSeen) ||
+            (backwardBranchSeen && !returnSeen && traits.byteSize > 0)))
+            traits.isInfiniteSpinLoop = true;
+        if(failBranchSeen) traits.containsInfiniteFailLoop = true;
+    }
+
+    // v9 Rule 121: backward-branch sync-wait. Small body, has backward branch,
+    // load or syscall in body — F24 / F27 / F28 host-wait blocker class.
+    private void detectSyncWaitLoop(Function func, FuncTraits traits) {
+        if(traits.byteSize > 400) return;
+        if(!traits.hasBackwardBranch) return;
+        if(!(traits.loadOps > 0 || traits.hasSyscall || traits.callsPadPollCallee
+             || traits.callsSifRpc)) return;
+        traits.isSyncWaitLoop = true;
+    }
+
+    // v9 Rule 124 / 125: IRX loader + IOP reboot handler from callee names.
+    private void detectIrxLoaderShape(Function func, FuncTraits traits) {
+        int loadCount = 0;
+        for(Function c : func.getCalledFunctions(monitor)) {
+            String cn = c.getName();
+            if(cn == null) continue;
+            if(IRX_LOAD_CALLEES.contains(cn)) loadCount++;
+            if(IOP_REBOOT_CALLEES.contains(cn)) traits.isIopRebootHandler = true;
+        }
+        traits.sifLoadModuleCallCount = loadCount;
+        if(loadCount >= 2) traits.isIrxLoader = true;
+        // Single call + IRX path string ref: tag too.
+        if(loadCount == 1 && refsAnyIrxString(func)) traits.isIrxLoader = true;
+    }
+
+    private boolean refsAnyIrxString(Function func) {
+        for(Reference ref : refManager.getReferencesFrom(func.getEntryPoint())) {
+            if(!ref.getReferenceType().isData()) continue;
+            try {
+                Data d = currentProgram.getListing().getDataAt(ref.getToAddress());
+                if(d == null) continue;
+                String s = d.getDefaultValueRepresentation();
+                if(s == null) continue;
+                String low = s.toLowerCase();
+                if(low.contains(".irx") || low.contains("rom0:")) return true;
+            } catch(Exception ignore) {}
+        }
+        return false;
+    }
+
+    // v9 Rule 126: render frame entry name fragment match.
+    private void detectRenderFrameEntry(String fname, FuncTraits traits) {
+        if(fname == null) return;
+        for(String frag : RENDER_FRAME_ENTRY_FRAGMENTS) {
+            if(fname.contains(frag)) { traits.isRenderFrameEntry = true; return; }
+        }
+    }
+
+    // v9 Rule 127: non-ctor function writing >= 4 distinct +K($a0) slots.
+    private void detectStructInitializer(Function func, FuncTraits traits) {
+        if(traits.isCtor) return;
+        if(traits.byteSize > 800) return;
+        Set<Long> slots = new HashSet<>();
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int n = 0;
+        while(it.hasNext() && n < 60) {
+            Instruction inst = it.next(); n++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(!(mll.equals("sw") || mll.equals("sd") || mll.equals("sq") || mll.equals("sh") || mll.equals("sb"))) continue;
+            Object[] aop = inst.getOpObjects(1);
+            boolean baseA0 = false; long off = -1;
+            if(aop != null) for(Object o : aop) {
+                if(o instanceof ghidra.program.model.lang.Register &&
+                   ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("a0"))
+                    baseA0 = true;
+                else if(o instanceof ghidra.program.model.scalar.Scalar)
+                    off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
+            }
+            if(baseA0 && off >= 0 && off < 0x400) slots.add(off);
+        }
+        if(slots.size() >= 4) traits.isStructInitializer = true;
+    }
+
+    // v9.1: detectAdRegImmediateStores (General Rule A port). Sharpens
+    // PRIM/RGBAQ/TEX0/ZBUF/DISPFB/BITBLTBUF writer detection via const-tracked
+    // sd/sw of an A+D reg id. Distinct from raw MMIO scan (which catches
+    // GS priv reg writes at 0x12000000+, not GIF A+D payloads).
+    private void detectAdRegImmediateStores(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        Set<Long> adRegIdsStored = new LinkedHashSet<>(); // v11: distinct GS reg-id store evidence
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            } else if(mll.equals("sd") || mll.equals("sw") || mll.equals("sq")) {
+                Object[] dop = inst.getOpObjects(0);
+                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
+                if(src != null && regConsts.containsKey(src)) {
+                    long v = regConsts.get(src);
+                    if(v <= 0x6CL) adRegIdsStored.add(v);
+                }
+            }
+        }
+        // v11 (General v13): storing a register that happens to hold 0 or 1
+        // is among the most common operations in compiled code (`flag = 1`,
+        // `ptr = NULL`), so a single hit is meaningless - SF3 benchmark
+        // tagged 464 functions (incl. sceMcInit) as RGBAQ writers. A real
+        // A+D packet builder stores several distinct GS register ids
+        // (PRIM+RGBAQ+XYZ2, BITBLTBUF+TRXPOS+TRXREG+TRXDIR). Require >=2
+        // distinct ids, or independent GIF-tag evidence in the same function,
+        // before stamping the writer flags.
+        if(adRegIdsStored.size() >= 2 || traits.gifTagInlineBuilder ||
+           traits.bitbltbufMacroSequence) {
+            if(adRegIdsStored.contains(0x00L)) traits.writesGsPrimReg = true;
+            if(adRegIdsStored.contains(0x01L)) traits.writesRgbaqReg = true;
+            if(adRegIdsStored.contains(0x06L) || adRegIdsStored.contains(0x07L)) traits.writesTex0Reg = true;
+            if(adRegIdsStored.contains(0x4EL) || adRegIdsStored.contains(0x4FL)) traits.writesZbufReg = true;
+            if(adRegIdsStored.contains(0x59L) || adRegIdsStored.contains(0x5BL)) traits.writesDispfbReg = true;
+            if(adRegIdsStored.contains(0x50L)) traits.writesBitbltbufReg = true;
+            // v12 Rule 166: FRAME A+D reg ids
+            if(adRegIdsStored.contains(0x4CL) || adRegIdsStored.contains(0x4DL)) traits.writesFrameReg = true;
+            // v15 Rule 192: XYZ2 (0x05 draw-kick) / XYZ3 (0x0D no-kick / strip-restart).
+            if(adRegIdsStored.contains(0x05L)) traits.writesXyz2Reg = true;
+            if(adRegIdsStored.contains(0x0DL)) traits.writesXyz3Reg = true;
+            // v15.1 Rule 201: TEX1_1/TEX1_2 (0x14/0x15) texture filter (G8 point-sampling).
+            if(adRegIdsStored.contains(0x14L) || adRegIdsStored.contains(0x15L)) traits.writesTex1Reg = true;
+            // v15.1 Rule 200: XYOFFSET_1/2 (0x18/0x19) guard-band centre (G88).
+            if(adRegIdsStored.contains(0x18L) || adRegIdsStored.contains(0x19L)) traits.writesXyoffsetReg = true;
+            for(Long v : adRegIdsStored) {
+                String nm = KNOWN_GS_REGS.get(v);
+                if(nm != null) traits.gsRegHits.add(nm);
+            }
+        }
+    }
+
+    // v9.1: aggressive PSMT-constant scan. Walks every const-load and matches
+    // PSMT4HH (0x2C), PSMT4HL (0x24), PSMT8H (0x1B), PSMT8 (0x13), PSMT4 (0x14).
+    // Looser than the existing Rule 73/87 path — accepts the constant in any
+    // reg, any context.
+    private void detectPsmConstantsAggressive(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            long imm = -1;
+            String dr = null;
+            if(mll.equals("addiu") || mll.equals("li") || mll.equals("ori") ||
+               mll.equals("daddiu") || mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+            }
+            for(Long cBoxed : regConsts.values()) {
+                long c = cBoxed & 0xFFFFFFFFL;
+                if(c == 0x2CL || c == 0x24L || c == 0x1BL)
+                    traits.loadsPsm4hhConstant = true;
+                if(c == 0x13L) traits.loadsPsm4hhConstant = true;
+                if(c > 0 && c <= 0x3FFFL) traits.tbpConstantsLoaded.add(c);
+                if(EXPECTED_DBP_SET.contains(c)) {
+                    for(Object[] row : EXPECTED_UPLOADS) {
+                        if(((Number)row[2]).longValue() == c)
+                            traits.assetUploadTagsHit.add((String)row[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    // v9 Rule 131 (v9.1): stamp the game hardcoded role from KNOWN_FUNCTION_ADDRESSES
+    // when address matches. Counter incremented separately in pre-scan so totals
+    // are address-uniqueness based, not per-getTraits-call.
+    private void stampKnownRole(long addr, FuncTraits traits) {
+        for(Object[] row : KNOWN_FUNCTION_ADDRESSES) {
+            if(((Number)row[0]).longValue() != addr) continue;
+            traits.knownPhase       = (String)row[2];
+            traits.knownRole        = (String)row[3];
+            traits.knownCriticality = (String)row[4];
+            return;
+        }
+    }
+
+    // v9 Rule 139: SID/FID composite recovery via $a1 lui+ori before sceSifCallRpc.
     private void detectDiscoveredSidsFids(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
         Map<String,Long> regConsts = new HashMap<>();
+        long lastA1Const = -1;
         while(it.hasNext()) {
             Instruction inst = it.next();
             String mn = inst.getMnemonicString(); if(mn == null) continue;
@@ -6662,6 +8163,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     regConsts.put(dr, (regConsts.get(src) + imm) & 0xFFFFFFFFL);
                 else if(dr != null && imm != 0)
                     regConsts.put(dr, imm & 0xFFFFFFFFL);
+                if("a1".equalsIgnoreCase(dr) && regConsts.containsKey(dr))
+                    lastA1Const = regConsts.get(dr);
+                if("a0".equalsIgnoreCase(dr) && regConsts.containsKey(dr) && lastA1Const < 0)
+                    lastA1Const = regConsts.get(dr);
             } else if(mll.equals("li")) {
                 Object[] dops = inst.getOpObjects(0);
                 String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
@@ -6671,33 +8176,805 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     if(o instanceof ghidra.program.model.scalar.Scalar)
                         imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
                 if(dr != null && imm >= 0) regConsts.put(dr, imm);
+                if("a1".equalsIgnoreCase(dr)) lastA1Const = imm;
+                if("a0".equalsIgnoreCase(dr) && lastA1Const < 0) lastA1Const = imm;
             } else if(mll.equals("jal") || mll.equals("jalr")) {
                 Object[] tops = inst.getOpObjects(0);
                 String tname = null;
-                if(tops != null && tops.length > 0 && tops[0] instanceof ghidra.program.model.address.Address) {
-                    try {
-                        Function c = funcManager.getFunctionAt((ghidra.program.model.address.Address)tops[0]);
-                        if(c != null) tname = c.getName();
-                    } catch(Exception ignore) {}
+                if(tops != null && tops.length > 0) {
+                    if(tops[0] instanceof ghidra.program.model.address.Address) {
+                        try {
+                            Function c = funcManager.getFunctionAt((ghidra.program.model.address.Address)tops[0]);
+                            if(c != null) tname = c.getName();
+                        } catch(Exception ignore) {}
+                    }
                 }
                 if(tname != null && (tname.equals("sceSifCallRpc") || tname.equals("sceSifBindRpc"))) {
                     Long a0 = regConsts.get("a0");
                     if(a0 != null) {
-                        long sid = a0 & 0xFFFFFFFFL;
-                        traits.allDetectedSids.add(sid);
+                        traits.discoveredRpcSids.add(a0 & 0xFFFFFFFFL);
                         long fa = func.getEntryPoint().getOffset() & 0xFFFFFFFFL;
-                        discoveredSidToCallers.computeIfAbsent(sid, k -> new ArrayList<>()).add(fa);
+                        discoveredSidToCallers.computeIfAbsent(a0 & 0xFFFFFFFFL, k -> new LinkedHashSet<>()).add(fa);
                     }
                     Long a1 = regConsts.get("a1");
                     if(a1 != null && tname.equals("sceSifCallRpc")) {
-                        long fid = a1 & 0xFFFFFFFFL;
-                        traits.allDetectedFids.add(fid);
+                        traits.discoveredRpcFids2.add(a1 & 0xFFFFFFFFL);
                         long fa = func.getEntryPoint().getOffset() & 0xFFFFFFFFL;
-                        discoveredFidToCallers.computeIfAbsent(fid, k -> new ArrayList<>()).add(fa);
+                        discoveredFidToCallers.computeIfAbsent(a1 & 0xFFFFFFFFL, k -> new LinkedHashSet<>()).add(fa);
+                    }
+                }
+                lastA1Const = -1;
+            }
+        }
+    }
+
+    // v9 Rule 128: scan non-.text blocks for runs of function-entry pointers.
+    private void scanFunctionPointerTables(List<FuncResult> results,
+                                            Map<Long,FuncResult> byAddr) {
+        Set<Long> entryAddrs = new HashSet<>();
+        for(FuncResult r : results) entryAddrs.add(r.address & 0xFFFFFFFFL);
+        Map<Long, Long> aliasMap = new HashMap<>();
+        for(Long e : entryAddrs) aliasMap.put(e, e);
+        for(Long e : entryAddrs)
+            for(int tag = 1; tag <= 0xF; tag++) aliasMap.putIfAbsent(e | (long)tag, e);
+        for(MemoryBlock blk : memory.getBlocks()) {
+            if(!blk.isInitialized()) continue;
+            String bn = blk.getName().toLowerCase();
+            if(bn.equals(".text") || bn.equals("text")) continue;
+            long start = blk.getStart().getOffset();
+            long end   = blk.getEnd().getOffset();
+            long size  = end - start + 1;
+            if(size < 16) continue;
+            try {
+                byte[] data = new byte[(int)Math.min(size, 1 << 22)];
+                blk.getBytes(blk.getStart(), data);
+                long runStart = -1;
+                List<long[]> runEntries = new ArrayList<>();
+                for(int i = 0; i + 4 <= data.length; i += 4) {
+                    long v = ((long)(data[i] & 0xFF))
+                           | ((long)(data[i+1] & 0xFF) << 8)
+                           | ((long)(data[i+2] & 0xFF) << 16)
+                           | ((long)(data[i+3] & 0xFF) << 24);
+                    Long resolved = aliasMap.get(v);
+                    if(resolved == null && (v & 0xFL) != 0) {
+                        Long maskTry = aliasMap.get(v & ~0xFL);
+                        if(maskTry != null) resolved = maskTry;
+                    }
+                    if(resolved != null) {
+                        if(runStart < 0) runStart = start + i;
+                        runEntries.add(new long[]{ resolved & 0xFFFFFFFFL, 0L });
+                    } else {
+                        if(runEntries.size() >= 3 && v == 0L) continue;
+                        if(runEntries.size() >= 3)
+                            functionPointerTables.put(runStart, new ArrayList<>(runEntries));
+                        runStart = -1;
+                        runEntries.clear();
+                    }
+                }
+                if(runEntries.size() >= 3)
+                    functionPointerTables.put(runStart, new ArrayList<>(runEntries));
+            } catch(Exception ignore) {}
+        }
+        // Synthesise class names for stripped binaries.
+        for(Map.Entry<Long,List<long[]>> e : functionPointerTables.entrySet()) {
+            long tableAddr = e.getKey() & 0xFFFFFFFFL;
+            String className = String.format("Class_0x%08X", tableAddr);
+            int slot = 0;
+            for(long[] row : e.getValue()) {
+                long fnAddr = row[0] & 0xFFFFFFFFL;
+                FuncResult fr = byAddr.get(fnAddr);
+                if(fr != null && fr.traits != null) {
+                    boolean stripped = fr.name == null || fr.name.startsWith("FUN_") || fr.name.startsWith("sub_");
+                    if(stripped && fr.traits.inferredClassName == null) {
+                        fr.traits.inferredClassName = className;
+                        fr.traits.inferredVtableSlot = slot;
+                    }
+                }
+                slot++;
+            }
+        }
+        // DISPATCH_TABLE_TARGET / TABLE_DISPATCH_CALL tags.
+        Set<Long> dispatchTargets = new HashSet<>();
+        for(List<long[]> entries : functionPointerTables.values())
+            for(long[] row : entries) dispatchTargets.add(row[0] & 0xFFFFFFFFL);
+        for(FuncResult r : results) {
+            if(dispatchTargets.contains(r.address & 0xFFFFFFFFL)) {
+                if(!r.tags.contains("DISPATCH_TABLE_TARGET")) {
+                    r.tags.add("DISPATCH_TABLE_TARGET");
+                    dispatchTableTargetCount++;
+                }
+            }
+            if(r.traits == null) continue;
+            if(r.traits.indirectCallT9Count == 0 && r.traits.virtualDispatchSites.isEmpty())
+                continue;
+            for(long[] cl : r.traits.constLoads) {
+                long v = cl[1] & 0xFFFFFFFFL;
+                if(functionPointerTables.containsKey(v)) {
+                    r.traits.tableDispatchSites.add(String.format("0x%08X", v));
+                    if(!r.tags.contains("TABLE_DISPATCH_CALL")) {
+                        r.tags.add("TABLE_DISPATCH_CALL");
+                        tableDispatchCallCount++;
                     }
                 }
             }
         }
+    }
+
+    // v9 Rule 129: greedy module clustering. Bidirectional jal edges.
+    private void assignModuleIds(List<FuncResult> results) {
+        Map<Long, Set<Long>> adj = new HashMap<>();
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            long a = r.address & 0xFFFFFFFFL;
+            Set<Long> nbrs = adj.computeIfAbsent(a, k -> new HashSet<>());
+            for(long[] site : r.traits.jalSites) {
+                long t = site[1] & 0xFFFFFFFFL;
+                if(t == 0xFFFFFFFFL) continue;
+                nbrs.add(t);
+                adj.computeIfAbsent(t, k -> new HashSet<>()).add(a);
+            }
+        }
+        Map<Long, Long> compId = new HashMap<>();
+        for(FuncResult r : results) {
+            long a = r.address & 0xFFFFFFFFL;
+            if(compId.containsKey(a)) continue;
+            Deque<Long> q = new ArrayDeque<>();
+            Set<Long> seen = new HashSet<>();
+            q.add(a); seen.add(a);
+            long minAddr = a;
+            while(!q.isEmpty()) {
+                long cur = q.poll();
+                if(cur < minAddr) minAddr = cur;
+                Set<Long> ns = adj.get(cur);
+                if(ns == null) continue;
+                for(long n : ns) if(seen.add(n)) q.add(n);
+            }
+            for(long n : seen) compId.put(n, minAddr);
+        }
+        Map<Long, Integer> idMap = new HashMap<>();
+        int idCounter = 0;
+        for(FuncResult r : results) {
+            long a = r.address & 0xFFFFFFFFL;
+            Long cid = compId.get(a);
+            if(cid == null) continue;
+            Integer mid = idMap.get(cid);
+            if(mid == null) { mid = idCounter++; idMap.put(cid, mid); }
+            if(r.traits != null) r.traits.moduleId = mid;
+            moduleClusters.computeIfAbsent(mid, k -> new LinkedHashSet<>()).add(a);
+        }
+    }
+
+    // =========================================================
+    // v12 Rules 165-177: RTT/Z VRAM-alias map, audio/memcard/present
+    // hazards, CLUT cache ops, perf-hot ranking. Derived from already-
+    // collected traits + BFS depths; appends tags, bumps counters, and
+    // builds the cross-function VRAM overlap pairs.
+    // =========================================================
+    private void applyV12Rules(List<FuncResult> results) {
+        // Pass 1: per-function derivations + collect VRAM page writers by kind.
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits;
+            if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // VRAM pages this func references (labelled subset only).
+            for(Long c : t.tbpConstantsLoaded) {
+                if(KNOWN_TBP_LABELS.containsKey(c)) {
+                    t.vramKnownPagesHit.add(c);
+                    gsLocalMemPagesReferenced.add(c);
+                }
+            }
+            // Writer kinds for the overlap map.
+            List<String> kinds = new ArrayList<>();
+            if(t.writesFrameReg)     { kinds.add("FRAME"); frameRegWriterCount++; }
+            if(t.writesZbufReg)        kinds.add("ZBUF");
+            if(t.writesTex0Reg)        kinds.add("TEX0");
+            if(t.writesBitbltbufReg)   kinds.add("BITBLTBUF");
+            if(t.writesDispfbReg)      kinds.add("DISPFB");
+            for(Long page : t.vramKnownPagesHit) {
+                Map<String,List<String>> byKind =
+                    vramPageWriters.computeIfAbsent(page, k -> new LinkedHashMap<>());
+                for(String kind : kinds)
+                    byKind.computeIfAbsent(kind, k -> new ArrayList<>()).add(nm);
+            }
+
+            // Rule 166 RTT_TARGET: FRAME writer that references a labelled tex/CLUT/RTT page.
+            if(t.writesFrameReg && !t.vramKnownPagesHit.isEmpty()) {
+                t.isRttTarget = true;
+                if(!r.tags.contains("RTT_TARGET")) { r.tags.add("RTT_TARGET"); rttTargetCount++; }
+            }
+            // Rule 167 ZBUF_VRAM_ALIAS_RISK: ZBUF writer referencing a labelled live VRAM page.
+            if(t.writesZbufReg && !t.vramKnownPagesHit.isEmpty()) {
+                t.zbufVramAliasRisk = true;
+                if(!r.tags.contains("ZBUF_VRAM_ALIAS_RISK")) {
+                    r.tags.add("ZBUF_VRAM_ALIAS_RISK"); zbufVramAliasCount++;
+                }
+            }
+            // Rule 169 VF0_DEPENDENT_INVERSE: matrix-inverse helper using COP2 + EFU Q latency.
+            boolean efuQ = t.cop2SpecialOps.contains("EFU_Q_LATENCY") || t.usesFpuDivSqrt;
+            if(nm.contains("Invers") && t.usesCop2 && efuQ) {
+                t.isVf0DependentInverse = true;
+                if(!r.tags.contains("VF0_DEPENDENT_INVERSE")) {
+                    r.tags.add("VF0_DEPENDENT_INVERSE"); vf0DependentInverseCount++;
+                }
+            }
+            // Rule 170 AUDIO_COMPLETION_GATE: wait loop polling an audio/stream completion signal.
+            for(String cn : t.calleeNames) {
+                String lc = cn.toLowerCase();
+                if(cn.contains("sceSifCheckStatRpc") || lc.contains("streamopenstate")
+                   || lc.contains("voice") || lc.contains("streamstat")
+                   || cn.startsWith("sceSd") || cn.startsWith("sceSpu2"))
+                    t.audioGateSignals.add(cn);
+            }
+            if(t.isAudioRpcHandler) t.audioGateSignals.add("audio_rpc_handler");
+            boolean waitShape = t.isSyncWaitLoop || t.hostWaitCandidate
+                    || (t.hasBackwardBranch && t.byteSize < 400);
+            if(!t.audioGateSignals.isEmpty() && waitShape) {
+                t.isAudioCompletionGate = true;
+                if(!r.tags.contains("AUDIO_COMPLETION_GATE")) {
+                    r.tags.add("AUDIO_COMPLETION_GATE"); audioCompletionGateCount++;
+                }
+                if(t.hostWaitCandidate && !r.tags.contains("AUDIO_GATED_STALL"))
+                    r.tags.add("AUDIO_GATED_STALL");
+            }
+            // Rule 171 MEMCARD_IO: sceMc*/libmc save-data callee.
+            for(String cn : t.calleeNames) {
+                String lc = cn.toLowerCase();
+                if(cn.startsWith("sceMc") || lc.contains("libmc")
+                   || lc.startsWith("mclib") || lc.contains("memcard")
+                   || lc.contains("mccard") || lc.contains("savedata"))
+                    t.memcardCallees.add(cn);
+            }
+            if(!t.memcardCallees.isEmpty()) {
+                t.isMemcardIo = true;
+                if(!r.tags.contains("MEMCARD_IO")) { r.tags.add("MEMCARD_IO"); memcardIoCount++; }
+            }
+            // Rule 173 PRESENTATION_FIELD_STATE: interlace/field GS privileged reg.
+            for(String pr : t.gsPrivRegHits) {
+                if(pr.equals("PMODE") || pr.equals("SMODE1") || pr.equals("SMODE2")
+                   || pr.equals("CSR") || pr.equals("SYNCV"))
+                    t.presentationRegs.add(pr);
+            }
+            if(!t.presentationRegs.isEmpty()) {
+                t.writesPresentationFieldState = true;
+                if(!r.tags.contains("PRESENTATION_FIELD_STATE")) {
+                    r.tags.add("PRESENTATION_FIELD_STATE"); presentationFieldStateCount++;
+                }
+            }
+            // Rule 174 DISPLAY_BUFFER_FLIP: DISPFB writer that drives the present boundary.
+            if(t.writesDispfbReg && (t.isFrameClockDriver || t.isRenderFrameEntry)) {
+                t.isDisplayBufferFlip = true;
+                if(!r.tags.contains("DISPLAY_BUFFER_FLIP")) {
+                    r.tags.add("DISPLAY_BUFFER_FLIP"); displayBufferFlipCount++;
+                }
+            }
+            // Rule 175 CLUT_CACHE_INVALIDATOR: TEXFLUSH or TEX0 write touching a CLUT page.
+            boolean clutPage = false;
+            for(Long page : t.vramKnownPagesHit) {
+                String lbl = KNOWN_TBP_LABELS.get(page);
+                if(lbl != null && lbl.toUpperCase().contains("CLUT")) { clutPage = true; break; }
+            }
+            if(t.gsRegHits.contains("TEXFLUSH") || (t.writesTex0Reg && clutPage)) {
+                t.isClutCacheInvalidator = true;
+                if(!r.tags.contains("CLUT_CACHE_INVALIDATOR")) {
+                    r.tags.add("CLUT_CACHE_INVALIDATOR"); clutCacheInvalidatorCount++;
+                }
+            }
+            // Rule 176 PERF_HOT_FRAME_PATH: shallow mainloop reach + inner loop + fan-out.
+            if(t.mainLoopDepth >= 0 && t.mainLoopDepth <= 3
+               && t.hasBackwardBranch && t.calleeCount >= 8) {
+                t.isPerfHotFramePath = true;
+                if(!r.tags.contains("PERF_HOT_FRAME_PATH")) {
+                    r.tags.add("PERF_HOT_FRAME_PATH"); perfHotFramePathCount++;
+                }
+            }
+        }
+
+        // Pass 2: Rule 165 VRAM_OVERLAP_MAP — pages targeted by >=2 differing kinds.
+        for(Map.Entry<Long,Map<String,List<String>>> e : vramPageWriters.entrySet()) {
+            long page = e.getKey();
+            Map<String,List<String>> byKind = e.getValue();
+            if(byKind.size() < 2) continue;
+            String label = KNOWN_TBP_LABELS.getOrDefault(page, "");
+            List<String> kindList = new ArrayList<>(byKind.keySet());
+            for(int i=0;i<kindList.size();i++) {
+                for(int j=i+1;j<kindList.size();j++) {
+                    String ka = kindList.get(i), kb = kindList.get(j);
+                    String cls;
+                    boolean aTarget = ka.equals("FRAME")||ka.equals("ZBUF")||ka.equals("DISPFB");
+                    boolean bUpload = kb.equals("TEX0")||kb.equals("BITBLTBUF");
+                    boolean bTarget = kb.equals("FRAME")||kb.equals("ZBUF")||kb.equals("DISPFB");
+                    boolean aUpload = ka.equals("TEX0")||ka.equals("BITBLTBUF");
+                    if(ka.equals("ZBUF")||kb.equals("ZBUF")) cls = "Z_ALIAS";
+                    else if((aTarget&&bUpload)||(bTarget&&aUpload)) cls = "RTT_ALIAS";
+                    else cls = "TIMESHARE";
+                    String fa = byKind.get(ka).get(0);
+                    String fb = byKind.get(kb).get(0);
+                    vramOverlapPairs.add(new String[]{
+                        hex(page), label, ka, fa, kb, fb, cls });
+                }
+            }
+        }
+        println(String.format(
+            "  v12: RTT_TARGET=%d ZBUF_ALIAS=%d VRAM_OVERLAP=%d VF0_INV=%d AUDIO_GATE=%d "
+          + "MEMCARD=%d PRESENT_FIELD=%d DBUF_FLIP=%d CLUT_CACHE=%d PERF_HOT=%d FRAME_W=%d GSMEM_PAGES=%d",
+            rttTargetCount, zbufVramAliasCount, vramOverlapPairs.size(), vf0DependentInverseCount,
+            audioCompletionGateCount, memcardIoCount, presentationFieldStateCount,
+            displayBufferFlipCount, clutCacheInvalidatorCount, perfHotFramePathCount,
+            frameRegWriterCount, gsLocalMemPagesReferenced.size()));
+    }
+
+    // =========================================================
+    // v13 Rules 178-188: the game G53-G82 title-3D retrospective.
+    // Render-mode selectors, per-vertex lighting terms, vtable
+    // tail-call thunks, RTT-no-restore leaks, VU-flag uploaders,
+    // PACKED-RGBAQ builders, frame-resume risk, and the
+    // cross-function init-order hazard graph. Derived from traits
+    // already collected (Rules 178/181 are filled in the scan).
+    // =========================================================
+    private void applyV13Rules(List<FuncResult> results) {
+        // Name fragments anchoring the G75-G82 render-mode + lighting paths.
+        final String[] CLIP_CALLEES   = { "ClipInBox", "ClipBox", "mgClip" };
+        final String[] RMODE_NAMES    = { "CreateRenderInfoPacket", "mgFlushRenderInfo",
+            "Draw__12mgCVisualMDT", "Draw__8mgCFrame", "Draw__9CMapParts", "DrawSub__4CMap", "Draw__4CMap" };
+        final String[] LIGHT_CALLEES  = { "GetLightInfo", "mgSetLight", "mgSetAmbient",
+            "mgSetFogParam", "SetFogParam", "LightColorMatrix", "SetLight", "SetAmbient" };
+        final String[] LIGHT_NAMES    = { "DrawSub__4CMap", "Draw__9CMapParts", "Draw__4CMap" };
+
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // Rule 178 (set in scan): tag + counter + feed init-order readers.
+            if(t.isConditionalInitOnGlobal) {
+                if(!r.tags.contains("CONDITIONAL_INIT_ON_GLOBAL")) {
+                    r.tags.add("CONDITIONAL_INIT_ON_GLOBAL"); conditionalInitOnGlobalCount++;
+                }
+                for(String g : t.guardGlobals)
+                    initGlobalReaders.computeIfAbsent(g, k -> new ArrayList<>()).add(nm);
+            }
+            // Rule 181 (set in scan): tag + counter + roster.
+            if(t.isVtableTailcallThunk) {
+                if(!r.tags.contains("VTABLE_TAILCALL_THUNK")) {
+                    r.tags.add("VTABLE_TAILCALL_THUNK"); vtableTailcallThunkCount++;
+                }
+                StringBuilder sl = new StringBuilder();
+                for(Long s : t.tailcallVtableSlots) { if(sl.length()>0) sl.append("|"); sl.append(hex(s)); }
+                vtableTailcallThunks.add(new String[]{ nm, hex(r.address), sl.toString() });
+            }
+            // Rule 179 RENDER_MODE_SELECTOR: calls a clip-test discriminator (and stores),
+            // or is one of the known render-mode submit functions.
+            boolean callsClip = false;
+            for(String cn : t.calleeNames) for(String f : CLIP_CALLEES) if(cn.contains(f)) callsClip = true;
+            boolean rmodeName = false; for(String f : RMODE_NAMES) if(nm.contains(f)) rmodeName = true;
+            if((callsClip && (t.writesToGlobal || t.isStructInitializer || t.gifTagInlineBuilder)) || rmodeName) {
+                t.isRenderModeSelector = true;
+                if(!r.tags.contains("RENDER_MODE_SELECTOR")) {
+                    r.tags.add("RENDER_MODE_SELECTOR"); renderModeSelectorCount++;
+                }
+                renderModeSelectors.add(new String[]{ nm, hex(r.address), callsClip ? "clip_test" : "submit" });
+            }
+            // Rule 180 VERTEX_LIGHTING_NORMAL_TERM: lighting-setup callee, or a COP2
+            // outer-product/dot feeding a vertex-colour writer, in a draw context.
+            boolean callsLight = false;
+            for(String cn : t.calleeNames) for(String f : LIGHT_CALLEES) if(cn.contains(f)) { callsLight = true; t.lightingSources.add(cn); }
+            boolean cop2Dot = t.usesCop2 && (t.cop2SpecialOps.contains("OUTER_PRODUCT") || t.writesRgbaqReg);
+            boolean lightName = false; for(String f : LIGHT_NAMES) if(nm.contains(f)) lightName = true;
+            if(callsLight || (cop2Dot && (t.writesRgbaqReg || lightName)) || (lightName && t.usesCop2)) {
+                t.isVertexLightingTerm = true;
+                if(!r.tags.contains("VERTEX_LIGHTING_NORMAL_TERM")) {
+                    r.tags.add("VERTEX_LIGHTING_NORMAL_TERM"); vertexLightingTermCount++;
+                }
+                String src = t.lightingSources.isEmpty() ? (cop2Dot ? "cop2_dot" : "draw_chain")
+                                                          : String.join("|", t.lightingSources);
+                vertexLightingTerms.add(new String[]{ nm, hex(r.address), src });
+            }
+            // Rule 182 RTT_NO_RESTORE: an RTT writer that targets an RTT/texture page but
+            // never writes a display-buffer FRAME (0x0/0x68) back in the same body.
+            if(t.isRttTarget) {
+                boolean writesDisplayPage = false;
+                for(Long p : t.vramKnownPagesHit) {
+                    String lbl = KNOWN_TBP_LABELS.get(p);
+                    if(p == 0x68L || p == 0x0L || (lbl != null && lbl.contains("DBuff"))) writesDisplayPage = true;
+                }
+                if(!writesDisplayPage) {
+                    t.isRttNoRestore = true;
+                    if(!r.tags.contains("RTT_NO_RESTORE")) {
+                        r.tags.add("RTT_NO_RESTORE"); rttNoRestoreCount++;
+                    }
+                    rttNoRestoreFuncs.add(new String[]{ nm, hex(r.address), "rtt_target_no_display_fbp" });
+                }
+            }
+            // Rule 184 VU_FLAG_PIPELINE_UPLOADER: VU microcode upload site (advisory).
+            if(t.isMicrocodeUploader || nm.contains("SendVuProg") || nm.contains("VuProg")
+               || t.vifOpcodesBuilt.contains("MPG")) {
+                t.isVuFlagPipelineUploader = true;
+                if(!r.tags.contains("VU_FLAG_PIPELINE_UPLOADER")) {
+                    r.tags.add("VU_FLAG_PIPELINE_UPLOADER"); vuFlagPipelineUploaderCount++;
+                }
+                vuFlagPipelineUploaders.add(new String[]{ nm, hex(r.address),
+                    t.isMicrocodeUploader ? "microcode_uploader" : "vuprog_name" });
+            }
+            // Rule 187 PACKED_RGBAQ_BUILDER: inline GIFtag builder that writes RGBAQ.
+            if(t.gifTagInlineBuilder && t.writesRgbaqReg) {
+                t.isPackedRgbaqBuilder = true;
+                if(!r.tags.contains("PACKED_RGBAQ_BUILDER")) {
+                    r.tags.add("PACKED_RGBAQ_BUILDER"); packedRgbaqBuilderCount++;
+                }
+                packedRgbaqBuilders.add(new String[]{ nm, hex(r.address), "verify_spread_layout" });
+            }
+            // Rule 188 FRAME_RESUME_RISK: large draw/frame func with terminal indirect flow.
+            if(t.byteSize > 1500 && (t.isRenderFrameEntry
+                    || (t.drawingChainDepth >= 0 && t.drawingChainDepth <= 6))
+                    && (t.tailCallIndirect || t.isVtableTailcallThunk)) {
+                t.isFrameResumeRisk = true;
+                if(!r.tags.contains("FRAME_RESUME_RISK")) {
+                    r.tags.add("FRAME_RESUME_RISK"); frameResumeRiskCount++;
+                }
+                frameResumeRiskFuncs.add(new String[]{ nm, hex(r.address), "large_resumable_draw" });
+            }
+
+            // Rule 186: collect init-order writers (normal vs __sinit) by global token.
+            boolean isSinit = t.isStaticInitializer || t.isUncalledStaticInit;
+            Set<String> writeTokens = new LinkedHashSet<>();
+            for(Long a : t.returnWrittenToGlobals) writeTokens.add("0x" + Long.toHexString(a & 0xFFFFFFFFL));
+            for(Long a : t.ctorGlobalAddresses)    writeTokens.add("0x" + Long.toHexString(a & 0xFFFFFFFFL));
+            for(long[] inst : t.staticInitInstalls) writeTokens.add("0x" + Long.toHexString(inst[1] & 0xFFFFFFFFL));
+            if(t.isStructInitializer || t.isCtor || isSinit)
+                for(String lbl : t.globalsTouched) writeTokens.add(lbl);
+            for(String tok : writeTokens)
+                (isSinit ? initGlobalSinitWriters : initGlobalWriters)
+                    .computeIfAbsent(tok, k -> new ArrayList<>()).add(nm);
+        }
+
+        // Rule 186 pass 2: a guard-read global whose only writer is a __sinit (or which has
+        // no normal writer at all) is an init-ordering hazard (G58/G81 headless gap).
+        for(Map.Entry<String,List<String>> e : initGlobalReaders.entrySet()) {
+            String tok = e.getKey();
+            List<String> normal = initGlobalWriters.get(tok);
+            List<String> sinit  = initGlobalSinitWriters.get(tok);
+            boolean hasNormal = normal != null && !normal.isEmpty();
+            if(sinit != null && !sinit.isEmpty()) {
+                for(String reader : e.getValue())
+                    initOrderHazards.add(new String[]{ tok, reader, sinit.get(0), "__sinit" });
+            } else if(!hasNormal) {
+                for(String reader : e.getValue())
+                    initOrderHazards.add(new String[]{ tok, reader, "(none-found)", "no_static_writer" });
+            }
+        }
+
+        println(String.format(
+            "  v13: COND_INIT=%d RENDER_MODE=%d VTX_LIGHT=%d VTABLE_TAILCALL=%d RTT_NO_RESTORE=%d "
+          + "VU_FLAG_UP=%d PACKED_RGBAQ=%d FRAME_RESUME=%d INIT_ORDER_HAZARD=%d",
+            conditionalInitOnGlobalCount, renderModeSelectorCount, vertexLightingTermCount,
+            vtableTailcallThunkCount, rttNoRestoreCount, vuFlagPipelineUploaderCount,
+            packedRgbaqBuilderCount, frameResumeRiskCount, initOrderHazards.size()));
+    }
+
+    // =========================================================
+    // v15 Rules 190-198: the game G83-G115 retrospective + general PS2
+    // ADC/PRIM-class packer, allocator-family coherence, frame-pacing,
+    // view-matrix, object-array ctor, VU-exec hazard manifest. The
+    // firewalled per-func booleans (190/191/196/197) were set in the
+    // scan (detectV15Signals); this pass adds tags/counters/rosters and
+    // derives the non-firewalled rules (192/193/195/194/184+).
+    // =========================================================
+    private void applyV15Rules(List<FuncResult> results) {
+        // Texture-manager name fragments anchoring the G90-G97 reload-interleave path.
+        final String[] TEXMGR_NAMES = { "TextureManager", "TexCache", "Reload", "BindTex",
+            "SetTexture", "mgCTexture", "LoadTexture", "TexReload" };
+        // Allocator-family member names (Rule 194). Match by exact-equals on the symbol.
+        final java.util.Set<String> ALLOC_FAMILY = new java.util.HashSet<>(java.util.Arrays.asList(
+            "malloc", "_malloc_r", "_malloc", "free", "_free_r", "_free",
+            "realloc", "_realloc_r", "_realloc", "reallocf", "calloc", "_calloc_r", "_calloc",
+            "memalign", "_memalign_r", "valloc", "_valloc_r",
+            "__nw__FUi", "__nwa__FUi", "__dl__FPv", "__dla__FPv", "__nw__", "__dl__"));
+
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // Rule 190 GIFTAG_PRIM_CLASS_SELECTOR (set in scan): tag + roster.
+            if(t.isPrimClassSelector) {
+                if(!r.tags.contains("GIFTAG_PRIM_CLASS_SELECTOR")) {
+                    r.tags.add("GIFTAG_PRIM_CLASS_SELECTOR"); primClassSelectorCount++;
+                }
+                // the game anchor carries the decoded bit formula; others carry the VU selector addr.
+                String detail = ((r.address & 0xFFFFFFFFL) == 0x1404d0L)
+                    ? "qword38: bit0=fc0||fc4,bit1=fc4,bit2=desc+0x2c,bit3=desc+0x40&1,bit4=fc8"
+                    : "vu_selector_qword";
+                primClassSelectors.add(new String[]{ nm, hex(r.address), detail });
+            }
+            // Rule 191 ADC_KICK_VERTEX_SOURCE (set in scan): tag + roster.
+            if(t.isAdcKickVertexSource) {
+                adcKickVertexSourceCount++;
+                if(!r.tags.contains("ADC_KICK_VERTEX_SOURCE")) r.tags.add("ADC_KICK_VERTEX_SOURCE");
+                adcKickSources.add(new String[]{ nm, hex(r.address),
+                    t.adcSource == null ? "constant_kick" : t.adcSource });
+            }
+            // Rule 192 XYZ2_VS_XYZ3_KICK_WRITER: a per-vertex draw-kick / no-kick writer.
+            if(t.writesXyz3Reg || (t.writesXyz2Reg && (t.gifTagInlineBuilder || t.writesXyz3Reg))) {
+                t.isKickModeWriter = true;
+                if(!r.tags.contains("XYZ2_VS_XYZ3_KICK_WRITER")) {
+                    r.tags.add("XYZ2_VS_XYZ3_KICK_WRITER"); kickModeWriterCount++;
+                }
+                String mode = (t.writesXyz2Reg && t.writesXyz3Reg) ? "xyz2+xyz3(restart_control)"
+                            : t.writesXyz3Reg ? "xyz3(no_kick)" : "xyz2(draw_kick)";
+                kickModeWriters.add(new String[]{ nm, hex(r.address), mode });
+            }
+            // Rule 193 TEXTURE_RELOAD_INTERLEAVE_HAZARD: bind-many-then-draw-many shape.
+            boolean texmgrName = false;
+            for(String f : TEXMGR_NAMES) if(nm.contains(f)) { texmgrName = true; break; }
+            boolean drawKickEvidence = t.gifTagInlineBuilder || t.path3Initiator
+                || t.path3KickViaDmaApi || t.indirectCallT9Count > 0 || !t.dmaKickChannels.isEmpty();
+            if(t.writesTex0Reg && t.hasBackwardBranch && (drawKickEvidence || texmgrName)) {
+                t.isTextureReloadInterleave = true;
+                if(!r.tags.contains("TEXTURE_RELOAD_INTERLEAVE_HAZARD")) {
+                    r.tags.add("TEXTURE_RELOAD_INTERLEAVE_HAZARD"); textureReloadInterleaveCount++;
+                }
+                textureReloadInterleave.add(new String[]{ nm, hex(r.address),
+                    texmgrName ? "texmgr_per_block_reload" : "tex0_loop_with_draws" });
+            }
+            // Rule 195 VSYNC_COUPLED_GAME_STEP: game-state advance + frame-completion wait.
+            boolean waitsFrame = t.isFrameClockDriver || t.isRenderFrameEntry;
+            if(!waitsFrame) for(String cn : t.calleeNames) {
+                if(cn.contains("sceGsSyncV") || cn.contains("WaitVSync") || cn.contains("mgEndFrame")
+                   || cn.contains("FlipDrawEnv") || cn.contains("SwapDBuff")) { waitsFrame = true; break; }
+            }
+            boolean advancesState = t.writesToGlobal && (t.calleeCount >= 4 || t.hasBackwardBranch);
+            if(waitsFrame && advancesState && t.mainLoopDepth >= 0 && t.mainLoopDepth <= 4) {
+                t.isVsyncCoupledGameStep = true;
+                if(!r.tags.contains("VSYNC_COUPLED_GAME_STEP")) {
+                    r.tags.add("VSYNC_COUPLED_GAME_STEP"); vsyncCoupledGameStepCount++;
+                }
+                framePacingDrivers.add(new String[]{ nm, hex(r.address),
+                    "depth=" + t.mainLoopDepth + " callees=" + t.calleeCount });
+            }
+            // Rule 196 VIEW_PROJECTION_MATRIX_WRITER (set in scan): tag + roster.
+            if(t.isViewProjectionMatrixWriter) {
+                if(!r.tags.contains("VIEW_PROJECTION_MATRIX_WRITER")) {
+                    r.tags.add("VIEW_PROJECTION_MATRIX_WRITER"); viewProjectionWriterCount++;
+                }
+                viewProjectionWriters.add(new String[]{ nm, hex(r.address),
+                    "shared_view_proj(not_world)" });
+            }
+            // Rule 197 OBJECT_ARRAY_CTOR (set in scan): tag + roster.
+            if(t.isObjectArrayCtor) {
+                if(!r.tags.contains("OBJECT_ARRAY_CTOR")) {
+                    r.tags.add("OBJECT_ARRAY_CTOR"); objectArrayCtorCount++;
+                }
+                objectArrayCtors.add(new String[]{ nm, hex(r.address),
+                    t.readsEabiArgT0 ? "array_ctor_count_in_t0" : "ctor_loop" });
+            }
+            // Rule 184+ VU_EXEC_HAZARD_MANIFEST: per-func interpreter-divergence checklist.
+            if(t.cop2SpecialOps.contains("EFU_Q_LATENCY")) t.vuExecHazards.add("Q_LATENCY");
+            if(t.isVuFlagPipelineUploader) {
+                t.vuExecHazards.add("MAC_STATUS_FLAGS");
+                // v15.1: an uploaded VU program the EE script cannot scan may use either
+                // EFU pipeline. PCSX2 VUops.cpp: Q (div/sqrt/rsqrt) and P (ESADD/ELENG/
+                // ESIN/EEXP/ERSQRT...) both latch late; reading before WAITQ/WAITP gives a
+                // stale value (the G87 class). Flag both for verification.
+                t.vuExecHazards.add("Q_LATENCY");
+                t.vuExecHazards.add("P_LATENCY");
+            }
+            if(t.isVf0DependentInverse)                    t.vuExecHazards.add("VF0_W_ONE");
+            if(t.cop2DestMaskVerify)                       t.vuExecHazards.add("DESTMASK_LANE_ORDER");
+            if(t.usesFpuDivSqrt || !t.cop2SpecialOps.isEmpty()) t.vuExecHazards.add("FLOAT_CLAMP");
+            // v15.2 Rule 204: CFC2/CTC2 control-reg map is the F51.8 silent-wrong class.
+            if(t.usesCop2ControlReg)                       t.vuExecHazards.add("CONTROL_REG_MAP");
+            if(!t.vuExecHazards.isEmpty())
+                vuExecHazardManifest.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.vuExecHazards) });
+
+            // Rule 199 VIF_UNPACK_DECOMPRESS_STATE (PCSX2 Vif_Unpack.cpp): gated on
+            // independent VIF evidence, the decompression-critical commands (STMOD/STMASK/
+            // STROW/STCOL) mean the runtime VIF must honour mode+mask+row+col or the
+            // unpacked vertex/colour stream is corrupt.
+            boolean vifEvidence = !t.vifOpcodesBuilt.isEmpty() || !t.storedVifOpcodes.isEmpty()
+                || t.accessesVif1MMIO || t.isMicrocodeUploader || t.isVu1DoubleBufferFramer;
+            boolean decompressCritical = t.vifUnpackStateCmds.contains("STMOD")
+                || t.vifUnpackStateCmds.contains("STMASK")
+                || t.vifUnpackStateCmds.contains("STROW")
+                || t.vifUnpackStateCmds.contains("STCOL");
+            if(vifEvidence && decompressCritical) {
+                t.isVifUnpackDecompressState = true;
+                if(!r.tags.contains("VIF_UNPACK_DECOMPRESS_STATE")) {
+                    r.tags.add("VIF_UNPACK_DECOMPRESS_STATE"); vifUnpackDecompressCount++;
+                }
+                vifUnpackDecompressState.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.vifUnpackStateCmds) });
+            }
+            // Rule 200 GS_XYOFFSET_GUARD_BAND (PCSX2 GSRegs.h XYOFFSET): guard-band centre (G88).
+            if(t.writesXyoffsetReg) {
+                t.isXyoffsetGuardWriter = true;
+                if(!r.tags.contains("GS_XYOFFSET_GUARD_BAND")) {
+                    r.tags.add("GS_XYOFFSET_GUARD_BAND"); xyoffsetGuardWriterCount++;
+                }
+                xyoffsetGuardWriters.add(new String[]{ nm, hex(r.address),
+                    t.kickConstAddCount > 0 ? "with_kick_const_add" : "guard_band_offset" });
+            }
+            // Rule 201 GS_TEX1_FILTER_WRITER (PCSX2 GSRegs.h TEX1): MMAG/MMIN filter (G8).
+            if(t.writesTex1Reg) {
+                t.isTex1FilterWriter = true;
+                if(!r.tags.contains("GS_TEX1_FILTER_WRITER")) {
+                    r.tags.add("GS_TEX1_FILTER_WRITER"); tex1FilterWriterCount++;
+                }
+                tex1FilterWriters.add(new String[]{ nm, hex(r.address), "mmag_mmin_filter_mode" });
+            }
+            // Rule 203 MMI_SIMD_OP (skill silent-wrong codegen class): roster for whole-class audit.
+            if(t.usesMmi) {
+                if(!r.tags.contains("MMI_SIMD_OP")) { r.tags.add("MMI_SIMD_OP"); mmiCodegenRiskCount++; }
+                mmiCodegenRisk.add(new String[]{ nm, hex(r.address),
+                    t.mmiOpCount + " ops: " + String.join("|", t.mmiFamilies) });
+            }
+            // Rule 204 COP2_CONTROL_REG_ACCESS (CFC2/CTC2): tag + roster (the manifest already
+            // carries CONTROL_REG_MAP from the block above).
+            if(t.usesCop2ControlReg) {
+                if(!r.tags.contains("COP2_CONTROL_REG_ACCESS")) {
+                    r.tags.add("COP2_CONTROL_REG_ACCESS"); cop2ControlRegCount++;
+                }
+                cop2ControlRegAccess.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.cop2ControlRegs) });
+            }
+
+            // Rule 194: collect allocator-family members + their dispositions.
+            if(ALLOC_FAMILY.contains(nm) || isAllocFamilyName(nm)) {
+                String disp = r.disposition == null ? "RECOMPILE" : r.disposition;
+                allocatorFamily.add(new String[]{ nm, hex(r.address), disp });
+            }
+        }
+
+        // Rule 194: a SPLIT family (some recompiled, some stubbed/skipped) = the
+        // PROJECT_STATE regen-caveat corruption hazard. Raise the flag.
+        java.util.Set<String> dispKinds = new java.util.LinkedHashSet<>();
+        for(String[] e : allocatorFamily) {
+            String d = e[2];
+            boolean nativeSide = d.equals("STUB") || d.equals("SKIP") || d.equals("OVERRIDE");
+            dispKinds.add(nativeSide ? "native" : "recompiled");
+        }
+        allocatorFamilySplit = dispKinds.size() > 1;
+
+        // Rule 205 UNFUNDED_TEXTURE_PAGE (advisory): a labelled VRAM page SAMPLED (TEX0 writer)
+        // but with NO BITBLTBUF uploader in the static set. The 15-vu1-gs-debugging §4.1
+        // decisive black-texture probe (upload-dest vs draw-ref divergence). vramPageWriters
+        // was built in applyV12Rules. Static can miss composite/computed uploads → advisory.
+        for(Map.Entry<Long,Map<String,List<String>>> e : vramPageWriters.entrySet()) {
+            Map<String,List<String>> byKind = e.getValue();
+            boolean sampled  = byKind.containsKey("TEX0");
+            boolean uploaded = byKind.containsKey("BITBLTBUF");
+            if(sampled && !uploaded) {
+                long page = e.getKey();
+                String sampler = byKind.get("TEX0").get(0);
+                unfundedTexturePages.add(new String[]{
+                    hex(page), KNOWN_TBP_LABELS.getOrDefault(page,""), sampler });
+            }
+        }
+
+        println(String.format(
+            "  v15: PRIM_SELECTOR=%d ADC_KICK=%d KICK_MODE=%d TEX_INTERLEAVE=%d VSYNC_STEP=%d "
+          + "VIEW_PROJ=%d OBJ_ARRAY_CTOR=%d ALLOC_FAMILY=%d(split=%b) VU_HAZARD=%d",
+            primClassSelectorCount, adcKickVertexSourceCount, kickModeWriterCount,
+            textureReloadInterleaveCount, vsyncCoupledGameStepCount, viewProjectionWriterCount,
+            objectArrayCtorCount, allocatorFamily.size(), allocatorFamilySplit,
+            vuExecHazardManifest.size()));
+        println(String.format(
+            "  v15.1 (PCSX2): VIF_UNPACK_DECOMPRESS=%d XYOFFSET_GUARD=%d TEX1_FILTER=%d",
+            vifUnpackDecompressCount, xyoffsetGuardWriterCount, tex1FilterWriterCount));
+        println(String.format(
+            "  v15.2 (skill): MMI_CODEGEN=%d COP2_CONTROL_REG=%d UNFUNDED_TEX_PAGE=%d",
+            mmiCodegenRiskCount, cop2ControlRegCount, unfundedTexturePages.size()));
+    }
+
+    // v15 Rule 194: fuzzy allocator-family membership for demangled/underscore variants
+    // (operator new/delete, _r reentrant forms) not in the exact-name set.
+    private static boolean isAllocFamilyName(String nm) {
+        if(nm == null) return false;
+        String n = nm;
+        if(n.equals("malloc") || n.equals("free") || n.equals("calloc") || n.equals("realloc")
+            || n.equals("memalign") || n.equals("valloc")
+            || n.matches("_(malloc|free|calloc|realloc|memalign|valloc)_r"))
+            return true;
+        // operator delete (incl. array) always frees the heap.
+        if(n.startsWith("__dl__") || n.startsWith("__dla__")) return true;
+        // operator new (incl. array): HEAP new only. PLACEMENT new — operator new(size, void*)
+        // mangled `__nw__FUiPv` / `__nw__FUiP1` — constructs in place, does NOT allocate, and is
+        // legitimately bound separately (OVERRIDE). Excluding it stops a spurious family "split".
+        if(n.startsWith("__nw__") || n.startsWith("__nwa__"))
+            return !n.matches("__nwa?__FU.*P.*");
+        return false;
+    }
+
+    // v9 Rule 130: name-prefix module index. Length 2-6, occur >= 5 times.
+    private void buildNamePrefixModules(List<FuncResult> results) {
+        Map<String, List<Long>> byPrefix = new HashMap<>();
+        for(FuncResult r : results) {
+            if(r.name == null || r.name.isEmpty()) continue;
+            String n = r.name;
+            if(n.startsWith("sub_") || n.startsWith("FUN_")) continue;
+            int maxLen = Math.min(6, n.length());
+            for(int len = 2; len <= maxLen; len++) {
+                String prefix = n.substring(0, len);
+                char last = prefix.charAt(len-1);
+                if(!Character.isLetter(last) && last != '_') continue;
+                byPrefix.computeIfAbsent(prefix, k -> new ArrayList<>()).add(r.address & 0xFFFFFFFFL);
+            }
+        }
+        List<Map.Entry<String,List<Long>>> kept = new ArrayList<>();
+        for(Map.Entry<String,List<Long>> e : byPrefix.entrySet())
+            if(e.getValue().size() >= 5) kept.add(e);
+        kept.sort((a,b) -> Integer.compare(b.getKey().length(), a.getKey().length()));
+        Set<Long> assigned = new HashSet<>();
+        for(Map.Entry<String,List<Long>> e : kept) {
+            List<Long> taken = new ArrayList<>();
+            for(Long a : e.getValue()) if(assigned.add(a)) taken.add(a);
+            if(taken.size() >= 5) {
+                Collections.sort(taken);
+                namePrefixModules.put(e.getKey(), taken);
+            }
+        }
+    }
+
+    // v9 Rule 134: tag every function that participates in a the game call chain.
+    private void tagCallChains(List<FuncResult> results) {
+        for(Object[] row : CALL_CHAINS) {
+            String chainTag = (String)row[0];
+            String[] stations = (String[])row[1];
+            for(FuncResult r : results) {
+                if(r.name == null) continue;
+                for(String s : stations) {
+                    if(r.name.contains(s)) {
+                        if(r.traits != null) r.traits.callChainsTagged.add(chainTag);
+                        if(!r.tags.contains("CHAIN_" + chainTag.toUpperCase()))
+                            r.tags.add("CHAIN_" + chainTag.toUpperCase());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // v9 Rule 137: prioritise function tags for TOML comment generation.
+    private String prioritizeTagsForComment(List<String> tags, int max) {
+        if(tags == null || tags.isEmpty()) return "";
+        List<String> sorted = new ArrayList<>(tags);
+        sorted.sort((a,b) -> Integer.compare(
+            TAG_PRIORITY.getOrDefault(b, 0),
+            TAG_PRIORITY.getOrDefault(a, 0)));
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0; i < sorted.size() && i < max; i++) {
+            if(i > 0) sb.append(",");
+            sb.append(sorted.get(i));
+        }
+        return sb.toString();
+    }
+
+    // v9 Rule 136: synthetic focus score for fallback when no bullseyes fire.
+    private long scoreFocus(FuncTraits t) {
+        if(t == null) return 0;
+        long score = 0;
+        if(t.isCtor)                       score += 30;
+        if("CRITICAL".equals(t.ctorRiskTier)) score += 50;
+        if("HIGH".equals(t.ctorRiskTier))     score += 30;
+        if(t.isRenderFrameEntry)           score += 80;
+        if(t.isFrameClockDriver)           score += 50;
+        if(t.isInfiniteSpinLoop)           score += 40;
+        if(t.isSyncWaitLoop)               score += 40;
+        if(t.bitbltbufMacroSequence)       score += 70;
+        if(t.gifTagInlineBuilder)          score += 60;
+        if(t.dmaSourceChainTagBuilder)     score += 50;
+        if(t.dmaChcrStartKick)             score += 70;
+        if(t.isIrxLoader)                  score += 35;
+        if(t.isBitbltbufT4hhUploader)      score += 90;
+        if(t.isCtorMultiFieldInit)         score += 40;
+        if(t.isLifecycleLazyInit)          score += 40;
+        if(t.drawingChainDepth >= 0 && t.drawingChainDepth <= 6) score += 50;
+        if("BLOCKER".equals(t.knownCriticality)) score += 100;
+        if("HIGH".equals(t.knownCriticality))    score += 60;
+        if("MEDIUM".equals(t.knownCriticality))  score += 30;
+        if(t.hostWaitCandidate)         score += 80;
+        score += Math.min(t.calleeNames.size(), 20);
+        score += Math.min(t.callers.size(), 10);
+        return score;
     }
 
     // =========================================================
@@ -6716,10 +8993,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // =========================================================
     // FIREWALLS
     // =========================================================
-    // v15: a radar stub now needs BOTH a host-boundary name match (exact or
-    // word-boundary family) AND trait corroboration. Name-only matching is
-    // what stubbed `exponent` on FF1 (prefix "exp") and would stub real game
-    // code on any title that reuses SDK-ish spellings.
+    // v11 (General v15): a radar stub now needs BOTH a host-boundary name
+    // match (exact or word-boundary family) AND trait corroboration.
+    // Name-only matching is what stubbed `exponent` on FF1 (prefix "exp")
+    // and would stub real game code on any title that reuses SDK-ish
+    // spellings.
     private boolean isRadarFirewalled(Function func, FuncTraits traits) {
         Address key=func.getEntryPoint();
         Boolean c=staticFwCache.get(key);if(c!=null)return c;
@@ -6734,521 +9012,112 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // referencesIopModule replaced with traits.refsIopModuleString.
 
     // =========================================================
-    // v9 R9: scan all initialized memory blocks (typically .data / .rodata)
-    // for runs of >=4 consecutive 4-byte words where each value lands in
-    // [textStart, textEnd] AND each matches a known function entry. Emits a
-    // map of table base -> entry list. Pairs with R10 in JSON emit.
-    private void scanFunctionPointerTables(List<FuncResult> results,
-                                            Map<Long,FuncResult> byAddr) {
-        Set<Long> entryAddrs = new HashSet<>();
-        for(FuncResult r : results) entryAddrs.add(r.address & 0xFFFFFFFFL);
-        // v12 (H1): tag-tolerant alias map. GOAL-compiled binaries store boxed
-        // pointers with low-bit type tags (or +constant offsets); strip the
-        // low 4 bits before lookup, but always resolve back to the precise
-        // function entry. Also accept values that ARE textStart-relative
-        // (small ints whose addition to textStart hits an entry).
-        Map<Long, Long> aliasMap = new HashMap<>();
-        for(Long e : entryAddrs) aliasMap.put(e, e);
-        for(Long e : entryAddrs) {
-            for(int tag = 1; tag <= 0xF; tag++)
-                aliasMap.putIfAbsent(e | (long)tag, e);
+    // v11.3: POST-REGEN COP2 PATCH GENERATION
+    // The COP2 dest-mask fix (F51.8) patches recomp/*.cpp, which only exist
+    // AFTER ps2_recomp.exe runs - so it cannot run inside this Ghidra pass.
+    // Instead we EMIT it (RECOMP path pre-filled) next to the triage output and
+    // list it in post_regen_steps.md, derived from this run's COP2 model, so it
+    // ships with the map and can't be forgotten or drift.
+    // =========================================================
+    private void emitCop2FixScript(File outputDir, List<FuncResult> results) {
+        int riskFns = 0;
+        for (FuncResult r : results)
+            if (r.traits != null && r.traits.cop2DestMaskVerify) riskFns++;
+        String recompDir = "D:/ps2r/recomp";
+        try (PrintWriter w = utf8Writer(new File(outputDir, "fix_cop2_destmask.py"))) {
+            w.println("#!/usr/bin/env python3");
+            w.println("# AUTO-GENERATED by the General TriageEnricher (v11.3). Do not hand-edit; regenerate.");
+            w.println("# F51.8: reverse the recompiler COP2 dest-component-mask lane order in generated");
+            w.println("# recomp files. The generator emits `__m128i mask = _mm_set_epi32(X,Y,Z,W)` mapping");
+            w.println("# VU dest X->lane3 .. W->lane0, but lqc2/sqc2/broadcast use X=lane0 .. W=lane3, so the");
+            w.println("# 4 args are reversed. Full-dest masks (-1,-1,-1,-1) are symmetric -> no-op.");
+            w.println("# >>> RUN THIS AFTER ps2_recomp.exe regenerates recomp/*.cpp (post-regen stage). <<<");
+            w.println("# This run flagged " + riskFns + " COP2 partial-dest-risk fn(s) (triage_map.json cop2_partial_dest_risk).");
+            w.println("import re, sys, glob, os");
+            w.println("");
+            w.println("RECOMP = r\"" + recompDir + "\"");
+            w.println("pat = re.compile(r\"(__m128i mask = _mm_set_epi32\\()\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*,\\s*(-?\\d+)\\s*(\\))\")");
+            w.println("");
+            w.println("def fix_text(text):");
+            w.println("    n = [0]");
+            w.println("    def repl(m):");
+            w.println("        a, b, c, d = m.group(2), m.group(3), m.group(4), m.group(5)");
+            w.println("        if a == d and b == c:");
+            w.println("            return m.group(0)  # symmetric -> unchanged");
+            w.println("        n[0] += 1");
+            w.println("        return f\"{m.group(1)}{d}, {c}, {b}, {a}{m.group(6)}\"");
+            w.println("    out = pat.sub(repl, text)");
+            w.println("    return out, n[0]");
+            w.println("");
+            w.println("def main():");
+            w.println("    files = sys.argv[1:]");
+            w.println("    if not files:");
+            w.println("        files = []");
+            w.println("        for f in glob.glob(os.path.join(RECOMP, \"*.cpp\")):");
+            w.println("            with open(f, \"r\", encoding=\"utf-8\", errors=\"replace\") as fh:");
+            w.println("                t = fh.read()");
+            w.println("            if \"_mm_blendv_ps(ctx->vu0_vf\" in t or \"PS2_VBLEND(ctx->vu0_vf\" in t:");
+            w.println("                files.append(f)");
+            w.println("    total_files = 0");
+            w.println("    total_swaps = 0");
+            w.println("    for f in files:");
+            w.println("        with open(f, \"r\", encoding=\"utf-8\", errors=\"replace\") as fh:");
+            w.println("            t = fh.read()");
+            w.println("        nt, n = fix_text(t)");
+            w.println("        if n > 0:");
+            w.println("            with open(f, \"w\", encoding=\"utf-8\", newline=\"\") as fh:");
+            w.println("                fh.write(nt)");
+            w.println("            total_files += 1");
+            w.println("            total_swaps += n");
+            w.println("            print(f\"  {os.path.basename(f)}: {n} partial-mask(s) reversed\")");
+            w.println("    print(f\"DONE: {total_files} files changed, {total_swaps} partial dest-masks reversed\")");
+            w.println("");
+            w.println("if __name__ == \"__main__\":");
+            w.println("    main()");
+        } catch (Exception e) {
+            printerr("[COP2] Failed to emit fix_cop2_destmask.py: " + e.getMessage());
         }
-        for(MemoryBlock blk : memory.getBlocks()) {
-            if(!blk.isInitialized()) continue;
-            String bn = blk.getName().toLowerCase();
-            // Skip the code segment itself.
-            if(bn.equals(".text") || bn.equals("text")) continue;
-            long start = blk.getStart().getOffset();
-            long end   = blk.getEnd().getOffset();
-            long size  = end - start + 1;
-            if(size < 16) continue;
-            try {
-                byte[] data = new byte[(int)Math.min(size, 1 << 22)]; // cap 4MB
-                blk.getBytes(blk.getStart(), data);
-                long runStart = -1;
-                List<Long> runEntries = new ArrayList<>();
-                for(int i = 0; i + 4 <= data.length; i += 4) {
-                    // Little-endian 32-bit read.
-                    long v = ((long)(data[i] & 0xFF))
-                           | ((long)(data[i+1] & 0xFF) << 8)
-                           | ((long)(data[i+2] & 0xFF) << 16)
-                           | ((long)(data[i+3] & 0xFF) << 24);
-                    // v12 (H1): tag-tolerant entry resolution. Direct hit first,
-                    // then masked-low-nibble for boxed pointers.
-                    Long resolved = aliasMap.get(v);
-                    if(resolved == null && (v & 0xFL) != 0) {
-                        Long maskTry = aliasMap.get(v & ~0xFL);
-                        if(maskTry != null) resolved = maskTry;
-                    }
-                    boolean isEntry = resolved != null;
-                    if(isEntry) {
-                        if(runStart < 0) runStart = start + i;
-                        runEntries.add(resolved);
-                    } else {
-                        // v12 (H1): allow up to 1 null/zero entry mid-run
-                        // (vtables often pad with 0 for missing slots).
-                        if(runEntries.size() >= 3 && v == 0L) continue;
-                        if(runEntries.size() >= 3) {
-                            functionPointerTables.put(runStart, new ArrayList<>(runEntries));
-                        }
-                        runStart = -1;
-                        runEntries.clear();
-                    }
-                }
-                if(runEntries.size() >= 3)
-                    functionPointerTables.put(runStart, new ArrayList<>(runEntries));
-            } catch(Exception ignore) {}
+        try (PrintWriter w = utf8Writer(new File(outputDir, "post_regen_steps.md"))) {
+            w.println("# Post-regen steps (auto-generated by the General TriageEnricher v11.3)");
+            w.println("");
+            w.println("Run these AFTER `ps2_recomp.exe` regenerates `recomp/*.cpp`, in order:");
+            w.println("");
+            w.println("1. **COP2 dest-mask reversal (F51.8) - MANDATORY.** `python fix_cop2_destmask.py`");
+            w.println("   (emitted beside this file, RECOMP path pre-filled). " + riskFns + " partial-dest-risk");
+            w.println("   function(s) flagged this run. Skipping it regresses ALL VU0-macro 3D transforms.");
+            w.println("2. **VU0 helper collision audit.** Any `sceVu0*` rescued to RECOMPILE that the runtime");
+            w.println("   also implements (Kernel/Stubs/VU.cpp) collides under /FORCE:MULTIPLE - verify the");
+            w.println("   winner per function, or lock the runtime-backed ones in the config.");
+            w.println("3. **Allocator-family coherence.** malloc/free/_malloc_r/memalign/operator new must all");
+            w.println("   route to the runtime (G1) - no half-runtime/half-recompiled split.");
+            w.println("4. **Smoke test.** `tools/run_30s_diagnose.ps1` - title must stay golden before promoting.");
+        } catch (Exception e) {
+            printerr("[COP2] Failed to emit post_regen_steps.md: " + e.getMessage());
         }
-        // v12 (H2): synthesise class names for stripped binaries. For each
-        // discovered table whose members have generic Ghidra names (FUN_/sub_),
-        // assign them ClassXXXXXXXX / slot N labels via FuncTraits.
-        for(Map.Entry<Long,List<Long>> e : functionPointerTables.entrySet()) {
-            long tableAddr = e.getKey() & 0xFFFFFFFFL;
-            String className = String.format("Class_0x%08X", tableAddr);
-            int slot = 0;
-            for(Long fnAddr : e.getValue()) {
-                FuncResult fr = byAddr.get(fnAddr & 0xFFFFFFFFL);
-                if(fr != null && fr.traits != null) {
-                    boolean stripped = fr.name == null || fr.name.startsWith("FUN_") ||
-                                       fr.name.startsWith("sub_");
-                    if(stripped && fr.traits.inferredClassName == null) {
-                        fr.traits.inferredClassName = className;
-                        fr.traits.inferredVtableSlot = slot;
-                    }
-                }
-                slot++;
-            }
-        }
-        // R10 tag: every function whose entry appears in a discovered table
-        // gets DISPATCH_TABLE_TARGET. Function CONTAINING jalr with target
-        // resolved via lw from table base gets TABLE_DISPATCH_CALL.
-        Set<Long> dispatchTargets = new HashSet<>();
-        for(List<Long> entries : functionPointerTables.values())
-            dispatchTargets.addAll(entries);
-        for(FuncResult r : results) {
-            if(dispatchTargets.contains(r.address & 0xFFFFFFFFL)) {
-                if(!r.tags.contains("DISPATCH_TABLE_TARGET"))
-                    r.tags.add("DISPATCH_TABLE_TARGET");
-            }
-            if(r.traits == null) continue;
-            // R10 site detection: function loads a constant matching a table
-            // base AND has jalr indirect call.
-            if(r.traits.indirectCallT9Count == 0 && r.traits.virtualDispatchSites.isEmpty())
-                continue;
-            for(long[] cl : r.traits.constLoads) {
-                long v = cl[1] & 0xFFFFFFFFL;
-                if(functionPointerTables.containsKey(v)) {
-                    r.traits.tableDispatchSites.add(String.format("0x%08X", v));
-                    if(!r.tags.contains("TABLE_DISPATCH_CALL")) {
-                        r.tags.add("TABLE_DISPATCH_CALL");
-                        tableDispatchCallCount++;
-                    }
-                }
-            }
-        }
+        println("[COP2] Emitted fix_cop2_destmask.py + post_regen_steps.md (" + riskFns + " risk fns).");
     }
 
-    // v11 (K): name-prefix module index. Discover prefixes of length 2-6 that
-    // occur >=5 times across the function set; emit {prefix -> [addrs]}.
-    // Complements call-graph clustering (which gives 696 small components on
-    // FF1) by surfacing engineer-visible subsystems (Scene*, Mc*, Pad*, ...).
-    private void buildNamePrefixModules(List<FuncResult> results) {
-        Map<String, List<Long>> byPrefix = new HashMap<>();
-        for(FuncResult r : results) {
-            if(r.name == null || r.name.isEmpty()) continue;
-            String n = r.name;
-            // Skip sub_XXXXXX (Ghidra default) - no semantic prefix.
-            if(n.startsWith("sub_") || n.startsWith("FUN_")) continue;
-            int maxLen = Math.min(6, n.length());
-            for(int len = 2; len <= maxLen; len++) {
-                String prefix = n.substring(0, len);
-                // Trim trailing digit/separator - keeps "Scene" over "Scene1".
-                char last = prefix.charAt(len-1);
-                if(!Character.isLetter(last) && last != '_') continue;
-                byPrefix.computeIfAbsent(prefix, k -> new ArrayList<>()).add(r.address & 0xFFFFFFFFL);
-            }
-        }
-        // Filter: >=5 occurrences, prefer longest qualifying prefix per address
-        // so a function isn't listed under both "Sc" and "Scene".
-        List<Map.Entry<String,List<Long>>> kept = new ArrayList<>();
-        for(Map.Entry<String,List<Long>> e : byPrefix.entrySet())
-            if(e.getValue().size() >= 5) kept.add(e);
-        kept.sort((a,b) -> Integer.compare(b.getKey().length(), a.getKey().length()));
-        Set<Long> assigned = new HashSet<>();
-        for(Map.Entry<String,List<Long>> e : kept) {
-            List<Long> taken = new ArrayList<>();
-            for(Long a : e.getValue())
-                if(assigned.add(a)) taken.add(a);
-            if(taken.size() >= 5) {
-                Collections.sort(taken);
-                namePrefixModules.put(e.getKey(), taken);
-            }
-        }
+    // v11.3: compare two configs by EXECUTABLE content only - each line is cut at
+    // its first '#' (drops the header block, the advisory pointer, and inline
+    // # TAG annotations) then trimmed; blank results are dropped. Lets the
+    // incremental mode leave the live config untouched when only comments/tags
+    // would have churned, and rewrite only on a real selector/section delta.
+    private boolean configBodyEquals(File a, File b) {
+        try { return semanticConfigLines(a).equals(semanticConfigLines(b)); }
+        catch (Exception e) { return false; }
     }
-
-    // v9 R18: greedy module clustering. Connected components on bidirectional
-    // jal call edges. Cluster id encoded as smallest function address in the
-    // cluster. Functions never called and never calling stay id=-1.
-    private void assignModuleIds(List<FuncResult> results) {
-        Map<Long, Set<Long>> adj = new HashMap<>();
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            long a = r.address & 0xFFFFFFFFL;
-            Set<Long> nbrs = adj.computeIfAbsent(a, k -> new HashSet<>());
-            for(long[] site : r.traits.jalSites) {
-                long t = site[1] & 0xFFFFFFFFL;
-                if(t == 0xFFFFFFFFL) continue;
-                nbrs.add(t);
-                adj.computeIfAbsent(t, k -> new HashSet<>()).add(a);
+    private List<String> semanticConfigLines(File f) throws IOException {
+        List<String> out = new ArrayList<>();
+        try (BufferedReader r = utf8Reader(f)) {
+            String ln;
+            while ((ln = r.readLine()) != null) {
+                int h = ln.indexOf('#');
+                if (h >= 0) ln = ln.substring(0, h);
+                ln = ln.trim();
+                if (!ln.isEmpty()) out.add(ln);
             }
         }
-        Map<Long, Long> compId = new HashMap<>();
-        int idCounter = 0;
-        for(FuncResult r : results) {
-            long a = r.address & 0xFFFFFFFFL;
-            if(compId.containsKey(a)) continue;
-            // BFS flood.
-            Deque<Long> q = new ArrayDeque<>();
-            Set<Long> seen = new HashSet<>();
-            q.add(a); seen.add(a);
-            long minAddr = a;
-            while(!q.isEmpty()) {
-                long cur = q.poll();
-                if(cur < minAddr) minAddr = cur;
-                Set<Long> ns = adj.get(cur);
-                if(ns == null) continue;
-                for(long n : ns) {
-                    if(seen.add(n)) q.add(n);
-                }
-            }
-            for(long n : seen) compId.put(n, minAddr);
-        }
-        // Renumber to compact integer ids.
-        Map<Long, Integer> idMap = new HashMap<>();
-        for(FuncResult r : results) {
-            long a = r.address & 0xFFFFFFFFL;
-            Long cid = compId.get(a);
-            if(cid == null) continue;
-            Integer mid = idMap.get(cid);
-            if(mid == null) { mid = idCounter++; idMap.put(cid, mid); }
-            if(r.traits != null) r.traits.moduleId = mid;
-            moduleClusters.computeIfAbsent(mid, k -> new LinkedHashSet<>()).add(a);
-        }
-    }
-
-    private void runV8PostPasses(List<FuncResult> results,
-                                  Map<Long,FuncResult> byAddr,
-                                  List<String> newStubs) {
-        // -------- Pass A: ctor call mode + return-to-global --------
-        // For every direct jal site, look at the caller's instructions just
-        // after the jal for `sw $v0, +imm($gp)`. If found, record on callee.
-        for(FuncResult caller : results) {
-            if(caller.traits == null) continue;
-            for(long[] site : caller.traits.jalSites) {
-                long callPc = site[0];
-                long target = site[1] & 0xFFFFFFFFL;
-                if(target == 0xFFFFFFFFL) continue;
-                FuncResult callee = byAddr.get(target);
-                if(callee == null || callee.traits == null) continue;
-                // Mark direct-jal observation on callee.
-                callee.traits.calledViaDirectJal = true;
-                // Examine 1-4 instructions immediately after the jal for sw $v0, +imm($gp).
-                try {
-                    Instruction jalInst = currentProgram.getListing().getInstructionAt(
-                        currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(callPc));
-                    if(jalInst == null) continue;
-                    Instruction probe = jalInst.getNext();
-                    int look = 0;
-                    while(probe != null && look < 4) {
-                        String mn = probe.getMnemonicString();
-                        if(mn != null) {
-                            String ml = mn.toLowerCase();
-                            if(ml.equals("sw") || ml.equals("sd")) {
-                                Object[] dop = probe.getOpObjects(0);
-                                Object[] aop = probe.getOpObjects(1);
-                                String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
-                                    ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
-                                boolean baseIsGp = false;
-                                long off = -1;
-                                if(aop != null) {
-                                    for(Object o : aop) {
-                                        if(o instanceof ghidra.program.model.lang.Register &&
-                                           ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("gp"))
-                                            baseIsGp = true;
-                                        else if(o instanceof ghidra.program.model.scalar.Scalar)
-                                            off = ((ghidra.program.model.scalar.Scalar)o).getSignedValue();
-                                    }
-                                }
-                                if(src != null && src.equalsIgnoreCase("v0") && baseIsGp && off != -1) {
-                                    long norm = off & 0xFFFFFFFFL;
-                                    callee.traits.returnWrittenToGlobals.add(norm);
-                                    callee.traits.ctorAssignedToGlobal = true;
-                                    break;
-                                }
-                            }
-                        }
-                        probe = probe.getNext();
-                        look++;
-                    }
-                } catch(Exception ignore) {}
-            }
-        }
-        // -------- Pass B: ctor risk grading --------
-        // Caller mode classification - was a ctor reached only via direct jal,
-        // only via jalr $t9, or both?
-        for(FuncResult r : results) {
-            if(r.traits == null || !r.traits.isCtor) continue;
-            FuncTraits t = r.traits;
-            // Determine if any caller calls via jalr $t9 (indirect).
-            for(long[] c : t.callers) {
-                FuncResult caller = byAddr.get(c[0] & 0xFFFFFFFFL);
-                if(caller == null || caller.traits == null) continue;
-                // If caller has indirectCallT9Count>0 we *may* dispatch this
-                // ctor via $t9; not a strict proof but a useful proxy.
-                if(caller.traits.indirectCallT9Count > 0) t.calledViaJrT9 = true;
-            }
-            // Mode
-            if(t.calledViaDirectJal && t.calledViaJrT9) t.ctorCallMode = "dual";
-            else if(t.calledViaDirectJal)               t.ctorCallMode = "direct_only";
-            else if(t.calledViaJrT9)                    t.ctorCallMode = "indirect_only";
-            else                                        t.ctorCallMode = "unobserved";
-            // Risk tier
-            boolean autoStubLikely = !t.ctorInstallsVtable && !t.isCtorMultiFieldInit
-                                  && !t.ctorWritesA0Slot && t.byteSize < 60;
-            if(t.ctorAssignedToGlobal && ("dual".equals(t.ctorCallMode) || "direct_only".equals(t.ctorCallMode))
-                                       && autoStubLikely) {
-                t.ctorRiskTier = "CRITICAL"; ctorCriticalCount++;
-            } else if(t.ctorInstallsVtable && "dual".equals(t.ctorCallMode)) {
-                t.ctorRiskTier = "HIGH"; ctorHighCount++;
-            } else if(t.isCtorMultiFieldInit || t.ctorInstallsVtable || t.ctorAssignedToGlobal) {
-                t.ctorRiskTier = "MEDIUM"; ctorMediumCount++;
-            } else {
-                t.ctorRiskTier = "LOW";
-            }
-            if(t.ctorAssignedToGlobal) ctorAssignedGlobalCount++;
-            if(t.ctorInstallsVtable)   ctorInstallsVtableCount++;
-            if("dual".equals(t.ctorCallMode)) ctorDualCallModeCount++;
-            // Promote CRITICAL/HIGH ctors out of STUB.
-            if(("CRITICAL".equals(t.ctorRiskTier) || "HIGH".equals(t.ctorRiskTier)) &&
-               "STUB".equals(r.disposition) && !isHardBoundStep1(r)) {
-                r.disposition = "RECOMPILE";
-                removeAutoBindingEntries(newStubs, r);
-                noteStep1Rescue(r, "ctor risk " + t.ctorRiskTier + " (vtable/global-assigned ctor)",
-                                "v8_ctor_risk");
-            }
-            if(!r.tags.contains("CTOR_RISK_" + t.ctorRiskTier))
-                r.tags.add("CTOR_RISK_" + t.ctorRiskTier);
-        }
-        // -------- Pass C: class registry build --------
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            FuncTraits t = r.traits;
-            String cls = null;
-            if(t.isCtor) cls = t.ctorClassName;
-            else if(t.isDtor) cls = t.methodClassName;
-            else if(t.methodClassName != null) cls = t.methodClassName;
-            if(cls == null) continue;
-            ClassEntry ce = classRegistry.computeIfAbsent(cls, k -> { ClassEntry x = new ClassEntry(); x.className = k; return x; });
-            if(t.isCtor) {
-                ce.ctorAddresses.add(r.address & 0xFFFFFFFFL);
-                if(t.ctorInstallsVtable && t.ctorVtableAddr != 0)
-                    ce.vtableAddr = t.ctorVtableAddr;
-                for(Long g : t.returnWrittenToGlobals) {
-                    ce.globalHolders.add(String.format("0x%08X", g));
-                }
-                // Track instantiation sites (caller PCs).
-                for(long[] c : t.callers) ce.instantiationSites.add(c[1] & 0xFFFFFFFFL);
-                // Class risk = highest ctor risk
-                if(rankRisk(t.ctorRiskTier) > rankRisk(ce.riskTier))
-                    ce.riskTier = t.ctorRiskTier;
-            } else if(t.isDtor) {
-                ce.dtorAddress = r.address & 0xFFFFFFFFL;
-            } else if(t.methodName != null) {
-                ce.methodNames.add(t.methodName);
-                ce.methodAddrs.put(t.methodName, r.address & 0xFFFFFFFFL);
-                if(t.isVirtualDrawMethod) ce.hasVirtualDraw = true;
-            }
-        }
-        // Bump ctor risk to CRITICAL when class has virtual draw method.
-        for(FuncResult r : results) {
-            if(r.traits == null || !r.traits.isCtor) continue;
-            String cls = r.traits.ctorClassName;
-            if(cls == null) continue;
-            ClassEntry ce = classRegistry.get(cls);
-            if(ce != null && ce.hasVirtualDraw &&
-               (rankRisk(r.traits.ctorRiskTier) < rankRisk("HIGH"))) {
-                r.traits.ctorRiskTier = "HIGH";
-                if(!r.tags.contains("CTOR_RISK_HIGH")) r.tags.add("CTOR_RISK_HIGH");
-            }
-        }
-        // -------- Pass D: virtual dispatch site counters + tags --------
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            if(!r.traits.virtualDispatchSites.isEmpty()) {
-                virtualDispatchSiteCount += r.traits.virtualDispatchSites.size();
-                virtualDispatchFuncCount++;
-                if(!r.tags.contains("VIRTUAL_DISPATCH_SITE"))
-                    r.tags.add("VIRTUAL_DISPATCH_SITE");
-            }
-            if(r.traits.isPadButtonMaskConsumer) {
-                padButtonMaskConsumerCount++;
-                if(!r.tags.contains("PAD_BUTTON_MASK_CONSUMER"))
-                    r.tags.add("PAD_BUTTON_MASK_CONSUMER");
-            }
-            if(r.traits.gifNloopDoubleCountRisk) {
-                gifNloopDoubleCountRiskCount++;
-                if(!r.tags.contains("GIF_NLOOP_DOUBLE_COUNT_RISK"))
-                    r.tags.add("GIF_NLOOP_DOUBLE_COUNT_RISK");
-            }
-            if(!r.traits.filePathSprintfFormats.isEmpty()) {
-                filePathSprintfCount++;
-                if(!r.tags.contains("FILE_PATH_SPRINTF_SOURCE"))
-                    r.tags.add("FILE_PATH_SPRINTF_SOURCE");
-            }
-            if(r.traits.isFrameClockDriver) {
-                frameClockDriverCount++;
-                if(!r.tags.contains("FRAME_CLOCK_DRIVER"))
-                    r.tags.add("FRAME_CLOCK_DRIVER");
-            }
-            if(r.traits.isSceVu0Helper) {
-                sceVu0HelperCount++;
-                if(!r.tags.contains("SCEVU0_HELPER_MUSTIMPL"))
-                    r.tags.add("SCEVU0_HELPER_MUSTIMPL");
-                // Promote out of STUB - unless the runtime ships a verified
-                // handler for it (v15.4 roster-backed keep, e.g. SIMD-native
-                // sceVu0ApplyMatrix).
-                if("STUB".equals(r.disposition) && !isHardBoundStep1(r)) {
-                    r.disposition = "RECOMPILE";
-                    removeAutoBindingEntries(newStubs, r);
-                    noteStep1Rescue(r, "sceVu0 helper must be implemented (VU0 macro math)",
-                                    "v8_scevu0_helper");
-                }
-            }
-            if(!r.traits.returnWrittenToGlobals.isEmpty()) returnWrittenToGlobalCount++;
-        }
-        // -------- Pass E: Uploader caller depth-1 / depth-2 markers --------
-        Set<Long> uploaderSet = new HashSet<>();
-        for(FuncResult r : results)
-            if(r.traits != null && r.traits.isBitbltbufT4hhUploader)
-                uploaderSet.add(r.address & 0xFFFFFFFFL);
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            for(long[] site : r.traits.jalSites) {
-                long tgt = site[1] & 0xFFFFFFFFL;
-                if(uploaderSet.contains(tgt)) {
-                    r.traits.uploaderCallerDepth1 = true;
-                    if(!r.tags.contains("UPLOADER_CALLER_D1"))
-                        r.tags.add("UPLOADER_CALLER_D1");
-                    break;
-                }
-            }
-        }
-        // ===== v9 post-passes =====
-        // Pass V9-A: R2 DMA_CHCR_START_KICK - pair 0x101 const with channel
-        // base load. Channel base may live in .data; we approximate by:
-        // loadsChcrStartConst AND any literalRef whose base register was loaded
-        // via a const matching a DMA channel CHCR address.
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            FuncTraits t = r.traits;
-            if(!t.loadsChcrStartConst) continue;
-            boolean hasChannelLoad = false;
-            for(long[] cl : t.constLoads) {
-                long v = cl[1] & 0xFFFFFFFFL;
-                for(long base : DMA_CHANNEL_BASES) {
-                    if(v == base || v == (base >> 16) || v == (base & 0xFFFFL)) {
-                        hasChannelLoad = true; break;
-                    }
-                }
-                if(hasChannelLoad) break;
-            }
-            // Also count VIF1 channel range, MMIO indirect via ref capture.
-            if(t.accessesMMIO || t.accessesVif1MMIO) hasChannelLoad = true;
-            if(hasChannelLoad) {
-                t.dmaChcrStartKick = true;
-                if(!r.tags.contains("DMA_CHCR_START_KICK")) {
-                    r.tags.add("DMA_CHCR_START_KICK");
-                    dmaChcrStartKickCount++;
-                }
-            }
-        }
-
-        // Pass V9-B: R9 function_pointer_tables - moved to pre-BFS in run()
-        // so table-edge augmentation can feed mainloop/init-chain depth BFS.
-        // (Was: scanFunctionPointerTables(results, byAddr);)
-
-        // Pass V9-C: R5/R6 frame driver + render frame entry.
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            FuncTraits t = r.traits;
-            // R6: writes GIF/VIF MMIO + mainloop_depth 1-2 + frame-clock callee.
-            boolean writesGifVif = t.accessesVif1MMIO || t.writesGifFifo ||
-                                   t.writesVif1Fifo || t.touchesGifCtrl ||
-                                   !t.dmaKickChannels.isEmpty();
-            if(writesGifVif && t.isFrameClockDriver &&
-               t.mainLoopDepth >= 0 && t.mainLoopDepth <= 2) {
-                t.isRenderFrameEntry = true;
-                if(!r.tags.contains("RENDER_FRAME_ENTRY")) {
-                    r.tags.add("RENDER_FRAME_ENTRY");
-                    renderFrameEntryCount++;
-                }
-            }
-        }
-
-        // Pass V9-D: R18 module clustering via mutual-call density. Greedy
-        // connected components on bidirectional jal edges. O(F * avgCallees).
-        assignModuleIds(results);
-        // v11 (K): secondary name-prefix module index.
-        buildNamePrefixModules(results);
-
-        // -------- Pass F0: stamp Rule 98 override classification on per-func traits --------
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            long addr = r.address & 0xFFFFFFFFL;
-            if(overrideKindByAddr.containsKey(addr)) {
-                r.traits.overrideKind = overrideKindByAddr.get(addr);
-                String k = r.traits.overrideKind;
-                r.traits.overrideRetireCandidate = "nop_stub".equals(k) || "probe".equals(k);
-                String tag = "OVERRIDE_" + (k == null ? "REAL_SHIM" : k.toUpperCase());
-                if(!r.tags.contains(tag)) r.tags.add(tag);
-            }
-        }
-
-        // -------- Pass F: SDK-caller depth-1 propagation (Rule 111) --------
-        Set<Long> dispfbWriters = new HashSet<>();
-        Set<Long> dmaKickers    = new HashSet<>();
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            if(r.traits.writesDispfbReg || r.traits.writesDispfbViaSdk)
-                dispfbWriters.add(r.address & 0xFFFFFFFFL);
-            if(!r.traits.dmaKickChannels.isEmpty() || r.traits.path3KickViaDmaApi)
-                dmaKickers.add(r.address & 0xFFFFFFFFL);
-        }
-        for(FuncResult r : results) {
-            if(r.traits == null) continue;
-            for(long[] site : r.traits.jalSites) {
-                long tgt = site[1] & 0xFFFFFFFFL;
-                if(dispfbWriters.contains(tgt) && !r.traits.dispfbWriterViaSdkCallerDepth1) {
-                    r.traits.dispfbWriterViaSdkCallerDepth1 = true;
-                    dispfbWriterViaSdkCallerCount++;
-                }
-                if(dmaKickers.contains(tgt) && !r.traits.dmaKickViaSdkCallerDepth1) {
-                    r.traits.dmaKickViaSdkCallerDepth1 = true;
-                    dmaKickViaSdkCallerCount++;
-                }
-            }
-        }
-    }
-
-    // Risk-tier comparator helper.
-    private static int rankRisk(String tier) {
-        if(tier == null) return 0;
-        switch(tier) {
-            case "CRITICAL": return 3;
-            case "HIGH":     return 2;
-            case "MEDIUM":   return 1;
-            default:         return 0;
-        }
+        return out;
     }
 
     // =========================================================
@@ -7256,21 +9125,71 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     // =========================================================
     private void writeUnifiedConfig(File outFile,File step1Config,
                                     List<String> newStubs,List<String> newSkips,
-                                    List<String> nopList,List<String> patchList,
-                                    List<String> forceRecompList,
-                                    List<String> nativeImplList,
-                                    List<String> reviewList,
-                                    List<long[]> patchInstrCandidates) throws IOException {
+                                    List<FuncResult> results,
+                                    Map<Long,FuncResult> byAddr) throws IOException {
+        // v9 Rule 138: build address -> FuncResult lookup by name@addr token,
+        // so each spliced stub/skip line can carry a top-tag comment.
+        Map<String,FuncResult> byToken = new HashMap<>();
+        for(FuncResult r : results) {
+            byToken.put(r.name + "@" + hex(r.address), r);
+        }
         List<String> lines=new ArrayList<>();
         BufferedReader reader=utf8Reader(step1Config);
         String line;while((line=reader.readLine())!=null)lines.add(line);
         reader.close();
-        // v15.5: normalize single-line stub/skip arrays (`stubs = [..]`,
-        // `skip = []`) into multi-line form so the rescue-removal and
-        // insertion passes below see one entry per line. The old scanner
-        // never found the closing `]` of an inline array: enricher
-        // additions were silently dropped and the in-array state leaked
-        // into the following lines.
+        // v11.1 RE-ENTRANT SANITIZE: when the input is a previous enricher
+        // output (evolving config_auto_recomp.toml workflow), strip
+        // everything THIS script generates before regenerating it - header
+        // comment block, advisory pointer comment, and any old
+        // [triage_advisory] section (incl. its banner comments and the
+        // trailing commented-out "# [patches]" candidate block). Without
+        // this, headers stack and stale advisory data survives forever.
+        // Step1-exporter inputs (DAC.toml) contain none of these lines, so
+        // the pass is a no-op for them.
+        {
+            // 1. Drop the old [triage_advisory] section: from its banner
+            //    comments through to the next REAL section header or EOF.
+            int advIdx=-1;
+            for(int i=0;i<lines.size();i++)
+                if(lines.get(i).trim().equals("[triage_advisory]")){advIdx=i;break;}
+            if(advIdx>=0){
+                int start=advIdx;
+                // back up over the banner comment lines directly above it.
+                while(start>0){
+                    String p=lines.get(start-1).trim();
+                    if(p.startsWith("#")||p.isEmpty()) start--;
+                    else break;
+                }
+                int end=advIdx+1;
+                while(end<lines.size()){
+                    String p=lines.get(end).trim();
+                    if(p.startsWith("[")&&!p.startsWith("[triage_advisory")) break;
+                    end++;
+                }
+                lines.subList(start,end).clear();
+            }
+            // 2. Drop our own one-line artifacts wherever they sit.
+            lines.removeIf(l -> {
+                String t=l.trim();
+                if(!t.startsWith("#")) return false;
+                return t.startsWith("# Unified config:")
+                    || (t.contains("inherited stub +") && t.contains("inherited skip"))
+                    || t.startsWith("# removed (now RECOMPILE)")
+                    || t.startsWith("# !! Rule 154:")
+                    || t.contains("EMIT_VERBOSE_TOML_ADVISORY")
+                    || t.contains("\"triage_advisory\". Set")
+                    || (t.startsWith("# v11:") && t.contains("advisory entries"))
+                    || t.contains("locked entries kept verbatim")
+                    || t.startsWith("# native_impl_needed / review / nop")
+                    || t.startsWith("# candidates) live in triage_map.json");
+            });
+        }
+        // v11 (General v15.5 Bugfix T): normalize single-line stub/skip
+        // arrays (`stubs = [..]`, `skip = []`) into multi-line form so the
+        // rescue-removal and insertion passes below see one entry per line.
+        // The old scanner never found the closing `]` of an inline array:
+        // enricher additions were silently dropped and the in-array state
+        // leaked into the following lines.
         for(int i=0;i<lines.size();i++){
             String t=lines.get(i).trim();
             boolean isStubsLine = t.startsWith("stubs");
@@ -7289,7 +9208,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             lines.addAll(i, expanded);
             i += expanded.size()-1;
         }
-        // v15.5: guarantee both arrays exist when we have additions to place.
+        // v11: guarantee both arrays exist when we have additions to place.
         {
             boolean hasStubsArr=false, hasSkipArr=false;
             int generalIdx=-1;
@@ -7309,10 +9228,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 lines.add(insertAt,"stubs = [");
             }
         }
-        // v15.1: DROP inherited stub/skip entries the keep gate (or a later
-        // promote pass) rescued to RECOMPILE. The TOML stays the executable
-        // safe subset; per-entry reasons/evidence live in triage_map.json
-        // under "rescued_from_step1" (the detailed source of truth).
+        // v11 (General v15.1): DROP inherited stub/skip entries the keep gate
+        // (or a later promote pass) rescued to RECOMPILE. The TOML stays the
+        // executable safe subset; per-entry reasons/evidence live in
+        // triage_map.json under "rescued_from_step1".
         int rescuedStubLines=0, rescuedSkipLines=0;
         {
             boolean inS=false,inK=false;
@@ -7349,13 +9268,27 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
         List<String> stubLines=new ArrayList<>();
         if(!newStubs.isEmpty()){
-            stubLines.add("  # --- Triage Enricher v3 additions ---");
-            for(String s:newStubs)stubLines.add("  \""+s+"\",");
+            stubLines.add("  # --- Triage Enricher v9 additions ---");
+            for(String s:newStubs){
+                FuncResult r = byToken.get(s);
+                String comment = (r != null) ? prioritizeTagsForComment(r.tags, 4) : "";
+                if(!comment.isEmpty())
+                    stubLines.add("  \""+s+"\",  # "+comment);
+                else
+                    stubLines.add("  \""+s+"\",");
+            }
         }
         List<String> skipLines=new ArrayList<>();
         if(!newSkips.isEmpty()){
-            skipLines.add("  # --- Triage Enricher v3 additions ---");
-            for(String s:newSkips)skipLines.add("  \""+s+"\",");
+            skipLines.add("  # --- Triage Enricher v9 additions ---");
+            for(String s:newSkips){
+                FuncResult r = byToken.get(s);
+                String comment = (r != null) ? prioritizeTagsForComment(r.tags, 4) : "";
+                if(!comment.isEmpty())
+                    skipLines.add("  \""+s+"\",  # "+comment);
+                else
+                    skipLines.add("  \""+s+"\",");
+            }
         }
         if(skipClose>=0&&!skipLines.isEmpty()){
             lines.addAll(skipClose,skipLines);
@@ -7363,25 +9296,61 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
         if(stubsClose>=0&&!stubLines.isEmpty())lines.addAll(stubsClose,stubLines);
         lines.add(0,"# Unified config: "+step1Config.getName()+" + "+newStubs.size()+" stubs + "
-            +newSkips.size()+" skips (Enricher v15.5)");
+            +newSkips.size()+" skips (General Enricher v11)");
         lines.add(1,"# "+rescuedStubLines+" inherited stub + "+rescuedSkipLines
             +" inherited skip entries failed the high-confidence safety gate and were");
         lines.add(2,"# removed (now RECOMPILE). Per-entry reason/evidence: triage_map.json "
             +"\"rescued_from_step1\".");
-        // v15.3 Rule 154: surface ELF identity mismatch at the top of the config.
+        if(step1LockedKeptCount>0)
+            lines.add(3,"# v11.1: "+step1LockedKeptCount+" locked entries kept verbatim "
+                +"(# LOCKED / locked = [...] - keep gate bypassed).");
+        // v11 Rule 154: surface ELF identity mismatch at the top of the config.
         if("mismatch".equals(step1ElfHashStatus))
             lines.add(3,"# !! Rule 154: input toml elf_hash does NOT match this ELF - "
                 +"every surviving address binding is suspect. Regenerate the input toml.");
+        // v11.1: recompute stub_count/skip_count from ACTUAL array contents.
+        // The old `old + new - rescued` delta math compounded across
+        // re-entrant runs (each run re-adjusted an already-adjusted count).
+        int actualStubCount=0, actualSkipCount=0;
+        {
+            boolean inS=false,inK=false;
+            for(String l0 : lines){
+                String t=l0.trim();
+                if(t.startsWith("stubs")){inS=true;inK=false;continue;}
+                if(t.startsWith("skip")&&!t.startsWith("skip_count")){inK=true;inS=false;continue;}
+                if(t.equals("]")||t.startsWith("]")){inS=false;inK=false;continue;}
+                if(!(inS||inK)||!t.startsWith("\"")) continue;
+                if(inS)actualStubCount++;else actualSkipCount++;
+            }
+        }
+        // v11.1: embed this ELF's hash into [general] so the NEXT run gets
+        // the Rule 154 identity guard even on re-entrant input. Update an
+        // existing elf_hash line in place; otherwise insert after [general].
+        if(elfHashForEmit!=null && !elfHashForEmit.isEmpty()){
+            boolean hashSet=false;
+            for(int i=0;i<lines.size();i++){
+                if(lines.get(i).trim().startsWith("elf_hash")){
+                    lines.set(i,"elf_hash = \""+elfHashForEmit+"\"");
+                    hashSet=true;break;
+                }
+            }
+            if(!hashSet){
+                for(int i=0;i<lines.size();i++){
+                    if(lines.get(i).trim().equals("[general]")){
+                        lines.add(i+1,"elf_hash = \""+elfHashForEmit+"\"");
+                        break;
+                    }
+                }
+            }
+        }
         for(int i=0;i<lines.size();i++){
             String l=lines.get(i);
             if(l.startsWith("stub_count =")){
-                int old=Integer.parseInt(l.split("=")[1].trim());
-                lines.set(i,"stub_count = "+(old+newStubs.size()-rescuedStubLines));
+                lines.set(i,"stub_count = "+actualStubCount);
             } else if(l.startsWith("skip_count =")){
-                int old=Integer.parseInt(l.split("=")[1].trim());
-                lines.set(i,"skip_count = "+(old+newSkips.size()-rescuedSkipLines));
+                lines.set(i,"skip_count = "+actualSkipCount);
             } else if(l.startsWith("input =") || l.startsWith("output_file =") || l.startsWith("output =") || l.startsWith("ghidra_output =")) {
-                // [FIX v4] Sanitize hardcoded absolute paths to relative paths
+                // Sanitize hardcoded absolute paths to relative paths
                 int q1 = l.indexOf('"');
                 int q2 = l.lastIndexOf('"');
                 if (q1 >= 0 && q2 > q1) {
@@ -7391,200 +9360,291 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
         }
+        // v9 Rule 137 / v11 (General v15.2): the advisory block is built
+        // unconditionally (it also populates advisoryJsonLists for the JSON
+        // "triage_advisory" object - the detailed source of truth), but it is
+        // appended to the TOML only when EMIT_VERBOSE_TOML_ADVISORY is set.
+        // By default the TOML stays the executable safe subset: [general] /
+        // stubs / skip / [patches] + a short pointer comment.
+        List<String> advisory = buildTriageAdvisoryBlock(results);
         PrintWriter w=utf8Writer(outFile);
         for(String l:lines)w.println(l);
-        // v9 T1/T2: append nop / patch / force_recompile arrays.
-        // v11 (N): preserve trailing tag comments on each emitted entry so
-        // engineers can see WHY a function is in nop/patch/force_recompile
-        // without cross-referencing the JSON.
-        // v12 (G2): advisory arrays moved under [triage_advisory] so they no
-        // longer collide with the recompiler's documented schema (which only
-        // recognises stubs/skip/[patches]). Engineers consume these via the
-        // companion report tool; recompiler ignores unknown sections.
-        // v15.2: advisory block is OFF by default - the TOML is the executable
-        // safe subset; the full advisory content (with reasons/evidence) is
-        // emitted into triage_map.json "triage_advisory" instead. Flip
-        // EMIT_VERBOSE_TOML_ADVISORY for the legacy debug behaviour.
-        if(!EMIT_VERBOSE_TOML_ADVISORY) {
-            int advisoryTotal = nopList.size()+patchList.size()+forceRecompList.size()
-                +nativeImplList.size()+reviewList.size()+patchInstrCandidates.size();
+        if(EMIT_VERBOSE_TOML_ADVISORY) {
+            for(String l:advisory)w.println(l);
+        } else {
+            int advisoryTotal = 0;
+            for(List<String> v : advisoryJsonLists.values()) advisoryTotal += v.size();
+            advisoryTotal += advisoryPatchInstr.size();
             if(advisoryTotal > 0) {
                 w.println("");
-                w.println("# v15.2: "+advisoryTotal+" advisory entries (force_recompile / native_impl_needed /");
-                w.println("# review / nop / patch-instruction candidates) live in triage_map.json");
-                w.println("# \"triage_advisory\". Set EMIT_VERBOSE_TOML_ADVISORY=true to also emit them here.");
+                w.println("# v11: "+advisoryTotal+" advisory entries (force_recompile / must_implement /");
+                w.println("# native_impl_needed / review / nop / patch / Advisory lists / patch-instruction");
+                w.println("# candidates) live in triage_map.json \"triage_advisory\". Set");
+                w.println("# EMIT_VERBOSE_TOML_ADVISORY=true to also emit them here.");
             }
-            w.close();
-            return;
-        }
-        boolean anyAdvisory = !nopList.isEmpty() || !patchList.isEmpty() ||
-            !forceRecompList.isEmpty() || !nativeImplList.isEmpty() || !reviewList.isEmpty();
-        if(anyAdvisory) {
-            w.println("");
-            w.println("# v12 Enricher advisory block. Not consumed by ps2recomp.exe.");
-            w.println("# Engineer review surface for stub/patch/force-recompile candidates.");
-            w.println("[triage_advisory]");
-        }
-        if(!nopList.isEmpty()) {
-            w.println("# nop candidates - runtime can emit NO-OP body if confirmed.");
-            w.println("nop = [");
-            for(String e : nopList) {
-                int hash = e.indexOf(" # ");
-                String entry = hash<0 ? e : e.substring(0, hash);
-                String tail  = hash<0 ? ""  : e.substring(hash);
-                w.println("  \"" + entry + "\"," + tail);
-            }
-            w.println("]");
-        }
-        if(!patchList.isEmpty()) {
-            w.println("");
-            w.println("# patch candidates - single-instr convention fix needed.");
-            w.println("patch = [");
-            for(String e : patchList) {
-                int hash = e.indexOf(" # ");
-                String entry = hash<0 ? e : e.substring(0, hash);
-                String tail  = hash<0 ? ""  : e.substring(hash);
-                w.println("  \"" + entry + "\"," + tail);
-            }
-            w.println("]");
-        }
-        if(!forceRecompList.isEmpty()) {
-            w.println("");
-            w.println("# force_recompile - these MUST run real game logic.");
-            w.println("# (must_be_implemented / top_priority / VU0 / render driver / etc.)");
-            w.println("force_recompile = [");
-            for(String e : forceRecompList) {
-                int hash = e.indexOf(" # ");
-                String entry = hash<0 ? e : e.substring(0, hash);
-                String tail  = hash<0 ? ""  : e.substring(hash);
-                w.println("  \"" + entry + "\"," + tail);
-            }
-            w.println("]");
-        }
-        // v14: native_impl_needed - runtime must provide host-side behaviour.
-        if(!nativeImplList.isEmpty()) {
-            w.println("");
-            w.println("# native_impl_needed - IOP-side subsystems behind these functions");
-            w.println("# (IRX module loads, SIF RPC services, audio/pad/mc gateways) need a");
-            w.println("# native runtime implementation. A stub here boots but the subsystem");
-            w.println("# stays dead until the runtime services it.");
-            w.println("native_impl_needed = [");
-            for(String e : nativeImplList) {
-                int hash = e.indexOf(" # ");
-                String entry = hash<0 ? e : e.substring(0, hash);
-                String tail  = hash<0 ? ""  : e.substring(hash);
-                w.println("  \"" + entry + "\"," + tail);
-            }
-            w.println("]");
-        }
-        // v14: review - enricher overrode/refused a binding decision.
-        if(!reviewList.isEmpty()) {
-            w.println("");
-            w.println("# review - firewall-rescued stub/skip entries and mixed IRX-init");
-            w.println("# functions. Human should confirm the enricher's override was right.");
-            w.println("review = [");
-            for(String e : reviewList) {
-                int hash = e.indexOf(" # ");
-                String entry = hash<0 ? e : e.substring(0, hash);
-                String tail  = hash<0 ? ""  : e.substring(hash);
-                w.println("  \"" + entry + "\"," + tail);
-            }
-            w.println("]");
-        }
-        // v12 (G1): candidate [patches.instructions] entries derived from
-        // INFINITE_FAIL_LOOP / INFINITE_SPIN_LOOP / BACKWARD_BRANCH_SYNC_WAIT
-        // backward-branch PCs. Emitted COMMENTED-OUT so engineers must opt in
-        // before nopping a backward branch. patchInstrCandidates entries are
-        // [pc, funcAddr, reasonTagBitmask]; we only know pc+func here.
-        if(!patchInstrCandidates.isEmpty()) {
-            w.println("");
-            w.println("# v12 Enricher: candidate patches.instructions entries for spin/wait loops.");
-            w.println("# Each entry NOPs the backward branch PC of a detected hazard. UNCOMMENT TO ENABLE.");
-            w.println("# [patches]");
-            w.println("# instructions = [");
-            int emitted = 0;
-            for(long[] c : patchInstrCandidates) {
-                long pc = c[0] & 0xFFFFFFFFL;
-                long funcAddr = c[1] & 0xFFFFFFFFL;
-                String reason = c.length>=3 ? humanizeReasonMask(c[2]) : "spin/wait";
-                w.println(String.format("#   { address = \"0x%08X\", value = \"0x00000000\" }, # %s in func@0x%08X",
-                    pc, reason, funcAddr));
-                if(++emitted >= 256) {
-                    w.println("#   # ... ("+(patchInstrCandidates.size()-emitted)+" more truncated)");
-                    break;
-                }
-            }
-            w.println("# ]");
         }
         w.close();
     }
 
-    // v12 (K): TOML tag-comment priority ranking. Higher rank = more actionable.
-    private static final Map<String,Integer> TAG_PRIORITY = new HashMap<>();
-    static {
-        int[] r = {0};
-        String[] order = {
-            "TOP_PRIORITY_FIX","RUNTIME_CONFIRMED",
-            // v15.3: input-hygiene + handler-roster tags rank just below the
-            // render bullseyes - they mark wrong bindings, not wrong code.
-            "NO_RUNTIME_HANDLER","STEP1_NAME_MISMATCH","OVERLAY_REGION",
-            "OUT_OF_TEXT_BINDING",
-            "BITBLTBUF_T4HH_UPLOADER",
-            "MUST_BE_IMPLEMENTED","SCEVU0_HELPER_MUSTIMPL","VU0_MACRO_HELPER",
-            // Rules 140-150: high-confidence firewall tags
-            "COP2_DESTMASK_VERIFY","MEMORY_ALLOCATOR_NEVER_STUB",
-            "STATIC_INIT_VTABLE_INSTALLER","UNCALLED_STATIC_INIT",
-            "COP2_SPECIAL_OPS_REVIEW","MAP_CLUT_PSMCT16_UPLOADER",
-            "COMPUTED_JUMP_UNRESOLVED","FPU_NONIEEE_SENSITIVE",
-            "GUEST_LOCK_HOG_CANDIDATE","EABI_ARG_T0","OVERLAY_LOADER",
-            "HOST_WAIT_CANDIDATE",
-            "RENDER_FRAME_ENTRY","PATH3_INITIATOR","PATH3_KICK_VIA_DMA_API",
-            "DISPFB_WRITER","DISPFB_SDK_WRITER","CTOR_MULTI_FIELD_INITIALIZER",
-            "CTOR_RISK_CRITICAL","CTOR_RISK_HIGH","INIT_LARGE_FUNC",
-            "DMA_CHCR_START_KICK","GIF_TAG_INLINE_BUILDER","BITBLTBUF_MACRO_SEQUENCE",
-            "VIF_MPG_OPCODE_BUILDER","VIF_MSCAL_OPCODE_BUILDER","VIF_DIRECT_OPCODE_BUILDER",
-            "VIF_OPCODE_BUILDER","DMA_TAG_BUILDER","DMA_SOURCE_CHAIN_TAG_BUILDER",
-            "VIF_TAG_STORED_IMMEDIATE","DMA_TAG_STORED_IMMEDIATE","BUILDS_GIF_TAG_64",
-            "DYNAMIC_CODE_LOADER","SYSCALL_TRAMPOLINE",
-            "DISCOVERED_IOP_SID","ARCHIVE_IO","IRX_LOADER","IOP_RPC_DISPATCH",
-            "FRAME_CLOCK_DRIVER","DRAWING_CHAIN_NEAR_ROOT","WRITES_BITBLTBUF_REG",
-            "ACCESSES_VU_MICROMEM","ACCESSES_VU_DATAMEM",
-            "ACCESSES_MMIO","COMPLEX_CONTROL_FLOW","INFINITE_FAIL_LOOP",
-            "INFINITE_SPIN_LOOP","BACKWARD_BRANCH_SYNC_WAIT","BUSY_WAIT_HAZARD",
-            "VU0_MICROCODE","WRITES_GLOBAL","SAFE_LEAF","ORPHAN_CODE"
-        };
-        for(String s : order) TAG_PRIORITY.put(s, 1000 - r[0]++);
-    }
-    private static List<String> prioritizeTagsForComment(List<String> tags, int limit) {
-        List<String> sorted = new ArrayList<>(tags);
-        sorted.sort((a, b) -> {
-            int pa = TAG_PRIORITY.getOrDefault(a, 0);
-            int pb = TAG_PRIORITY.getOrDefault(b, 0);
-            return Integer.compare(pb, pa);
-        });
-        return sorted.subList(0, Math.min(limit, sorted.size()));
+    // v9 Rule 137: build [triage_advisory] appendix lines.
+    private List<String> buildTriageAdvisoryBlock(List<FuncResult> results) {
+        List<String> out = new ArrayList<>();
+        List<String> nopList = new ArrayList<>();
+        List<String> patchList = new ArrayList<>();
+        List<String> forceRecompileList = new ArrayList<>();
+        List<String> mustImplementList = new ArrayList<>();
+        List<String> blockersList = new ArrayList<>();
+        List<String> hostWaitList = new ArrayList<>();
+        List<String> bullseyeUploadList = new ArrayList<>();
+        List<String> patchCandidateLines = new ArrayList<>();
+        // v10 advisory lists
+        List<String> cop2DestmaskList = new ArrayList<>();
+        List<String> memoryAllocatorList = new ArrayList<>();
+        List<String> staticInitRepairList = new ArrayList<>();
+        List<String> guestLockHogList = new ArrayList<>();
+        // v10.1 advisory lists
+        List<String> cop2SpecialList = new ArrayList<>();
+        List<String> computedJumpUnresolvedList = new ArrayList<>();
+        // v11 (General v14) advisory lists
+        List<String> nativeImplList = new ArrayList<>();
+        List<String> reviewList = new ArrayList<>();
+        advisoryJsonLists.clear();
+        advisoryPatchInstr.clear();
+        for(FuncResult r : results) {
+            if(r.traits == null) continue;
+            // v11 (General v15): override-bound functions already have a
+            // hand-written handler - never emit them into advisory arrays.
+            if("OVERRIDE".equals(r.disposition)) continue;
+            FuncTraits t = r.traits;
+            String token = r.name + "@" + hex(r.address);
+            String tagCmt = prioritizeTagsForComment(r.tags, 4);
+            String suffix = tagCmt.isEmpty() ? "" : "  # " + tagCmt;
+            // v11 (General v13): never emit a function into the advisory
+            // force_recompile list while it sits in the binding stubs/skip
+            // arrays. The binding firewall already rescued everything with
+            // hard evidence; what remains stubbed (e.g. pure IRX-loader
+            // shapes) must not be contradicted one section lower in the same
+            // TOML.
+            boolean boundToStubOrSkip = "STUB".equals(r.disposition) || "SKIP".equals(r.disposition);
+            // nop = libgcc/process-terminator that's currently STUB and provably side-effect-free
+            if(t.isLibgccIntrinsic && "STUB".equals(r.disposition))
+                nopList.add("  \""+token+"\","+suffix);
+            // patch = small functions with $a1 buffer convention violation
+            if(t.writesToA1Buffer && t.byteSize < 80)
+                patchList.add("  \""+token+"\","+suffix);
+            // force_recompile = bullseyes / critical ctors / lifecycle guards / BLOCKERs
+            boolean fr = t.isBitbltbufT4hhUploader || t.isCtorMultiFieldInit ||
+                         t.isLifecycleLazyInit || t.ctorWritesVTablePointer ||
+                         t.isRenderFrameEntry || t.bitbltbufMacroSequence ||
+                         t.isSceGifPkRefLoadImage || t.isTopPriorityFix ||
+                         "BLOCKER".equals(t.knownCriticality);
+            if(fr && !boundToStubOrSkip) forceRecompileList.add("  \""+token+"\","+suffix);
+            // v11 (General v14): native_impl_needed collection. Two ways in:
+            //  (a) bound stub/skip whose traits show it fronted an IOP-side
+            //      subsystem (IRX loader string, SIF RPC, audio RPC) - the
+            //      stub is intentional but the subsystem now needs a host
+            //      implementation;
+            //  (b) recompiled RPC binder/IRX loader - the EE side will run,
+            //      but only works if the runtime services its RPC SIDs /
+            //      module loads natively.
+            boolean rpcGateway = t.callsSifRpc ||
+                    t.detectedRpcSid != 0 || !t.discoveredRpcSids.isEmpty();
+            boolean iopSubsystemFront = t.refsIopModuleString ||
+                    t.isIrxLoader || t.sifLoadModuleCallCount >= 1 ||
+                    t.isAudioRpcHandler || t.isIopRebootHandler;
+            boolean noHandlerStub = r.tags.contains("NO_RUNTIME_HANDLER");
+            if((boundToStubOrSkip && (iopSubsystemFront || rpcGateway || noHandlerStub)) ||
+               (!boundToStubOrSkip && (t.isIrxLoader ||
+                    t.detectedRpcSid != 0 || !t.discoveredRpcSids.isEmpty()))) {
+                nativeImplList.add("  \""+token+"\","+suffix);
+            }
+            // v11 (General v14/v15): review collection - firewall rescues,
+            // mixed IRX-init shapes, step1 rescues, handler-less stubs,
+            // out-of-text bindings, kept-but-address-taken bindings.
+            boolean pureLoaderShape = t.refsIopModuleString &&
+                    t.byteSize <= 200 && t.calleeCount <= 4 &&
+                    !t.accessesMMIO && !t.writesIntcMask &&
+                    t.dmaKickChannels.isEmpty();
+            boolean mixedIrxInit = t.refsIopModuleString && !pureLoaderShape;
+            if(r.tags.contains("BINDING_FIREWALL_RESCUED") || mixedIrxInit ||
+               r.tags.contains("STEP1_RESCUED") ||
+               r.tags.contains("NO_RUNTIME_HANDLER") ||
+               r.tags.contains("OUT_OF_TEXT_BINDING") ||
+               r.tags.contains("ADDRESS_TAKEN_CALLBACK")) {
+                reviewList.add("  \""+token+"\","+suffix);
+            }
+            // must_implement = sceVu0 helpers + HIGH criticality
+            if(t.isSceVu0Helper ||
+               "HIGH".equals(t.knownCriticality) || "BLOCKER".equals(t.knownCriticality))
+                mustImplementList.add("  \""+token+"\","+suffix);
+            // game_blockers
+            if("BLOCKER".equals(t.knownCriticality))
+                blockersList.add("  \""+token+"\","+suffix);
+            // game_host_wait
+            if(t.hostWaitCandidate)
+                hostWaitList.add("  \""+token+"\","+suffix);
+            // bullseye_upload — functions matching expected_uploads dpsm + dbp
+            if(!t.assetUploadTagsHit.isEmpty())
+                bullseyeUploadList.add("  \""+token+"\","+suffix);
+            // v10 advisory categories
+            if(t.cop2DestMaskVerify)
+                cop2DestmaskList.add("  \""+token+"\","+suffix);
+            if(t.isMemoryAllocator)
+                memoryAllocatorList.add("  \""+token+"\","+suffix);
+            if(t.isStaticInitializer && t.staticInitInstallsVtable)
+                staticInitRepairList.add("  \""+token+"\","+suffix);
+            if(t.isGuestLockHogCandidate)
+                guestLockHogList.add("  \""+token+"\","+suffix);
+            // v10.1
+            if(!t.cop2SpecialOps.isEmpty())
+                cop2SpecialList.add("  \""+token+"\","+suffix);
+            if(!t.computedJumpSwitchPcs.isEmpty()){
+                java.util.Set<Long> resolved = new java.util.HashSet<>();
+                for(long[] e : t.computedJumpTargets) resolved.add(e[0]);
+                boolean anyUnres=false;
+                for(Long pc : t.computedJumpSwitchPcs) if(!resolved.contains(pc)){anyUnres=true;break;}
+                if(anyUnres) computedJumpUnresolvedList.add("  \""+token+"\","+suffix);
+            }
+            // patch instruction candidates for backward branches
+            for(Long pc : t.patchCandidatePcs) {
+                if(patchCandidateLines.size() >= 256) break;
+                String reason = t.isSyncWaitLoop ? "BACKWARD_BRANCH_SYNC_WAIT" :
+                                t.containsInfiniteFailLoop ? "INFINITE_FAIL_LOOP" :
+                                t.isInfiniteSpinLoop ? "INFINITE_SPIN_LOOP" :
+                                "BACKWARD_BRANCH";
+                patchCandidateLines.add(String.format(
+                    "  {address = \"0x%08X\", value = \"0x00000000\"},  # %s in %s",
+                    pc & 0xFFFFFFFFL, reason, token));
+                // v11: structured copy for the JSON triage_advisory object.
+                advisoryPatchInstr.add(new String[]{
+                    String.format("0x%08X", pc & 0xFFFFFFFFL), reason, token});
+            }
+        }
+        // v11: stash raw copies of every advisory list for the JSON
+        // "triage_advisory" object (TOML stays executable-only by default).
+        advisoryJsonLists.put("nop",                       rawAdvisoryEntries(nopList));
+        advisoryJsonLists.put("patch",                     rawAdvisoryEntries(patchList));
+        advisoryJsonLists.put("force_recompile",           rawAdvisoryEntries(forceRecompileList));
+        advisoryJsonLists.put("must_implement",            rawAdvisoryEntries(mustImplementList));
+        advisoryJsonLists.put("native_impl_needed",        rawAdvisoryEntries(nativeImplList));
+        advisoryJsonLists.put("review",                    rawAdvisoryEntries(reviewList));
+        advisoryJsonLists.put("blockers",              rawAdvisoryEntries(blockersList));
+        advisoryJsonLists.put("host_wait",             rawAdvisoryEntries(hostWaitList));
+        advisoryJsonLists.put("bullseye_upload",           rawAdvisoryEntries(bullseyeUploadList));
+        advisoryJsonLists.put("cop2_destmask_verify",      rawAdvisoryEntries(cop2DestmaskList));
+        advisoryJsonLists.put("memory_allocator_never_stub", rawAdvisoryEntries(memoryAllocatorList));
+        advisoryJsonLists.put("static_init_vtable_repair", rawAdvisoryEntries(staticInitRepairList));
+        advisoryJsonLists.put("guest_lock_hog_candidate",  rawAdvisoryEntries(guestLockHogList));
+        advisoryJsonLists.put("cop2_special_ops_review",   rawAdvisoryEntries(cop2SpecialList));
+        advisoryJsonLists.put("computed_jump_unresolved",  rawAdvisoryEntries(computedJumpUnresolvedList));
+        out.add("");
+        out.add("# ============================================================");
+        out.add("# [triage_advisory] - Enricher v9 (the game). Hints only.");
+        out.add("# ps2recomp.exe ignores this section. Consumed by report tool.");
+        out.add("# Each line: \"name@0xADDR\",  # TOP_TAG,NEXT_TAG,...");
+        out.add("# ============================================================");
+        out.add("[triage_advisory]");
+        emitTomlList(out, "nop",                  nopList);
+        emitTomlList(out, "patch",                patchList);
+        emitTomlList(out, "force_recompile",      forceRecompileList);
+        emitTomlList(out, "must_implement",       mustImplementList);
+        // v11 (General v14)
+        emitTomlList(out, "native_impl_needed",   nativeImplList);
+        emitTomlList(out, "review",               reviewList);
+        emitTomlList(out, "blockers",         blockersList);
+        emitTomlList(out, "host_wait",        hostWaitList);
+        emitTomlList(out, "bullseye_upload",      bullseyeUploadList);
+        // v10: F47-F52 advisory categories.
+        emitTomlList(out, "cop2_destmask_verify", cop2DestmaskList);
+        emitTomlList(out, "memory_allocator_never_stub", memoryAllocatorList);
+        emitTomlList(out, "static_init_vtable_repair", staticInitRepairList);
+        emitTomlList(out, "guest_lock_hog_candidate", guestLockHogList);
+        // v10.1: PCSX2-/skill-grounded advisory categories.
+        emitTomlList(out, "cop2_special_ops_review", cop2SpecialList);
+        emitTomlList(out, "computed_jump_unresolved", computedJumpUnresolvedList);
+        // Commented patches block — humans uncomment manually after verifying.
+        out.add("");
+        out.add("# [patches]");
+        out.add("# instructions = [");
+        for(String l : patchCandidateLines) out.add("#" + l);
+        out.add("# ]");
+        return out;
     }
 
-    /** Helper: map low-bit-set flags to a comma-joined reason label. */
-    private String humanizeReasonMask(long mask) {
-        StringBuilder sb = new StringBuilder();
-        if((mask & 0x1L) != 0) sb.append("INFINITE_FAIL_LOOP,");
-        if((mask & 0x2L) != 0) sb.append("INFINITE_SPIN_LOOP,");
-        if((mask & 0x4L) != 0) sb.append("BACKWARD_BRANCH_SYNC_WAIT,");
-        if((mask & 0x8L) != 0) sb.append("BUSY_WAIT_HAZARD,");
-        if(sb.length() == 0) return "spin/wait";
-        sb.setLength(sb.length()-1);
-        return sb.toString();
+    // v10.1: emit a JSON `"name": [ <pre-rendered entries> ]` member inside an
+    // object. Entries already carry their own indentation.
+    private void emitJsonObjArray(PrintWriter w, String name, List<String> entries, boolean trailingComma) {
+        w.println("    \""+name+"\": [");
+        for(int i=0;i<entries.size();i++)
+            w.println(entries.get(i) + (i<entries.size()-1 ? "," : ""));
+        w.println("    ]" + (trailingComma ? "," : ""));
+    }
+
+    private void emitTomlList(List<String> out, String name, List<String> entries) {
+        out.add("");
+        out.add(name + " = [");
+        for(String e : entries) out.add(e);
+        out.add("]");
+    }
+
+    /** v11: convert pre-rendered TOML advisory lines (`  "name@0xADDR",  # T1,T2`)
+     *  back to raw `name@0xADDR # T1,T2` entries for the JSON writer. */
+    private static List<String> rawAdvisoryEntries(List<String> tomlLines) {
+        List<String> out = new ArrayList<>();
+        for(String l : tomlLines) {
+            String t = l.trim();
+            if(!t.startsWith("\"")) continue;
+            int q2 = t.indexOf('"', 1);
+            if(q2 < 0) continue;
+            String entry = t.substring(1, q2);
+            int hash = t.indexOf('#', q2);
+            String tags = hash >= 0 ? t.substring(hash+1).trim() : "";
+            out.add(tags.isEmpty() ? entry : entry + " # " + tags);
+        }
+        return out;
+    }
+
+    // v8 Rule 109: cheap line-scanning reader. Extracts {address: "disposition|category"}
+    // pairs from a prior triage_map.json without bringing in a JSON dependency.
+    private Map<Long,String> loadPriorTriageMapCats(File f) throws IOException {
+        Map<Long,String> out = new HashMap<>();
+        BufferedReader r = utf8Reader(f);
+        String line;
+        while((line = r.readLine()) != null) {
+            int aIdx = line.indexOf("\"address\":");
+            int cIdx = line.indexOf("\"category\":");
+            int dIdx = line.indexOf("\"disposition\":");
+            if(aIdx < 0 || (cIdx < 0 && dIdx < 0)) continue;
+            int q1 = line.indexOf('"', aIdx + 10);
+            int q2 = line.indexOf('"', q1 + 1);
+            if(q1 < 0 || q2 <= q1) continue;
+            long addr;
+            try { addr = Long.parseLong(line.substring(q1+1, q2).replace("0x",""), 16); }
+            catch(NumberFormatException ex) { continue; }
+            String cat = "?", disp = "?";
+            if(cIdx >= 0) {
+                int c1 = line.indexOf('"', cIdx + 11); int c2 = line.indexOf('"', c1 + 1);
+                if(c1 >= 0 && c2 > c1) cat = line.substring(c1+1, c2);
+            }
+            if(dIdx >= 0) {
+                int d1 = line.indexOf('"', dIdx + 14); int d2 = line.indexOf('"', d1 + 1);
+                if(d1 >= 0 && d2 > d1) disp = line.substring(d1+1, d2);
+            }
+            out.put(addr & 0xFFFFFFFFL, disp + "|" + cat);
+        }
+        r.close();
+        return out;
     }
 
     // =========================================================
     // JSON OUTPUT - v3 extended with new fields
     // =========================================================
-    /** v15.5: GS-side static evidence gate for Rule 78 TBP constants. */
+    /** v11 (General v15.5 Bugfix U): GS-side static evidence gate for the
+     *  Rule 78 TBP constant list. */
     private static boolean hasGsSideEvidence(FuncTraits t) {
         return t.writesTex0Reg || t.writesBitbltbufReg || t.writesRgbaqReg
             || t.writesZbufReg || t.writesDispfbReg || t.writesDispfbViaSdk
-            || t.writesGsPrimReg || t.gifTagInlineBuilder || t.buildsGifTag64
+            || t.writesGsPrimReg || t.gifTagInlineBuilder
             || t.bitbltbufMacroSequence || t.isMicrocodeUploader
             || t.path3Initiator || t.path3KickViaDmaApi || t.touchesGifCtrl
             || t.touchesGifP3Reg || t.writesGifFifo || t.writesVif1Fifo
@@ -7593,14 +9653,448 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             || t.dmaChcrStartKick;
     }
 
+    // v14: filename-safe slug for a function name.
+    private static String slug(String s) {
+        if(s == null || s.isEmpty()) return "anon";
+        StringBuilder b = new StringBuilder(s.length());
+        for(int i=0;i<s.length() && b.length()<80;i++){
+            char c = s.charAt(i);
+            b.append((Character.isLetterOrDigit(c)||c=='.'||c=='_'||c=='-') ? c : '_');
+        }
+        return b.length()==0 ? "anon" : b.toString();
+    }
+    // v14.1: stable grep token - keep symbol chars, collapse the rest to '_'.
+    private static String tok(String s) {
+        if(s == null || s.isEmpty()) return "anon";
+        StringBuilder b = new StringBuilder(s.length());
+        for(int i=0;i<s.length();i++){
+            char c = s.charAt(i);
+            b.append((Character.isLetterOrDigit(c)||c=='_'||c=='.'||c=='$') ? c : '_');
+        }
+        return b.toString();
+    }
+    // v14.1: derived per-function Markdown filename (matches writeFunctionDocs).
+    private static String mdNameFor(long addr, String name) {
+        String f = (name==null||name.isEmpty()) ? ("sub_"+hex(addr)) : name;
+        return hex(addr)+"_"+slug(f)+".md";
+    }
+    // v14: append "- LABEL\n" for each true boolean signal (compact, readable).
+    private static void sig(StringBuilder b, boolean on, String label) {
+        if(on) b.append("- ").append(label).append('\n');
+    }
+    private static void sigList(StringBuilder b, Collection<String> c, String label) {
+        if(c != null && !c.isEmpty()) b.append("- ").append(label).append(": `")
+            .append(String.join("`, `", c)).append("`\n");
+    }
+
+    // v14: per-function Markdown docs. One functions/<addr>_<name>.md per ELF
+    // function, with the full triage signal set + assembly + decompiled C +
+    // control-flow, for an AI working on the recompilation.
+    private void writeFunctionDocs(File functionsDir, List<FuncResult> results,
+                                   String elfHash, long gpValue) throws IOException {
+        Map<Long,String> nameByAddr = new HashMap<>();
+        Map<String,Long> nameToAddr = new HashMap<>();
+        for(FuncResult r : results) {
+            nameByAddr.put(r.address & 0xFFFFFFFFL, r.name);
+            if(r.name != null && !r.name.isEmpty()) nameToAddr.putIfAbsent(r.name, r.address & 0xFFFFFFFFL);
+        }
+        String exportTs  = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date());
+        String exportVer = "General enricher v15.2 (schema 14.2)";
+        int n = 0;
+        for(FuncResult r : results) {
+            if(monitor.isCancelled()) break;
+            FuncTraits t = r.traits;
+            AiRec rec = buildFunctionRecommendation(r);
+            String fname = (r.name==null||r.name.isEmpty()) ? ("sub_"+hex(r.address)) : r.name;
+            File md = new File(functionsDir, hex(r.address)+"_"+slug(fname)+".md");
+            try (PrintWriter w = utf8Writer(md)) {
+                w.println("# "+fname);
+                w.println();
+                w.println("`"+hex(r.address)+"` · **"+r.category+"** · disposition **"+r.disposition
+                    +"** · origin `"+r.origin+"`");
+                w.println();
+                // --- Export metadata (stale-export protection) ---
+                w.println("> schema_version `14.2` · elf_hash `"+elfHash+"` · global_pointer `"+hex(gpValue)
+                    +"` · exported `"+exportTs+"` · enricher `"+exportVer+"`");
+                w.println(">");
+                w.println("> _If elf_hash / global_pointer differ from the current ELF, this doc is stale — re-run the enricher._");
+                w.println();
+                // --- Summary table ---
+                w.println("## Summary");
+                w.println();
+                w.println("| field | value |");
+                w.println("|---|---|");
+                w.println("| address | `"+hex(r.address)+"` |");
+                w.println("| name | `"+fname+"` |");
+                w.println("| category | "+r.category+" |");
+                w.println("| disposition | "+r.disposition+(r.rescueReason!=null?(" (rescued: "+r.rescueReason+")"):"")+" |");
+                w.println("| origin | "+r.origin+(r.step1Disposition!=null?(" / step1="+r.step1Disposition):"")+" |");
+                if(t != null) {
+                    w.println("| size (bytes) | "+t.byteSize+" |");
+                    w.println("| mainloop_depth | "+t.mainLoopDepth+" |");
+                    w.println("| init_chain_depth | "+t.initChainDepth+" |");
+                    w.println("| drawing_chain_depth | "+t.drawingChainDepth+" |");
+                    w.println("| module_id | "+t.moduleId+" |");
+                    if(t.knownRole!=null)
+                        w.println("| game_known_role | "+t.knownRole+" ("+t.knownPhase+", "+t.knownCriticality+") |");
+                }
+                w.println("| subsystem (AI) | "+rec.subsystem+" |");
+                w.println("| role (AI) | "+rec.role+" |");
+                w.println();
+                // --- AI recommendation ---
+                w.println("## Recommendation (AI)");
+                w.println();
+                w.println("- **action**: "+rec.action+"  (confidence "+rec.confidence+", risk "+rec.risk+")");
+                if(rec.reason!=null && !rec.reason.isEmpty())          w.println("- **reason**: "+rec.reason);
+                if(rec.suggestedNextStep!=null && !rec.suggestedNextStep.isEmpty()) w.println("- **next step**: "+rec.suggestedNextStep);
+                if(rec.riskIfStubbed!=null && !rec.riskIfStubbed.isEmpty())     w.println("- **risk if stubbed**: "+rec.riskIfStubbed);
+                if(rec.riskIfRecompiled!=null && !rec.riskIfRecompiled.isEmpty()) w.println("- **risk if recompiled**: "+rec.riskIfRecompiled);
+                if(rec.gateway) w.println("- **gateway function** (subsystem entry point)");
+                w.println();
+                // --- Tags ---
+                w.println("## Tags");
+                w.println();
+                if(r.tags.isEmpty()) w.println("_(none)_");
+                else { StringBuilder tb=new StringBuilder(); for(String tg:r.tags) tb.append("`").append(tg).append("` "); w.println(tb.toString().trim()); }
+                w.println();
+                // --- Signals (every true trait / non-empty list) ---
+                if(t != null) {
+                    StringBuilder s = new StringBuilder();
+                    sig(s,t.usesCop1,"uses COP1 (FPU)"); sig(s,t.usesCop2,"uses COP2 / VU0 macro");
+                    sig(s,t.usesSPR,"uses scratchpad (SPR)"); sig(s,t.writesToGlobal,"writes a global");
+                    sig(s,t.hasVcallms,"VU0 microcode (vcallms)"); sig(s,t.hasJumpTable,"jump table");
+                    sig(s,t.accessesMMIO,"accesses MMIO"); sig(s,t.accessesVif1MMIO,"VIF1 MMIO");
+                    sig(s,t.callsDmaSend,"calls DMA send"); sig(s,t.callsSifRpc,"SIF RPC");
+                    sig(s,t.hasBackwardBranch,"backward branch (loop)"); sig(s,t.hasSyscall,"syscall");
+                    sig(s,t.isLargeInitFunc,"large init func"); sig(s,t.isMemoryAllocator,"memory allocator ("+t.allocatorKind+")");
+                    sig(s,t.isCtor,"C++ ctor ("+t.ctorClassName+")"); sig(s,t.isDtor,"C++ dtor");
+                    sig(s,t.ctorInstallsVtable,"installs vtable @"+hex(t.ctorVtableAddr));
+                    sig(s,t.isStaticInitializer,"__sinit static initializer"); sig(s,t.isUncalledStaticInit,"UNCALLED __sinit (init-order risk)");
+                    sig(s,t.staticInitInstallsVtable,"sinit installs vtable");
+                    sig(s,t.isProcessTerminator,"process terminator"); sig(s,t.isLibgccIntrinsic,"libgcc intrinsic");
+                    sig(s,t.readsEabiArgT0,"reads EABI 5th arg in $t0");
+                    sig(s,t.writesFrameReg,"writes GS FRAME"); sig(s,t.writesZbufReg,"writes GS ZBUF");
+                    sig(s,t.writesTex0Reg,"writes GS TEX0"); sig(s,t.writesBitbltbufReg,"writes BITBLTBUF");
+                    sig(s,t.writesDispfbReg,"writes DISPFB"); sig(s,t.writesRgbaqReg,"writes RGBAQ");
+                    sig(s,t.isRttTarget,"RTT_TARGET (renders to a texture page)");
+                    sig(s,t.zbufVramAliasRisk,"ZBUF aliases live VRAM"); sig(s,t.isVf0DependentInverse,"vf0-dependent matrix inverse");
+                    sig(s,t.cop2DestMaskVerify,"COP2 partial-dest (verify lane order, F51.8)");
+                    sig(s,t.isAudioCompletionGate,"audio/stream completion gate"); sig(s,t.isMemcardIo,"memcard I/O");
+                    sig(s,t.writesPresentationFieldState,"interlace/field GS reg"); sig(s,t.isDisplayBufferFlip,"display-buffer flip");
+                    sig(s,t.isClutCacheInvalidator,"CLUT cache invalidator / TEXFLUSH"); sig(s,t.isPerfHotFramePath,"perf-hot frame path");
+                    sig(s,t.programsSprDma,"programs fromSPR/toSPR DMA"); sig(s,t.subwordDmaStrKick,"sub-word DMA STR kick");
+                    // v13
+                    sig(s,t.isConditionalInitOnGlobal,"CONDITIONAL_INIT_ON_GLOBAL (init-order gap, G58/G81)");
+                    sig(s,t.isRenderModeSelector,"RENDER_MODE_SELECTOR (copy vs transform, G75-G80)");
+                    sig(s,t.isVertexLightingTerm,"VERTEX_LIGHTING_NORMAL_TERM (N·L / shade, G82)");
+                    sig(s,t.isVtableTailcallThunk,"VTABLE_TAILCALL_THUNK (G59 recompiler dispatch)");
+                    sig(s,t.isRttNoRestore,"RTT_NO_RESTORE (GS-state leak, G79)");
+                    sig(s,t.isVuFlagPipelineUploader,"VU_FLAG_PIPELINE_UPLOADER (G71)");
+                    sig(s,t.isPackedRgbaqBuilder,"PACKED_RGBAQ_BUILDER (spread layout, G82)");
+                    sig(s,t.isFrameResumeRisk,"FRAME_RESUME_RISK (mid-body resume, G58/G59)");
+                    // v15
+                    sig(s,t.isPrimClassSelector,"GIFTAG_PRIM_CLASS_SELECTOR (qword38 PRIM route, G77-G115)");
+                    sig(s,t.isAdcKickVertexSource,"ADC_KICK_VERTEX_SOURCE ("+(t.adcSource==null?"":t.adcSource)+", G65-G115)");
+                    sig(s,t.isKickModeWriter,"XYZ2_VS_XYZ3_KICK_WRITER (per-vertex draw-kick)");
+                    sig(s,t.isTextureReloadInterleave,"TEXTURE_RELOAD_INTERLEAVE_HAZARD (G90-G97)");
+                    sig(s,t.isVsyncCoupledGameStep,"VSYNC_COUPLED_GAME_STEP (perf, G103)");
+                    sig(s,t.isViewProjectionMatrixWriter,"VIEW_PROJECTION_MATRIX_WRITER (shared camera, G98/G99)");
+                    sig(s,t.isObjectArrayCtor,"OBJECT_ARRAY_CTOR (per-element vtables, G92)");
+                    sigList(s,new ArrayList<>(t.vuExecHazards),"VU exec hazards (manifest)");
+                    // v15.1 (PCSX2-grounded)
+                    sig(s,t.isVifUnpackDecompressState,"VIF_UNPACK_DECOMPRESS_STATE (STMOD/STMASK/STROW/STCOL)");
+                    sig(s,t.isXyoffsetGuardWriter,"GS_XYOFFSET_GUARD_BAND (guard-band centre, G88)");
+                    sig(s,t.isTex1FilterWriter,"GS_TEX1_FILTER_WRITER (MMAG/MMIN, G8)");
+                    sigList(s,new ArrayList<>(t.vifUnpackStateCmds),"VIF unpack state cmds");
+                    // v15.2 (skill codegen classes)
+                    sig(s,t.usesMmi,"MMI_SIMD_OP ("+t.mmiOpCount+" ops — verify recompiler lane/pack codegen)");
+                    sig(s,t.usesCop2ControlReg,"COP2_CONTROL_REG_ACCESS (CFC2/CTC2 — verify control-reg map)");
+                    sigList(s,new ArrayList<>(t.mmiFamilies),"MMI families");
+                    sigList(s,new ArrayList<>(t.cop2ControlRegs),"COP2 control regs");
+                    sigList(s,t.guardGlobals,"guard globals");
+                    sigList(s,t.lightingSources,"lighting sources");
+                    sigList(s,t.cop2SpecialOps,"COP2 special ops");
+                    sigList(s,t.globalsTouched,"Known globals touched");
+                    sigList(s,new ArrayList<>(t.audioGateSignals),"audio gate signals");
+                    sigList(s,new ArrayList<>(t.presentationRegs),"presentation regs");
+                    sigList(s,new ArrayList<>(t.vifOpcodesBuilt),"VIF opcodes built");
+                    if(!t.vramKnownPagesHit.isEmpty()){
+                        StringBuilder pg=new StringBuilder();
+                        for(Long p:t.vramKnownPagesHit){ if(pg.length()>0)pg.append(", ");
+                            pg.append(hex(p)).append("=").append(KNOWN_TBP_LABELS.getOrDefault(p,"")); }
+                        s.append("- VRAM pages: ").append(pg).append('\n');
+                    }
+                    if(!t.tailcallVtableSlots.isEmpty()){
+                        StringBuilder sl=new StringBuilder(); for(Long x:t.tailcallVtableSlots){ if(sl.length()>0)sl.append(", "); sl.append(hex(x)); }
+                        s.append("- vtable tail-call slots: ").append(sl).append('\n');
+                    }
+                    if(s.length()>0){ w.println("## Signals"); w.println(); w.print(s.toString()); w.println(); }
+                }
+                // --- Memory / Globals (gp-relative refs recovered from assembly) ---
+                w.println("## Memory / Globals");
+                w.println();
+                if(t != null && !t.literalRefs.isEmpty()) {
+                    // signed gp offset -> [readBit, writeBit]; preserve first-seen order.
+                    Map<Long,boolean[]> gpModes = new LinkedHashMap<>();
+                    for(String[] lr : t.literalRefs) {
+                        if(lr.length < 4 || !"gp".equalsIgnoreCase(lr[2])) continue;
+                        String oh = lr[3]; boolean neg = oh.startsWith("-");
+                        String hp = oh.replace("-","").replace("0x","").replace("0X","");
+                        long mag; try { mag = Long.parseLong(hp, 16); } catch(Exception e){ continue; }
+                        long signed = neg ? -mag : mag;
+                        boolean[] m = gpModes.computeIfAbsent(signed, k -> new boolean[2]);
+                        if(lr[1]!=null && lr[1].toLowerCase().startsWith("s")) m[1]=true; else m[0]=true;
+                    }
+                    if(gpModes.isEmpty()) w.println("_(no gp-relative references)_");
+                    else for(Map.Entry<Long,boolean[]> e : gpModes.entrySet()) {
+                        long signed = e.getKey();
+                        long absAddr = (gpValue + signed) & 0xFFFFFFFFL;
+                        boolean[] m = e.getValue();
+                        String mode = m[0] && m[1] ? "read/write" : (m[1] ? "write" : "read");
+                        String gpTok = "gp" + (signed<0?"-":"+") + "0x" + Long.toHexString(Math.abs(signed));
+                        String sym = KNOWN_GP_OFFSETS.get(signed & 0xFFFFFFFFL);
+                        w.println("- `"+gpTok+"` = `"+hex(absAddr)+"` — "+mode
+                            + (sym!=null ? (" — `"+sym+"`") : ""));
+                    }
+                } else {
+                    w.println("_(no gp-relative references)_");
+                }
+                w.println();
+                // --- Calls ---
+                w.println("## Calls");
+                w.println();
+                if(t != null) {
+                    w.println("**Callees ("+t.calleeNames.size()+"):** "
+                        + (t.calleeNames.isEmpty() ? "_(none)_" : "`"+String.join("`, `", t.calleeNames)+"`"));
+                    w.println();
+                    StringBuilder cb = new StringBuilder();
+                    for(long[] c : t.callers){
+                        String cn = nameByAddr.getOrDefault(c[0]&0xFFFFFFFFL, "");
+                        if(cb.length()>0) cb.append(", ");
+                        cb.append(cn).append("(").append(hex(c[0])).append("@").append(hex(c[1])).append(")");
+                    }
+                    w.println("**Callers ("+t.callers.size()+"):** "+(t.callers.isEmpty()?"_(none)_":cb.toString()));
+                    w.println();
+                }
+                // --- Related Function Files (direct edges only, with derived filenames) ---
+                w.println("## Related Function Files");
+                w.println();
+                if(t != null) {
+                    w.println("### Callees");
+                    boolean anyCallee=false;
+                    java.util.LinkedHashSet<String> seenCallee = new java.util.LinkedHashSet<>();
+                    for(String cn : t.calleeNames){
+                        if(cn==null || !seenCallee.add(cn)) continue;
+                        Long ca = nameToAddr.get(cn);
+                        if(ca != null) { w.println("- `"+hex(ca)+"` — `"+cn+"` — `"+mdNameFor(ca,cn)+"`"); anyCallee=true; }
+                        else           { w.println("- `"+cn+"` — _(address not resolved; external/SDK or stripped)_"); anyCallee=true; }
+                    }
+                    if(!anyCallee) w.println("_(none)_");
+                    w.println();
+                    w.println("### Callers");
+                    if(t.callers.isEmpty()) w.println("_(none)_");
+                    else for(long[] c : t.callers){
+                        long ca = c[0]&0xFFFFFFFFL; String cn = nameByAddr.getOrDefault(ca, "");
+                        w.println("- `"+hex(ca)+"` — `"+(cn.isEmpty()?("sub_"+hex(ca)):cn)+"` @ `"+hex(c[1])
+                            +"` — `"+mdNameFor(ca,cn)+"`");
+                    }
+                    w.println();
+                }
+                // --- Search Anchors (grep-friendly tokens) ---
+                w.println("## Search Anchors");
+                w.println();
+                {
+                    StringBuilder a = new StringBuilder();
+                    a.append("`FUNC_").append(hex(r.address)).append("`\n");
+                    a.append("`NAME_").append(tok(fname)).append("`\n");
+                    a.append("`CATEGORY_").append(tok(r.category)).append("`\n");
+                    a.append("`DISPOSITION_").append(tok(r.disposition)).append("`\n");
+                    for(String tg : r.tags) a.append("`TAG_").append(tok(tg)).append("`\n");
+                    if(t != null){
+                        java.util.LinkedHashSet<String> cs = new java.util.LinkedHashSet<>();
+                        for(String cn : t.calleeNames){ if(cn!=null && cs.add(cn)) a.append("`CALLS_").append(tok(cn)).append("`\n"); }
+                        java.util.LinkedHashSet<String> cb2 = new java.util.LinkedHashSet<>();
+                        for(long[] c : t.callers){ String cn=nameByAddr.getOrDefault(c[0]&0xFFFFFFFFL,""); if(!cn.isEmpty() && cb2.add(cn)) a.append("`CALLED_BY_").append(tok(cn)).append("`\n"); }
+                    }
+                    w.print(a.toString());
+                }
+                w.println();
+                // --- Code ---
+                w.println("## Assembly");
+                w.println();
+                w.println("```asm");
+                w.println(r.asmText==null?"":r.asmText.trim());
+                w.println("```");
+                w.println();
+                w.println("## Decompiled");
+                w.println();
+                w.println("```c");
+                w.println(r.decompText==null?"":r.decompText.trim());
+                w.println("```");
+                w.println();
+                w.println("## Control flow");
+                w.println();
+                w.println("```");
+                w.println(r.flowText==null?"":r.flowText.trim());
+                w.println("```");
+                w.println();
+                w.println("---");
+                w.println("_Full machine-readable record: `index/functions_index.json` (address `"+hex(r.address)+"`)._");
+            }
+            n++;
+            if(n%500==0) monitor.setMessage("Writing function doc "+n+"...");
+        }
+        println("[DOCS] Wrote "+n+" function Markdown files to functions/");
+    }
+
+    // v14: the four focused lookup indexes (functions_index.json is written by
+    // writeTriageJson). Small, queryable, cross-cutting views for the AI.
+    private void writeLookupIndexes(File indexDir, List<FuncResult> results,
+                                    String elfHash, long gpValue) throws IOException {
+        Map<Long,String> nameByAddr = new HashMap<>();
+        for(FuncResult r : results) nameByAddr.put(r.address & 0xFFFFFFFFL, r.name);
+        // Stale-export metadata stamped into every index header.
+        final String idxMeta = "  \"elf_hash\": \""+elfHash+"\",\n"
+            + "  \"global_pointer\": \""+hex(gpValue)+"\",\n"
+            + "  \"export_timestamp\": \""
+            + new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date())+"\",";
+
+        // --- calls_index.json ---
+        try (PrintWriter w = utf8Writer(new File(indexDir,"calls_index.json"))) {
+            w.println("{");
+            w.println("  \"schema_version\": \"1.0\",");
+            w.println(idxMeta);
+            w.println("  \"purpose\": \"forward + reverse call graph (jal edges) per function\",");
+            w.println("  \"functions\": [");
+            for(int i=0;i<results.size();i++){
+                FuncResult r = results.get(i); FuncTraits t = r.traits;
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"callees\": "+(t==null?"[]":jsonStrArray(t.calleeNames))
+                    +", \"callers\": [");
+                if(t != null) for(int j=0;j<t.callers.size();j++){
+                    if(j>0) w.print(", ");
+                    long[] c = t.callers.get(j);
+                    w.print("{\"address\": \""+hex(c[0])+"\", \"name\": "
+                        +jsonString(nameByAddr.getOrDefault(c[0]&0xFFFFFFFFL,""))
+                        +", \"call_site\": \""+hex(c[1])+"\"}");
+                }
+                w.print("]}");
+                w.println(i<results.size()-1?",":"");
+            }
+            w.println("  ]");
+            w.println("}");
+        }
+
+        // --- xrefs_index.json ---
+        try (PrintWriter w = utf8Writer(new File(indexDir,"xrefs_index.json"))) {
+            w.println("{");
+            w.println("  \"schema_version\": \"1.0\",");
+            w.println(idxMeta);
+            w.println("  \"purpose\": \"xref counts + incoming references + referenced globals per function\",");
+            w.println("  \"functions\": [");
+            for(int i=0;i<results.size();i++){
+                FuncResult r = results.get(i); FuncTraits t = r.traits;
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"xref_to_count\": "+(t==null?0:t.xrefToCount)
+                    +", \"caller_count\": "+(t==null?0:t.callers.size())
+                    +", \"referenced_globals\": "+(t==null?"[]":jsonStrArray(new ArrayList<>(t.globalsTouched)))
+                    +", \"literal_refs\": [");
+                if(t != null) for(int j=0;j<t.literalRefs.size();j++){
+                    if(j>0) w.print(", ");
+                    String[] lr = t.literalRefs.get(j);
+                    w.print("{\"pc\": "+jsonString(lr[0])+", \"mnem\": "+jsonString(lr[1])
+                        +", \"base_reg\": "+jsonString(lr[2])+", \"offset\": "+jsonString(lr[3])
+                        +", \"dest_reg\": "+jsonString(lr[4])+"}");
+                }
+                w.print("]}");
+                w.println(i<results.size()-1?",":"");
+            }
+            w.println("  ]");
+            w.println("}");
+        }
+
+        // --- tags_index.json ---
+        try (PrintWriter w = utf8Writer(new File(indexDir,"tags_index.json"))) {
+            Map<String,List<FuncResult>> byTag = new TreeMap<>();
+            for(FuncResult r : results) for(String tg : r.tags)
+                byTag.computeIfAbsent(tg, k -> new ArrayList<>()).add(r);
+            w.println("{");
+            w.println("  \"schema_version\": \"1.0\",");
+            w.println(idxMeta);
+            w.println("  \"purpose\": \"tag -> functions carrying it (priority-ranked triage buckets)\",");
+            w.println("  \"tags\": {");
+            int ti=0;
+            for(Map.Entry<String,List<FuncResult>> e : byTag.entrySet()){
+                w.print("    "+jsonString(e.getKey())+": {\"count\": "+e.getValue().size()
+                    +", \"priority\": "+TAG_PRIORITY.getOrDefault(e.getKey(),0)+", \"functions\": [");
+                List<FuncResult> fs = e.getValue();
+                for(int j=0;j<fs.size();j++){
+                    if(j>0) w.print(", ");
+                    w.print("{\"address\": \""+hex(fs.get(j).address)+"\", \"name\": "+jsonString(fs.get(j).name)+"}");
+                }
+                w.print("]}");
+                w.println(++ti<byTag.size()?",":"");
+            }
+            w.println("  }");
+            w.println("}");
+        }
+
+        // --- globals_index.json ---
+        try (PrintWriter w = utf8Writer(new File(indexDir,"globals_index.json"))) {
+            // token -> readers / writers / sinit-writers / touchers.
+            Map<String,Set<String>> readers = new TreeMap<>();
+            Map<String,Set<String>> writers = new TreeMap<>();
+            Map<String,Set<String>> sinitWriters = new TreeMap<>();
+            Map<String,Set<String>> touchers = new TreeMap<>();
+            for(FuncResult r : results){
+                FuncTraits t = r.traits; if(t==null) continue;
+                String nm = r.name==null?"":r.name;
+                boolean isSinit = t.isStaticInitializer || t.isUncalledStaticInit;
+                for(String g : t.guardGlobals) readers.computeIfAbsent(g,k->new LinkedHashSet<>()).add(nm);
+                for(String lbl : t.globalsTouched) touchers.computeIfAbsent(lbl,k->new LinkedHashSet<>()).add(nm);
+                Set<String> wts = new LinkedHashSet<>();
+                for(Long a : t.returnWrittenToGlobals) wts.add("0x"+Long.toHexString(a & 0xFFFFFFFFL));
+                for(Long a : t.ctorGlobalAddresses)    wts.add("0x"+Long.toHexString(a & 0xFFFFFFFFL));
+                for(long[] inst : t.staticInitInstalls) wts.add("0x"+Long.toHexString(inst[1] & 0xFFFFFFFFL));
+                for(String tok : wts)
+                    (isSinit?sinitWriters:writers).computeIfAbsent(tok,k->new LinkedHashSet<>()).add(nm);
+            }
+            Set<String> all = new TreeSet<>();
+            all.addAll(readers.keySet()); all.addAll(writers.keySet());
+            all.addAll(sinitWriters.keySet()); all.addAll(touchers.keySet());
+            w.println("{");
+            w.println("  \"schema_version\": \"1.0\",");
+            w.println(idxMeta);
+            w.println("  \"purpose\": \"global token -> readers / writers / __sinit-writers / touchers; init-order hazard support (Rule 186)\",");
+            w.println("  \"globals\": {");
+            int gi=0;
+            for(String tok : all){
+                Set<String> rd=readers.getOrDefault(tok,Collections.emptySet());
+                Set<String> wr=writers.getOrDefault(tok,Collections.emptySet());
+                Set<String> si=sinitWriters.getOrDefault(tok,Collections.emptySet());
+                Set<String> tc=touchers.getOrDefault(tok,Collections.emptySet());
+                boolean hazard = !rd.isEmpty() && wr.isEmpty();
+                w.print("    "+jsonString(tok)+": {\"readers\": "+jsonStrArray(new ArrayList<>(rd))
+                    +", \"writers\": "+jsonStrArray(new ArrayList<>(wr))
+                    +", \"sinit_writers\": "+jsonStrArray(new ArrayList<>(si))
+                    +", \"touchers\": "+jsonStrArray(new ArrayList<>(tc))
+                    +", \"init_order_hazard\": "+hazard+"}");
+                w.println(++gi<all.size()?",":"");
+            }
+            w.println("  }");
+            w.println("}");
+        }
+        println("[INDEX] Wrote calls_index, xrefs_index, tags_index, globals_index to index/");
+    }
+
     private void writeTriageJson(File outFile,List<FuncResult> results,
                                  String elfHash,long gpValue,
                                  int totalFuncs,int uncategorized) throws IOException {
-        // v15.5 Rule 78 noise gate: tbp_constants_loaded used to collect
-        // EVERY immediate in (0,0x3FFF] from every function - 16-byte syscall
-        // trampolines were reporting "TBP constants". A function with no
-        // GS-side evidence and no runtime-confirmed TBP match carries no
-        // meaningful TBP signal; drop the list before emission.
+        // v11 (General v15.5 Bugfix U) Rule 78 noise gate: tbp_constants_loaded
+        // used to collect EVERY immediate in (0,0x3FFF] from every function -
+        // 16-byte syscall trampolines were reporting "TBP constants". A
+        // function with no GS-side evidence and no runtime-confirmed TBP match
+        // carries no meaningful TBP signal; drop the list before emission.
         for(FuncResult r:results){
             FuncTraits t=r.traits;
             if(t==null) continue;
@@ -7609,7 +10103,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
         PrintWriter w=utf8Writer(outFile);
         w.println("{");
-        w.println("  \"schema_version\": 12.3,");
+        w.println("  \"schema_version\": 14.2,");
+        w.println("  \"enricher_version\": \"General enricher v15.2 (schema 14.2)\",");
+        w.println("  \"export_timestamp\": \""
+            +new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date())+"\",");
         w.println("  \"elf_hash\": \""+elfHash+"\",");
         if(gpValue!=0)w.println("  \"global_pointer\": \""+hex(gpValue)+"\",");
         w.println("  \"text_range\": { \"start\": \""+hex(textStart)+"\", \"end\": \""+hex(textEnd)+"\" },");
@@ -7619,7 +10116,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"total_functions\": "+totalFuncs+",");
         w.println("    \"uncategorized_from_step1\": "+uncategorized+",");
         w.println("    \"enriched_count\": "+results.size()+",");
-        // v15: step1 vetting summary.
+        // v11 (General v15): step1 vetting summary.
         {
             int s1kept=0, s1rescued=0, ovr=0;
             for(FuncResult r : results) {
@@ -7629,7 +10126,9 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             }
             w.println("    \"step1_inherited_kept\": "+s1kept+",");
             w.println("    \"step1_rescued_to_recompile\": "+s1rescued+",");
+            w.println("    \"step1_locked_kept\": "+step1LockedKeptCount+",");
             w.println("    \"step1_name_mismatches\": "+step1NameMismatchCount+",");
+            w.println("    \"step1_truncated_names\": "+step1TruncatedNameCount+",");
             w.println("    \"step1_elf_hash\": \""+step1ElfHashStatus+"\",");
             w.println("    \"runtime_handler_roster_size\": "
                 +(runtimeRosterLoaded ? runtimeHandlerNames.size() : 0)+",");
@@ -7638,6 +10137,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             w.println("    \"out_of_text_bindings\": "+outOfTextBindingCount+",");
             w.println("    \"override_bound\": "+ovr+",");
         }
+        // v11 Rule 161: >0 means this ELF loads EE code at runtime (overlay /
+        // DGO-style); recompiling the ELF alone does not cover the game.
+        // Expectation: 0.
+        w.println("    \"dynamic_code_loaders\": "+dynamicCodeLoaderCount+",");
         w.println("    \"safe_leaf\": "+safeLeafCount+",");
         w.println("    \"acc_hazard\": "+accHazardCount+",");
         w.println("    \"mmio_access\": "+mmioCount+",");
@@ -7651,9 +10154,55 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"init_large_func\": "+initLargeFuncCount+",");
         w.println("    \"dma_tte_risk\": "+dmaTteRiskCount+",");
         w.println("    \"iop_rpc_dispatch\": "+iopRpcCount+",");
-        w.println("    \"archive_io\": "+archiveIoCount+","); // v13: was hardcoded 0
+        w.println("    \"archive_io\": "+archiveIoCount+",");
         w.println("    \"pad_poll_loop\": "+padPollLoopCount+",");
         w.println("    \"thread_sync_point\": "+threadSyncCount+",");
+        // v11.3 Rules 162-164
+        w.println("    \"spr_dma_stager\": "+sprDmaStagerCount+",");
+        w.println("    \"subword_dma_str_kick\": "+subwordDmaStrKickCount+",");
+        w.println("    \"vu1_double_buffer_framer\": "+vu1DoubleBufferFramerCount+",");
+        w.println("    \"stale_ptr_cache_ctor\": "+stalePtrCacheCtorCount+",");
+        // v12 Rules 165-177
+        w.println("    \"frame_reg_writer\": "+frameRegWriterCount+",");
+        w.println("    \"rtt_target\": "+rttTargetCount+",");
+        w.println("    \"zbuf_vram_alias_risk\": "+zbufVramAliasCount+",");
+        w.println("    \"vram_overlap_pairs\": "+vramOverlapPairs.size()+",");
+        w.println("    \"vf0_dependent_inverse\": "+vf0DependentInverseCount+",");
+        w.println("    \"audio_completion_gate\": "+audioCompletionGateCount+",");
+        w.println("    \"memcard_io\": "+memcardIoCount+",");
+        w.println("    \"presentation_field_state\": "+presentationFieldStateCount+",");
+        w.println("    \"display_buffer_flip\": "+displayBufferFlipCount+",");
+        w.println("    \"clut_cache_invalidator\": "+clutCacheInvalidatorCount+",");
+        w.println("    \"perf_hot_frame_path\": "+perfHotFramePathCount+",");
+        w.println("    \"gs_local_mem_pages_referenced\": "+gsLocalMemPagesReferenced.size()+",");
+        // v13 Rules 178-188
+        w.println("    \"conditional_init_on_global\": "+conditionalInitOnGlobalCount+",");
+        w.println("    \"render_mode_selector\": "+renderModeSelectorCount+",");
+        w.println("    \"vertex_lighting_normal_term\": "+vertexLightingTermCount+",");
+        w.println("    \"vtable_tailcall_thunk\": "+vtableTailcallThunkCount+",");
+        w.println("    \"rtt_no_restore\": "+rttNoRestoreCount+",");
+        w.println("    \"vu_flag_pipeline_uploader\": "+vuFlagPipelineUploaderCount+",");
+        w.println("    \"packed_rgbaq_builder\": "+packedRgbaqBuilderCount+",");
+        w.println("    \"frame_resume_risk\": "+frameResumeRiskCount+",");
+        w.println("    \"init_order_hazards\": "+initOrderHazards.size()+",");
+        // v15 Rules 190-198 (G83-G115 ADC/packer/pacing) — surfaced for the boot dashboard.
+        w.println("    \"prim_class_selector\": "+primClassSelectorCount+",");
+        w.println("    \"adc_kick_vertex_source\": "+adcKickVertexSourceCount+",");
+        w.println("    \"kick_mode_writer\": "+kickModeWriterCount+",");
+        w.println("    \"texture_reload_interleave\": "+textureReloadInterleaveCount+",");
+        w.println("    \"vsync_coupled_game_step\": "+vsyncCoupledGameStepCount+",");
+        w.println("    \"view_projection_writer\": "+viewProjectionWriterCount+",");
+        w.println("    \"object_array_ctor\": "+objectArrayCtorCount+",");
+        w.println("    \"allocator_family_split\": "+allocatorFamilySplit+",");
+        w.println("    \"vu_exec_hazard_manifest\": "+vuExecHazardManifest.size()+",");
+        // v15.1 Rules 199-202 (PCSX2 cross-check)
+        w.println("    \"vif_unpack_decompress_state\": "+vifUnpackDecompressCount+",");
+        w.println("    \"xyoffset_guard_writer\": "+xyoffsetGuardWriterCount+",");
+        w.println("    \"tex1_filter_writer\": "+tex1FilterWriterCount+",");
+        // v15.2 Rules 203-206 (skill cross-check)
+        w.println("    \"mmi_codegen_risk\": "+mmiCodegenRiskCount+",");
+        w.println("    \"cop2_control_reg_access\": "+cop2ControlRegCount+",");
+        w.println("    \"unfunded_texture_pages\": "+unfundedTexturePages.size()+",");
         w.println("    \"ctor_field_writer\": "+ctorFieldWriterCount+",");
         w.println("    \"vtable_setter\": "+vtableSetterCount+",");
         w.println("    \"a0_passthrough_returner\": "+a0PassthroughCount+",");
@@ -7711,82 +10260,72 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"lifecycle_lazy_init_guard\": "+lifecycleLazyInitCount+",");
         w.println("    \"bitbltbuf_t4hh_uploader\": "+bitbltbufT4hhUploaderCount+",");
         w.println("    \"drawing_chain_funcs\": "+drawingChainCount+",");
+        // v8 stats
+        w.println("    \"ctor_risk_critical\": "+ctorCriticalCount+",");
+        w.println("    \"ctor_risk_high\": "+ctorHighCount+",");
+        w.println("    \"ctor_risk_medium\": "+ctorMediumCount+",");
+        w.println("    \"ctor_assigned_to_global\": "+ctorAssignedGlobalCount+",");
+        w.println("    \"ctor_installs_vtable\": "+ctorInstallsVtableCount+",");
+        w.println("    \"ctor_dual_call_mode\": "+ctorDualCallModeCount+",");
+        w.println("    \"virtual_dispatch_sites\": "+virtualDispatchSiteCount+",");
+        w.println("    \"virtual_dispatch_funcs\": "+virtualDispatchFuncCount+",");
+        w.println("    \"pad_button_mask_consumer\": "+padButtonMaskConsumerCount+",");
+        w.println("    \"gif_nloop_double_count_risk\": "+gifNloopDoubleCountRiskCount+",");
+        w.println("    \"file_path_sprintf_source\": "+filePathSprintfCount+",");
+        w.println("    \"frame_clock_driver\": "+frameClockDriverCount+",");
+        w.println("    \"sce_vu0_helper_mustimpl\": "+sceVu0HelperCount+",");
+        w.println("    \"asset_upload_trace_funcs\": "+assetUploadTraceFuncCount+",");
+        w.println("    \"override_classified\": "+overrideClassifiedCount+",");
+        w.println("    \"override_retire_candidate\": "+overrideRetireCount+",");
+        w.println("    \"dispfb_writer_via_sdk_caller\": "+dispfbWriterViaSdkCallerCount+",");
+        w.println("    \"dma_kick_via_sdk_caller\": "+dmaKickViaSdkCallerCount+",");
+        w.println("    \"return_written_to_global_funcs\": "+returnWrittenToGlobalCount+",");
+        w.println("    \"auto_extended_globals\": "+autoExtendedGlobalsCount+",");
+        w.println("    \"class_registry_count\": "+classRegistry.size()+",");
         // v9 stats
-        w.println("    \"archive_io_v9\": "+archiveIoCount+",");
-        w.println("    \"gif_tag_inline_builder\": "+gifTagBuilderCount+",");
-        w.println("    \"bitbltbuf_macro_sequence\": "+bitbltbufMacroCount+",");
-        w.println("    \"vu0_macro_helper\": "+vu0MacroHelperCount+",");
-        w.println("    \"struct_initializer\": "+structInitCount+",");
-        w.println("    \"infinite_spin_loop\": "+spinLoopCount+",");
+        w.println("    \"gif_tag_inline_builder\": "+gifTagInlineBuilderCount+",");
+        w.println("    \"bitbltbuf_macro_sequence\": "+bitbltbufMacroSeqCount+",");
         w.println("    \"dma_chcr_start_kick\": "+dmaChcrStartKickCount+",");
-        w.println("    \"render_frame_entry\": "+renderFrameEntryCount+",");
-        w.println("    \"table_dispatch_call\": "+tableDispatchCallCount+",");
-        w.println("    \"function_pointer_tables_count\": "+functionPointerTables.size()+",");
-        w.println("    \"module_clusters_count\": "+moduleClusters.size()+",");
-        // v10 generic stats
-        w.println("    \"vif_tag_stored_immediate\": "+storedVifTagCount+",");
-        w.println("    \"dma_tag_stored_immediate\": "+storedDmaTagCount+",");
-        w.println("    \"builds_gif_tag_64\": "+gifTag64Count+",");
-        w.println("    \"loads_vif1_chunk_70000\": "+chunk70000Count+",");
-        w.println("    \"hi_lo_consumer\": "+hiLoConsumerCount+",");
-        // v11 stats (E/F/H/I/J)
-        w.println("    \"rcnt_access\": "+rcntAccessCount+",");
-        w.println("    \"vif_control_reg\": "+vifCtrlAccessCount+",");
-        w.println("    \"dmac_global_reg\": "+dmacGlobalAccessCount+",");
-        w.println("    \"writes_intc_mask\": "+intcMaskWriterCount+",");
-        w.println("    \"reads_intc_stat\": "+intcStatReaderCount+",");
-        w.println("    \"sio_access\": "+sioAccessCount+",");
-        w.println("    \"writes_dmac_enable\": "+dmacEnableWriterCount+",");
-        w.println("    \"sbus_flag_toucher\": "+sbusFlagAccessCount+",");
-        w.println("    \"dma_source_chain_tag_builder\": "+dmaSourceChainTagCount+",");
-        w.println("    \"format_magic_parser\": "+formatMagicHitCount+",");
+        w.println("    \"dma_source_chain_tag_builder\": "+dmaSourceChainBuilderCount+",");
+        w.println("    \"composite_mmio_recovered\": "+compositeMmioRecoveryCount+",");
+        w.println("    \"syscall_trampoline\": "+syscallTrampolineCount+",");
+        w.println("    \"backward_branch_sync_wait\": "+backwardSyncWaitCount+",");
+        w.println("    \"infinite_spin_loop\": "+infiniteSpinLoopCount+",");
+        w.println("    \"infinite_fail_loop\": "+infiniteFailLoopCount+",");
         w.println("    \"irx_loader\": "+irxLoaderCount+",");
         w.println("    \"iop_reboot_handler\": "+iopRebootHandlerCount+",");
-        w.println("    \"backward_branch_sync_wait\": "+syncWaitLoopCount+",");
-        w.println("    \"infinite_fail_loop\": "+infiniteFailLoopCount+",");
-        // v12 (D3 + others) - counters for new fields.
-        {
-            int sidCount = 0, assetCount = 0, inferredNames = 0, mcGate = 0;
-            Set<Long> distinctSids = new HashSet<>();
-            for(FuncResult r : results) {
-                if(r.traits == null) continue;
-                distinctSids.addAll(r.traits.detectedRpcSids);
-                if(r.traits.detectedRpcSid != 0) distinctSids.add(r.traits.detectedRpcSid);
-                assetCount += r.traits.discoveredAssetPaths.size();
-                if(r.traits.inferredName != null) inferredNames++;
-                if(r.traits.callsMcSdk) mcGate++;
-                sidCount += r.traits.detectedRpcSids.size();
-            }
-            w.println("    \"discovered_iop_sids_count\": "+distinctSids.size()+",");
-            w.println("    \"detected_rpc_sids_total\": "+sidCount+",");
-            w.println("    \"discovered_asset_paths_total\": "+assetCount+",");
-            w.println("    \"inferred_syscall_name_count\": "+inferredNames+",");
-            w.println("    \"syscall_trampolines\": "+syscallTrampolineCount+",");
-            // Rule 161: >0 means this ELF loads EE code at runtime (overlay /
-            // DGO-style); recompiling the ELF alone does not cover the game.
-            w.println("    \"dynamic_code_loaders\": "+dynamicCodeLoaderCount+",");
-            w.println("    \"behavioral_mc_gate_count\": "+mcGate+",");
-        }
-        // O5: derived disposition totals.
-        {
-            int stubN=0, skipN=0, recN=0, mustN=0;
-            for(FuncResult r : results) {
-                if("STUB".equals(r.disposition)) stubN++;
-                else if("SKIP".equals(r.disposition)) skipN++;
-                else recN++;
-                if(r.traits != null && r.traits.mustBeImplemented) mustN++;
-            }
-            w.println("    \"stub_candidates\": "+stubN+",");
-            w.println("    \"skip_candidates\": "+skipN+",");
-            w.println("    \"recompile_candidates\": "+recN+",");
-            w.println("    \"must_implement_count\": "+mustN);
-        }
+        w.println("    \"render_frame_entry\": "+renderFrameEntryCount+",");
+        w.println("    \"struct_initializer\": "+structInitializerCount+",");
+        w.println("    \"dispatch_table_target\": "+dispatchTableTargetCount+",");
+        w.println("    \"table_dispatch_call\": "+tableDispatchCallCount+",");
+        w.println("    \"game_host_wait_candidate\": "+hostWaitCandidateCount+",");
+        w.println("    \"game_known_address_matched\": "+knownAddressMatched+",");
+        w.println("    \"game_known_name_mismatches\": "+knownNameMismatches+",");
+        w.println("    \"discovered_iop_sid_funcs\": "+discoveredRpcSidCount+",");
+        w.println("    \"function_pointer_tables\": "+functionPointerTables.size()+",");
+        w.println("    \"module_clusters\": "+moduleClusters.size()+",");
+        w.println("    \"name_prefix_modules\": "+namePrefixModules.size()+",");
+        // v10 stats (the game F47-F52)
+        w.println("    \"cop2_partial_dest_funcs\": "+cop2PartialDestFuncCount+",");
+        w.println("    \"static_initializer_funcs\": "+staticInitializerFuncCount+",");
+        w.println("    \"uncalled_static_init\": "+uncalledStaticInitCount+",");
+        w.println("    \"memory_allocators\": "+memoryAllocatorCount+",");
+        w.println("    \"guest_lock_hog_candidates\": "+guestLockHogCount+",");
+        w.println("    \"eabi_arg_t0_funcs\": "+eabiArgT0Count+",");
+        w.println("    \"psmct16_clut_uploaders\": "+psmct16ClutUploaderCount+",");
+        // v10.1 stats
+        w.println("    \"computed_jump_sites\": "+computedJumpSiteCount+",");
+        w.println("    \"computed_jump_unresolved\": "+computedJumpUnresolvedCount+",");
+        w.println("    \"cop2_special_op_funcs\": "+cop2SpecialOpFuncCount+",");
+        w.println("    \"fpu_noniee_sensitive\": "+fpuNonIeeeCount+",");
+        w.println("    \"overlay_loaders\": "+overlayLoaderCount);
         w.println("  },");
 
-        // v15.1: structured rescue ledger - the detailed explanation surface
-        // for every inherited (step1) stub/skip binding that failed the
-        // high-confidence safety gate. The unified TOML only carries the
-        // executable safe subset plus a one-line pointer here.
+        // v11 (General v15.1): structured rescue ledger - the detailed
+        // explanation surface for every inherited (step1/DAC.toml) stub/skip
+        // binding that failed the high-confidence safety gate. The unified
+        // TOML only carries the executable safe subset plus a one-line
+        // pointer here.
         w.println("  \"rescued_from_step1\": [");
         {
             boolean first=true;
@@ -7800,7 +10339,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 w.print("\"from_section\": \""+("STUB".equals(r.step1Disposition)?"stubs":"skip")+"\", ");
                 // All rescues recompile; ones the enricher flags for human
                 // confirmation surface as "review" (they also sit in the
-                // TOML [triage_advisory].review array).
+                // triage_advisory review array).
                 boolean review = r.tags.contains("BINDING_FIREWALL_RESCUED")
                               || r.tags.contains("ADDRESS_TAKEN_CALLBACK");
                 w.print("\"new_decision\": \""+(review?"review":"recompile")+"\", ");
@@ -7809,7 +10348,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 List<String> ev=new ArrayList<>();
                 if(t!=null) {
                     ev.add(t.hasSyscall?"has_syscall":"no_syscall");
-                    ev.add((t.callsSifRpc||t.detectedRpcSid!=0||!t.detectedRpcSids.isEmpty())
+                    ev.add((t.callsSifRpc||t.detectedRpcSid!=0||!t.discoveredRpcSids.isEmpty())
                            ?"sif_rpc":"no_sif_rpc");
                     ev.add((t.refsIopModuleString||t.isIrxLoader||t.sifLoadModuleCallCount>=1)
                            ?"irx_evidence":"no_irx_evidence");
@@ -7825,40 +10364,465 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 // derived_from: the rescuing pass + most actionable tags.
                 List<String> der=new ArrayList<>();
                 der.add(r.rescuedBy!=null?r.rescuedBy:"step1_keep_gate");
-                for(String tag : prioritizeTagsForComment(r.tags,4))
-                    if(!der.contains(tag)) der.add(tag);
+                String topTags = prioritizeTagsForComment(r.tags, 4);
+                if(!topTags.isEmpty())
+                    for(String tag : topTags.split(","))
+                        if(!der.contains(tag.trim())) der.add(tag.trim());
                 w.print("\"derived_from\": "+jsonStrArray(der));
                 w.print("}");
             }
         }
         w.println("\n  ],");
 
-        // v15.2: full advisory content - moved here from the TOML
-        // [triage_advisory] block (TOML = executable safe subset, JSON =
+        // v11 (General v15.2): full advisory content - mirrored here from the
+        // TOML [triage_advisory] block (TOML = executable safe subset, JSON =
         // detailed source of truth). Entry strings are "name@0xADDR"; tags
         // are the priority-sorted hint tags previously emitted as TOML
         // trailing comments.
         w.println("  \"triage_advisory\": {");
         w.println("    \"_note\": \"Advisory only - not consumed by ps2recomp.exe. "
             +"nop: confirmed no-op stub candidates; patch: single-instr convention fixes; "
-            +"force_recompile: must run real game logic; native_impl_needed: IOP-side "
-            +"subsystems needing host implementations; review: enricher overrode/refused "
-            +"a binding decision; patch_instruction_candidates: spin/wait backward-branch "
-            +"NOP patches (opt-in).\",");
-        emitAdvisoryJsonArray(w, "nop", advisoryNop, true);
-        emitAdvisoryJsonArray(w, "patch", advisoryPatch, true);
-        emitAdvisoryJsonArray(w, "force_recompile", advisoryForceRecomp, true);
-        emitAdvisoryJsonArray(w, "native_impl_needed", advisoryNativeImpl, true);
-        emitAdvisoryJsonArray(w, "review", advisoryReview, true);
+            +"force_recompile: must run real game logic; must_implement: VU0/the game-critical math; "
+            +"native_impl_needed: IOP-side subsystems needing host implementations; "
+            +"review: enricher overrode/refused a binding decision; Advisory lists: blockers / "
+            +"host-wait / upload bullseyes / F47-F52 categories; patch_instruction_candidates: "
+            +"spin/wait backward-branch NOP patches (opt-in).\",");
+        for(Map.Entry<String,List<String>> e : advisoryJsonLists.entrySet())
+            emitAdvisoryJsonArray(w, e.getKey(), e.getValue(), true);
         w.println("    \"patch_instruction_candidates\": [");
         for(int pi=0; pi<advisoryPatchInstr.size(); pi++) {
-            long[] c = advisoryPatchInstr.get(pi);
-            long pc = c[0] & 0xFFFFFFFFL;
-            long fa = c[1] & 0xFFFFFFFFL;
-            String reason = c.length>=3 ? humanizeReasonMask(c[2]) : "spin/wait";
-            w.print("      {\"address\": \""+hex(pc)+"\", \"value\": \"0x00000000\", "
-                +"\"reason\": "+jsonString(reason)+", \"function\": \""+hex(fa)+"\"}");
+            String[] c = advisoryPatchInstr.get(pi);
+            w.print("      {\"address\": \""+c[0]+"\", \"value\": \"0x00000000\", "
+                +"\"reason\": "+jsonString(c[1])+", \"function\": "+jsonString(c[2])+"}");
             w.println(pi==advisoryPatchInstr.size()-1 ? "" : ",");
+        }
+        w.println("    ]");
+        w.println("  },");
+
+        // v5 Rule 55: known the game gp-relative globals (labels for literal_refs decode).
+        w.println("  \"known_globals\": {");
+        {
+            boolean firstG=true;
+            for(Map.Entry<Long,String> e : KNOWN_GP_OFFSETS.entrySet()) {
+                if(!firstG) w.println(","); firstG=false;
+                w.print("    \"0x"+String.format("%08X", e.getKey()&0xFFFFFFFFL)+"\": \""+e.getValue()+"\"");
+            }
+        }
+        w.println("\n  },");
+
+        // v8 Rule 95: auto-extended Known globals discovered via return-to-global tracking.
+        w.println("  \"auto_extended_globals\": {");
+        {
+            boolean f=true;
+            for(Map.Entry<Long,String> e : autoExtendedGlobals.entrySet()) {
+                if(!f) w.println(","); f=false;
+                w.print("    \"0x"+String.format("%08X", e.getKey()&0xFFFFFFFFL)+"\": "+jsonString(e.getValue()));
+            }
+        }
+        w.println("\n  },");
+
+        // v8 Rule 107: phase trace env-var flag inventory.
+        w.println("  \"phase_trace_flags\": [");
+        for(int i=0; i<PHASE_TRACE_FLAGS.length; i++) {
+            w.print("    "+jsonString(PHASE_TRACE_FLAGS[i]));
+            w.println(i<PHASE_TRACE_FLAGS.length-1 ? "," : "");
+        }
+        w.println("  ],");
+
+        // ===== v10 top-level sections (the game F47-F52) =====
+        // sceVu0 helpers still unimplemented (throwing) in Kernel/Stubs/VU.cpp (F50.7).
+        w.println("  \"sce_vu0_unimplemented\": [");
+        for(int i=0;i<SCEVU0_UNIMPLEMENTED.length;i++){
+            w.print("    "+jsonString(SCEVU0_UNIMPLEMENTED[i]));
+            w.println(i<SCEVU0_UNIMPLEMENTED.length-1?",":"");
+        }
+        w.println("  ],");
+
+        // ===== v12 Rules 165-177 top-level sections =====
+        // Rule 165 VRAM_OVERLAP_MAP: functions targeting the SAME labelled VRAM
+        // page with DIFFERING GS reg kinds → RTT_ALIAS / Z_ALIAS / TIMESHARE.
+        // The G33-G50 / G45 page-alias bug class, surfaced statically.
+        w.println("  \"vram_overlap_pairs\": [");
+        for(int i=0;i<vramOverlapPairs.size();i++){
+            String[] p = vramOverlapPairs.get(i);
+            w.print("    {\"page\": \""+p[0]+"\", \"label\": "+jsonString(p[1])
+                +", \"kind_a\": \""+p[2]+"\", \"func_a\": "+jsonString(p[3])
+                +", \"kind_b\": \""+p[4]+"\", \"func_b\": "+jsonString(p[5])
+                +", \"classification\": \""+p[6]+"\"}");
+            w.println(i<vramOverlapPairs.size()-1?",":"");
+        }
+        w.println("  ],");
+
+        // Rule 171 MEMCARD_IO roster (#4 active blocker: save/load).
+        w.println("  \"memcard_io_roster\": [");
+        {
+            List<FuncResult> mc = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isMemcardIo) mc.add(r);
+            for(int i=0;i<mc.size();i++){
+                FuncResult r = mc.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"memcard_callees\": "+jsonStrArray(new ArrayList<>(r.traits.memcardCallees))+"}");
+                w.println(i<mc.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 170 AUDIO_COMPLETION_GATE (#3 active blocker: audio/event signals).
+        w.println("  \"audio_completion_gates\": [");
+        {
+            List<FuncResult> ag = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isAudioCompletionGate) ag.add(r);
+            for(int i=0;i<ag.size();i++){
+                FuncResult r = ag.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"signals\": "+jsonStrArray(new ArrayList<>(r.traits.audioGateSignals))
+                    +", \"game_audio_gated_stall\": "+r.tags.contains("AUDIO_GATED_STALL")+"}");
+                w.println(i<ag.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 173 PRESENTATION_FIELD_STATE (#5 active blocker: interlace jitter).
+        w.println("  \"presentation_field_writers\": [");
+        {
+            List<FuncResult> pf = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.writesPresentationFieldState) pf.add(r);
+            for(int i=0;i<pf.size();i++){
+                FuncResult r = pf.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"regs\": "+jsonStrArray(new ArrayList<>(r.traits.presentationRegs))
+                    +", \"display_buffer_flip\": "+r.traits.isDisplayBufferFlip+"}");
+                w.println(i<pf.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 175 CLUT_CACHE_INVALIDATOR (TEXFLUSH / CLUT-page cache ops).
+        w.println("  \"clut_cache_ops\": [");
+        {
+            List<FuncResult> cc = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isClutCacheInvalidator) cc.add(r);
+            for(int i=0;i<cc.size();i++){
+                FuncResult r = cc.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+"}");
+                w.println(i<cc.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 176 PERF_HOT_FRAME_PATH (#7 active blocker: frame pacing). Ranked
+        // by callee fan-out (shallow mainloop reach + inner loop = hot suspect).
+        w.println("  \"perf_hot_candidates\": [");
+        {
+            List<FuncResult> ph = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isPerfHotFramePath) ph.add(r);
+            ph.sort((a,b)->Integer.compare(b.traits.calleeCount, a.traits.calleeCount));
+            for(int i=0;i<ph.size();i++){
+                FuncResult r = ph.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"mainloop_depth\": "+r.traits.mainLoopDepth
+                    +", \"callee_count\": "+r.traits.calleeCount+"}");
+                w.println(i<ph.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 177 GS_LOCAL_MEM_BUDGET: distinct labelled VRAM pages seen
+        // statically. >4MB worth → bank-switched VRAM the flat recomp model breaks.
+        w.println("  \"gs_local_mem_budget\": {");
+        w.println("    \"distinct_labelled_pages\": "+gsLocalMemPagesReferenced.size()+",");
+        w.print("    \"pages\": [");
+        {
+            boolean f=true;
+            for(Long p : gsLocalMemPagesReferenced){ if(!f)w.print(", "); f=false;
+                w.print("{\"page\": \""+hex(p)+"\", \"label\": "
+                    +jsonString(KNOWN_TBP_LABELS.getOrDefault(p,""))+"}"); }
+        }
+        w.println("]");
+        w.println("  },");
+
+        // ===== v13 Rules 178-188 top-level rosters (the game G53-G82) =====
+        // Rule 179 RENDER_MODE_SELECTOR (G75-G80 copy-vs-transform routing).
+        emitV13Roster(w, "render_mode_selectors", renderModeSelectors, "kind");
+        // Rule 180 VERTEX_LIGHTING_NORMAL_TERM (G82 per-vertex N·L / shade-RED deficit).
+        emitV13Roster(w, "vertex_lighting_terms", vertexLightingTerms, "source");
+        // Rule 181 VTABLE_TAILCALL_THUNK (G59 recompiler inherited-virtual tail-call bug).
+        emitV13Roster(w, "vtable_tailcall_thunks", vtableTailcallThunks, "slots");
+        // Rule 182 RTT_NO_RESTORE (G79 GS render-target / scissor leak across scenes).
+        emitV13Roster(w, "rtt_no_restore", rttNoRestoreFuncs, "reason");
+        // Rule 184 VU_FLAG_PIPELINE_UPLOADER (G71 VU MAC/STATUS flag pipeline advisory).
+        emitV13Roster(w, "vu_flag_pipeline_uploaders", vuFlagPipelineUploaders, "kind");
+        // Rule 187 PACKED_RGBAQ_BUILDER (G82 GIF PACKED RGBAQ spread-layout advisory).
+        emitV13Roster(w, "packed_rgbaq_builders", packedRgbaqBuilders, "note");
+        // Rule 188 FRAME_RESUME_RISK (G58/G59 mid-body preempt/resume risk).
+        emitV13Roster(w, "frame_resume_risk", frameResumeRiskFuncs, "reason");
+        // Rule 186 INIT_ORDER_DEPENDENCY: globals read-guarded but only __sinit-written (G58/G81).
+        w.println("  \"init_order_hazards\": [");
+        for(int i=0;i<initOrderHazards.size();i++){
+            String[] h = initOrderHazards.get(i);
+            w.print("    {\"global\": "+jsonString(h[0])+", \"reader\": "+jsonString(h[1])
+                +", \"writer\": "+jsonString(h[2])+", \"writer_kind\": "+jsonString(h[3])+"}");
+            w.println(i<initOrderHazards.size()-1?",":"");
+        }
+        w.println("  ],");
+
+        // ===== v15 Rules 190-198 top-level rosters (the game G83-G115) =====
+        // Rule 190 GIFTAG_PRIM_CLASS_SELECTOR (the qword38 PRIM-class route decode, G77-G115).
+        emitV13Roster(w, "prim_class_selectors", primClassSelectors, "selector");
+        // Rule 191 ADC_KICK_VERTEX_SOURCE (the per-vertex strip-restart ADC source, G65-G115).
+        emitV13Roster(w, "adc_kick_sources", adcKickSources, "adc_source");
+        // Rule 192 XYZ2_VS_XYZ3_KICK_WRITER (per-vertex draw-kick vs no-kick writers).
+        emitV13Roster(w, "kick_mode_writers", kickModeWriters, "mode");
+        // Rule 193 TEXTURE_RELOAD_INTERLEAVE_HAZARD (per-block TEX0 de-interleave, G90-G97).
+        emitV13Roster(w, "texture_reload_interleave", textureReloadInterleave, "reason");
+        // Rule 195 VSYNC_COUPLED_GAME_STEP (game-step coupled to render, G103 perf blocker).
+        emitV13Roster(w, "frame_pacing_drivers", framePacingDrivers, "detail");
+        // Rule 196 VIEW_PROJECTION_MATRIX_WRITER (shared camera/view matrix, G98/G99).
+        emitV13Roster(w, "view_projection_writers", viewProjectionWriters, "kind");
+        // Rule 197 OBJECT_ARRAY_CTOR (array-of-objects ctor needing per-element vtables, G92).
+        emitV13Roster(w, "object_array_ctors", objectArrayCtors, "shape");
+        // Rule 184+ VU_EXEC_HAZARD_MANIFEST (consolidated VU/COP2 interpreter divergences).
+        emitV13Roster(w, "vu_exec_hazard_manifest", vuExecHazardManifest, "hazards");
+        // ===== v15.1 PCSX2-grounded rosters (Rules 199-201) =====
+        // Rule 199 VIF_UNPACK_DECOMPRESS_STATE (STMOD/STMASK/STROW/STCOL decompression).
+        emitV13Roster(w, "vif_unpack_decompress_state", vifUnpackDecompressState, "commands");
+        // Rule 200 GS_XYOFFSET_GUARD_BAND (guard-band centre, G88).
+        emitV13Roster(w, "xyoffset_guard_writers", xyoffsetGuardWriters, "detail");
+        // Rule 201 GS_TEX1_FILTER_WRITER (MMAG/MMIN texture filter, G8).
+        emitV13Roster(w, "tex1_filter_writers", tex1FilterWriters, "detail");
+        // ===== v15.2 skill-grounded rosters (Rules 203-205) =====
+        // Rule 203 MMI_SIMD_OP (EE MMI codegen class - audit the whole class).
+        emitV13Roster(w, "mmi_codegen_risk", mmiCodegenRisk, "detail");
+        // Rule 204 COP2_CONTROL_REG_ACCESS (CFC2/CTC2 control-reg map codegen class).
+        emitV13Roster(w, "cop2_control_reg_access", cop2ControlRegAccess, "regs");
+        // Rule 205 UNFUNDED_TEXTURE_PAGE (sampled page with no static BITBLTBUF upload, advisory).
+        w.println("  \"unfunded_texture_pages\": [");
+        for(int i=0;i<unfundedTexturePages.size();i++){
+            String[] e = unfundedTexturePages.get(i);
+            w.print("    {\"page\": "+jsonString(e[0])+", \"label\": "+jsonString(e[1])
+                +", \"sampler\": "+jsonString(e[2])+", \"note\": \"confirm with runtime BITBLTBUF-dbp counter\"}");
+            w.println(i<unfundedTexturePages.size()-1?",":"");
+        }
+        w.println("  ],");
+        // Rule 194 ALLOCATOR_FAMILY_COHERENCE: the family + the split flag (regen-caveat #1).
+        w.println("  \"allocator_family_split\": "+allocatorFamilySplit+",");
+        w.println("  \"allocator_family\": [");
+        for(int i=0;i<allocatorFamily.size();i++){
+            String[] e = allocatorFamily.get(i);
+            w.print("    {\"name\": "+jsonString(e[0])+", \"address\": "+jsonString(e[1])
+                +", \"disposition\": "+jsonString(e[2])+"}");
+            w.println(i<allocatorFamily.size()-1?",":"");
+        }
+        w.println("  ],");
+
+        // Rule 185 LOOP_STATE_MODEL: program-state legend + illegal-concurrent states (G79).
+        w.println("  \"loop_state_model\": [");
+        for(int i=0;i<LOOP_STATE_MODEL.length;i++){
+            String[] s = LOOP_STATE_MODEL[i];
+            w.print("    {\"state\": "+jsonString(s[0])+", \"where\": "+jsonString(s[1])
+                +", \"legend\": "+jsonString(s[2])+"}");
+            w.println(i<LOOP_STATE_MODEL.length-1?",":"");
+        }
+        w.println("  ],");
+
+        // Rule 140: COP2 partial-dest transform risk set (F51.8). Every function
+        // here uses VU0-macro ops with a PARTIAL dest field; its generated COP2
+        // dest-mask lane order must be verified against READ128/WRITE128 (X=lane0).
+        // The F51.8 fix reversed the mask in code_generator.cpp; a clean regen of
+        // these functions is the canonical fix.
+        w.println("  \"cop2_partial_dest_risk\": [");
+        {
+            List<FuncResult> risk = new ArrayList<>();
+            for(FuncResult r : results)
+                if(r.traits != null && r.traits.cop2DestMaskVerify) risk.add(r);
+            risk.sort((a,b)->Integer.compare(
+                b.traits.cop2PartialDestOps, a.traits.cop2PartialDestOps));
+            for(int i=0;i<risk.size();i++){
+                FuncResult r = risk.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+
+                        ", \"partial_dest_ops\": "+r.traits.cop2PartialDestOps+
+                        ", \"full_dest_ops\": "+r.traits.cop2FullDestOps+
+                        ", \"dest_fields\": [");
+                boolean f=true;
+                for(String s:r.traits.cop2DestFields){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+                w.print("]}");
+                w.println(i<risk.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // v11.3 Rule 162: SPR/scratchpad DMA stagers — the G26 delivery-bug
+        // class. Each func programs a fromSPR/toSPR (ch8/9) DMA and/or kicks a
+        // transfer via a sub-word CHCR store. A runtime whose writeIORegister
+        // only handles GIF/VIF1 word writes drops these, so a scratchpad-staged
+        // VU1 model packet never reaches VIF1 (no XGKICK). override_hookable
+        // tells the fix strategy (registerFunction vs wrap-the-jal/runtime IO).
+        w.println("  \"spr_dma_stagers\": [");
+        {
+            List<FuncResult> sp = new ArrayList<>();
+            for(FuncResult r : results)
+                if(r.traits != null && (r.traits.programsSprDma || r.traits.subwordDmaStrKick))
+                    sp.add(r);
+            for(int i=0;i<sp.size();i++){
+                FuncResult r = sp.get(i);
+                FuncTraits t = r.traits;
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+
+                        ", \"programs_spr_dma\": "+t.programsSprDma+
+                        ", \"subword_dma_str_kick\": "+t.subwordDmaStrKick+
+                        ", \"override_hookable\": "+(t.calledViaJrT9 && !t.calledViaDirectJal)+
+                        ", \"spr_channels\": [");
+                boolean f=true;
+                for(String s:t.sprDmaChannels){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+                w.print("], \"subword_kick_channels\": [");
+                f=true;
+                for(String s:t.subwordKickChannels){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+                w.print("]}");
+                w.println(i<sp.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 141: static-init manifest — the globals/vtables each __sinit_*
+        // installs. Replay these (idempotent write_u32) to repair un-run
+        // static init when the global-ctors table is not driven (F50.4/F50.7).
+        w.println("  \"static_init_manifest\": [");
+        {
+            List<FuncResult> si = new ArrayList<>();
+            for(FuncResult r : results)
+                if(r.traits != null && r.traits.isStaticInitializer && !r.traits.staticInitInstalls.isEmpty())
+                    si.add(r);
+            for(int i=0;i<si.size();i++){
+                FuncResult r = si.get(i);
+                FuncTraits t = r.traits;
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+
+                        ", \"uncalled\": "+t.isUncalledStaticInit+
+                        ", \"installs_vtable\": "+t.staticInitInstallsVtable+
+                        ", \"installs\": [");
+                boolean f=true;
+                for(long[] e : t.staticInitInstalls){
+                    if(!f) w.print(", "); f=false;
+                    w.print("{\"pc\": \""+hex(e[0])+"\", \"value\": \""+hex(e[1])+"\", \"offset\": \""+hex(e[2])+"\"}");
+                }
+                w.print("]}");
+                w.println(i<si.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 142: memory allocators — never auto-stub (F50.1/F50.2 pool/null-vtable trap).
+        w.println("  \"memory_allocators\": [");
+        {
+            List<FuncResult> al = new ArrayList<>();
+            for(FuncResult r : results)
+                if(r.traits != null && r.traits.isMemoryAllocator) al.add(r);
+            for(int i=0;i<al.size();i++){
+                FuncResult r = al.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+
+                        ", \"kind\": "+jsonString(r.traits.allocatorKind)+
+                        ", \"reads_eabi_arg_t0\": "+r.traits.readsEabiArgT0+"}");
+                w.println(i<al.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // ===== v10.1 top-level sections (PCSX2- + skill-grounded) =====
+        // Rule 146: computed-jump resolution — per-func switch sites + Ghidra-
+        // resolved targets. The recompiler pre-populates its indirect-jump
+        // dispatch from this; sites with "unresolved": true are the real risk set.
+        w.println("  \"computed_jump_targets\": [");
+        {
+            List<FuncResult> cj = new ArrayList<>();
+            for(FuncResult r : results)
+                if(r.traits != null && !r.traits.computedJumpSwitchPcs.isEmpty()) cj.add(r);
+            for(int i=0;i<cj.size();i++){
+                FuncResult r = cj.get(i); FuncTraits t = r.traits;
+                Map<Long,List<Long>> byPc = new LinkedHashMap<>();
+                for(Long pc : t.computedJumpSwitchPcs) byPc.put(pc, new ArrayList<>());
+                for(long[] e : t.computedJumpTargets){
+                    List<Long> l=byPc.get(e[0]); if(l==null){l=new ArrayList<>();byPc.put(e[0],l);} l.add(e[1]);
+                }
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+", \"sites\": [");
+                boolean f=true;
+                for(Map.Entry<Long,List<Long>> e : byPc.entrySet()){
+                    if(!f) w.print(", "); f=false;
+                    w.print("{\"pc\": \""+hex(e.getKey())+"\", \"unresolved\": "+e.getValue().isEmpty()+", \"targets\": [");
+                    boolean g=true;
+                    for(Long tg : e.getValue()){ if(!g) w.print(", "); g=false; w.print("\""+hex(tg)+"\""); }
+                    w.print("]}");
+                }
+                w.print("]}");
+                w.println(i<cj.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rule 149: SDK / syscall coverage audit. Every SDK-shaped callee (sce*)
+        // partitioned vs the known rosters + game_override bindings. coverage_gap =
+        // called but neither bound nor recognized → needs a stub/implement decision.
+        w.println("  \"sdk_coverage_audit\": {");
+        {
+            java.util.Map<String,Integer> calleeCounts = new java.util.TreeMap<>();
+            for(FuncResult r : results) if(r.traits != null)
+                for(String cn : r.traits.calleeNames)
+                    if(cn != null) calleeCounts.merge(cn, 1, Integer::sum);
+            Set<String> bound = new HashSet<>(gameOverrideNames.values());
+            Set<String> iopNames = new HashSet<>(KNOWN_IOP_SIDS.values());
+            Set<String> unimpl = new HashSet<>(Arrays.asList(SCEVU0_UNIMPLEMENTED));
+            List<String> mustStub = new ArrayList<>(), mustImpl = new ArrayList<>(), gap = new ArrayList<>();
+            for(Map.Entry<String,Integer> e : calleeCounts.entrySet()){
+                String n = e.getKey();
+                if(!(n.startsWith("sce")||n.startsWith("_sce"))) continue;
+                String entry = "    {\"name\": "+jsonString(n)+", \"calls\": "+e.getValue()+"}";
+                if(n.startsWith("sceVu0")||n.startsWith("_sceVu0")||unimpl.contains(n)) { mustImpl.add(entry); continue; }
+                if(bound.contains(n)) continue;  // handled by game_override
+                boolean recognized = iopNames.contains(n) || FILE_OPEN_CALLEES.contains(n) || FRAME_CLOCK_CALLEES.contains(n);
+                if(!recognized) for(String p : SCE_GIF_PK_PREFIXES)    if(n.startsWith(p)){recognized=true;break;}
+                if(!recognized) for(String p : AUDIO_CALLEE_PREFIXES)  if(n.startsWith(p)){recognized=true;break;}
+                if(recognized) mustStub.add(entry); else gap.add(entry);
+            }
+            emitJsonObjArray(w, "must_implement", mustImpl, true);
+            emitJsonObjArray(w, "must_stub",      mustStub, true);
+            emitJsonObjArray(w, "coverage_gap",   gap,      false);
+        }
+        w.println("  },");
+
+        // Rule 150: EE code-overlay loaders. Empty for a single-binary game
+        // (the game) — absence confirms the flat-address-space assumption holds.
+        w.println("  \"overlay_load_sites\": [");
+        {
+            List<FuncResult> ol = new ArrayList<>();
+            for(FuncResult r : results) if(r.traits != null && r.traits.isOverlayLoader) ol.add(r);
+            for(int i=0;i<ol.size();i++){
+                FuncResult r = ol.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)+"}");
+                w.println(i<ol.size()-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // v8 Rule 106: build invariants.
+        w.println("  \"build_invariants\": {");
+        w.println("    \"build_cmd\": "+jsonString(BUILD_CMD)+",");
+        w.println("    \"do_not_modify\": [");
+        for(int i=0; i<BUILD_DO_NOT_MODIFY.length; i++) {
+            w.print("      "+jsonString(BUILD_DO_NOT_MODIFY[i]));
+            w.println(i<BUILD_DO_NOT_MODIFY.length-1 ? "," : "");
+        }
+        w.println("    ]");
+        w.println("  },");
+
+        // v8 Rule 104: expected uploads per phase. Consumers may compare
+        // against gs_runtime_evidence.bitbltbuf_dpsms_union to spot gaps.
+        w.println("  \"current_phase_inputs\": {");
+        w.println("    \"expected_uploads\": [");
+        for(int i=0; i<EXPECTED_UPLOADS.length; i++) {
+            Object[] row = EXPECTED_UPLOADS[i];
+            w.print("      {\"tag\": "+jsonString((String)row[0])+
+                    ", \"dpsm\": \""+String.format("0x%02X", ((Number)row[1]).intValue())+"\""+
+                    ", \"dbp\": \""+String.format("0x%08X", ((Number)row[2]).longValue())+"\""+
+                    ", \"phase\": "+jsonString((String)row[3])+
+                    ", \"hint\": "+jsonString((String)row[4])+"}");
+            w.println(i<EXPECTED_UPLOADS.length-1 ? "," : "");
         }
         w.println("    ]");
         w.println("  },");
@@ -7902,7 +10866,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("\n  },");
 
         // v6: PCSX2 baseline metadata. v7 auto-populates checkpoint slots from
-        // loaded gs_dump_to_summary.py outputs (filename -> checkpoint name).
+        // loaded gs_dump_to_summary.py outputs (filename → checkpoint name).
         // Slots without a matching GS dump remain null.
         w.println("  \"pcsx2_baseline\": {");
         w.println("    \"_note\": \"v7: checkpoint slots auto-populated from gs_runtime_evidence.checkpoints[]\",");
@@ -7925,7 +10889,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
         w.println("  },");
 
-        // v7: GS runtime evidence block - per-checkpoint facts + merged union.
+        // v7: GS runtime evidence block — per-checkpoint facts + merged union.
         emitGsRuntimeEvidence(w);
 
         // v4: GS register name map (consumers can label MMIO_GS hits).
@@ -7946,128 +10910,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("    \""+hex(e.getKey())+"\": \""+e.getValue()+"\"");
         }
         w.println("\n  },");
-
-        // v12 (D1): discovered IOP SIDs across the whole binary. Aggregates
-        // every SID literal that any function passed to sceSifBindRpc. Output:
-        // { "0xfab3": { "label": "JAK23X_DGO_RPC" | "UNKNOWN",
-        //               "callers": [ {"addr","name"}, ... ] } }
-        // Lets engineers map the EE<->IOP comm surface at a glance even when
-        // labels are stripped.
-        {
-            Map<Long, List<long[]>> sidToCallers = new TreeMap<>();
-            for(FuncResult r : results) {
-                if(r.traits == null) continue;
-                Set<Long> sids = new LinkedHashSet<>(r.traits.detectedRpcSids);
-                if(r.traits.detectedRpcSid != 0) sids.add(r.traits.detectedRpcSid);
-                for(Long sid : sids) {
-                    sidToCallers.computeIfAbsent(sid, k -> new ArrayList<>())
-                                .add(new long[]{r.address & 0xFFFFFFFFL, 0});
-                }
-            }
-            // Merge in cross-function discovered SIDs from detectDiscoveredSidsFids().
-            for(Map.Entry<Long,List<Long>> e : discoveredSidToCallers.entrySet()) {
-                long sid = e.getKey() & 0xFFFFFFFFL;
-                List<long[]> existing = sidToCallers.get(sid);
-                if(existing == null) { existing = new ArrayList<>(); sidToCallers.put(sid, existing); }
-                for(Long fa : e.getValue()) existing.add(new long[]{fa & 0xFFFFFFFFL, 0});
-            }
-            w.println("  \"discovered_iop_sids\": {");
-            boolean firstDS = true;
-            for(Map.Entry<Long, List<long[]>> e : sidToCallers.entrySet()) {
-                if(!firstDS) w.println(","); firstDS = false;
-                String label = KNOWN_IOP_SIDS.getOrDefault(e.getKey(), "UNKNOWN");
-                w.print("    \""+hex(e.getKey())+"\": { \"label\": \""+label+"\", \"callers\": [");
-                boolean firstC = true;
-                for(long[] c : e.getValue()) {
-                    if(!firstC) w.print(", "); firstC = false;
-                    String nm = "";
-                    for(FuncResult fr : results)
-                        if((fr.address & 0xFFFFFFFFL) == c[0]) { nm = fr.name; break; }
-                    w.print("{\"addr\":\""+hex(c[0])+"\",\"name\":"+jsonString(nm)+"}");
-                }
-                w.print("] }");
-            }
-            w.println("\n  },");
-        }
-
-        // Rule 140: COP2 partial-dest transform risk set.
-        {
-            List<FuncResult> cop2Risk = new ArrayList<>();
-            for(FuncResult r : results)
-                if(r.traits != null && r.traits.cop2DestMaskVerify) cop2Risk.add(r);
-            cop2Risk.sort((a,b) -> Integer.compare(b.traits.cop2PartialDestOps, a.traits.cop2PartialDestOps));
-            w.println("  \"cop2_partial_dest_risk\": [");
-            for(int ci=0; ci<cop2Risk.size(); ci++) {
-                FuncResult r = cop2Risk.get(ci); FuncTraits t2 = r.traits;
-                w.print("    {\"addr\":\""+hex(r.address)+"\",\"name\":"+jsonString(r.name));
-                w.print(",\"partial_dest_ops\":"+t2.cop2PartialDestOps);
-                w.print(",\"full_dest_ops\":"+t2.cop2FullDestOps);
-                w.print(",\"dest_fields\":[");
-                boolean fdf=true; for(String df:t2.cop2DestFields){if(!fdf)w.print(",");fdf=false;w.print("\""+df+"\"");}
-                w.print("]}");
-                if(ci<cop2Risk.size()-1) w.println(","); else w.println();
-            }
-            w.println("  ],");
-        }
-
-        // Rule 141: static-init manifest.
-        {
-            List<FuncResult> sinits = new ArrayList<>();
-            for(FuncResult r : results)
-                if(r.traits != null && r.traits.isStaticInitializer) sinits.add(r);
-            w.println("  \"static_init_manifest\": [");
-            for(int ci=0; ci<sinits.size(); ci++) {
-                FuncResult r = sinits.get(ci); FuncTraits t2 = r.traits;
-                w.print("    {\"addr\":\""+hex(r.address)+"\",\"name\":"+jsonString(r.name));
-                w.print(",\"uncalled\":"+t2.isUncalledStaticInit);
-                w.print(",\"installs_vtable\":"+t2.staticInitInstallsVtable);
-                w.print(",\"installs\":[");
-                boolean fi=true; for(String s:t2.staticInitInstalls){if(!fi)w.print(",");fi=false;w.print(jsonString(s));}
-                w.print("]}");
-                if(ci<sinits.size()-1) w.println(","); else w.println();
-            }
-            w.println("  ],");
-        }
-
-        // Rule 142: memory allocators.
-        {
-            List<FuncResult> allocs = new ArrayList<>();
-            for(FuncResult r : results)
-                if(r.traits != null && r.traits.isMemoryAllocator) allocs.add(r);
-            w.println("  \"memory_allocators\": [");
-            for(int ci=0; ci<allocs.size(); ci++) {
-                FuncResult r = allocs.get(ci); FuncTraits t2 = r.traits;
-                w.print("    {\"addr\":\""+hex(r.address)+"\",\"name\":"+jsonString(r.name));
-                w.print(",\"kind\":"+jsonString(t2.allocatorKind)+"}");
-                if(ci<allocs.size()-1) w.println(","); else w.println();
-            }
-            w.println("  ],");
-        }
-
-        // Rule 146: computed-jump resolution - per-func switch sites + Ghidra targets.
-        {
-            List<FuncResult> jumpFuncs = new ArrayList<>();
-            for(FuncResult r : results)
-                if(r.traits != null && !r.traits.computedJumpSwitchPcs.isEmpty()) jumpFuncs.add(r);
-            w.println("  \"computed_jump_targets\": [");
-            for(int ci=0; ci<jumpFuncs.size(); ci++) {
-                FuncResult r = jumpFuncs.get(ci); FuncTraits t2 = r.traits;
-                w.print("    {\"addr\":\""+hex(r.address)+"\",\"name\":"+jsonString(r.name));
-                w.print(",\"switch_sites\":[");
-                boolean fs=true;
-                for(Map.Entry<Long,List<Long>> e : t2.computedJumpTargets.entrySet()) {
-                    if(!fs) w.print(","); fs=false;
-                    w.print("{\"pc\":\""+hex(e.getKey())+"\",\"targets\":[");
-                    boolean ft=true;
-                    for(Long tg : e.getValue()){if(!ft)w.print(",");ft=false;w.print("\""+hex(tg)+"\"");}
-                    w.print("]}");
-                }
-                w.print("]}");
-                if(ci<jumpFuncs.size()-1) w.println(","); else w.println();
-            }
-            w.println("  ],");
-        }
-
+        
         w.println("  \"game_override_addresses\": [");
         List<Long> oaList=new ArrayList<>(gameOverrideAddresses);
         Collections.sort(oaList);
@@ -8078,12 +10921,157 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             if(i<oaList.size()-1)w.println(","); else w.println();
         }
         w.println("  ],");
-        
+
+        // v8 Rule 98 + 110: override classification + retire candidates.
+        w.println("  \"override_classification\": {");
+        {
+            boolean first = true;
+            for(Long a : oaList) {
+                String kind = overrideKindByAddr.getOrDefault(a, "real_shim");
+                String handler = overrideHandlerNames.getOrDefault(a, "");
+                String bound   = gameOverrideNames.getOrDefault(a, "");
+                boolean retire = "nop_stub".equals(kind) || "probe".equals(kind);
+                if(!first) w.println(","); first = false;
+                w.print("    \""+hex(a)+"\": {\"kind\": "+jsonString(kind)+
+                        ", \"handler\": "+jsonString(handler)+
+                        ", \"bound_name\": "+jsonString(bound)+
+                        ", \"retire_candidate\": "+retire+"}");
+            }
+        }
+        w.println("\n  },");
+
+        // v8 Rule 93: classes section.
+        w.println("  \"classes\": {");
+        {
+            boolean first = true;
+            for(Map.Entry<String,ClassEntry> e : classRegistry.entrySet()) {
+                ClassEntry ce = e.getValue();
+                if(!first) w.println(","); first = false;
+                w.print("    "+jsonString(e.getKey())+": {");
+                w.print("\"ctors\": [");
+                {
+                    boolean f = true;
+                    for(Long a : ce.ctorAddresses) {
+                        if(!f) w.print(", "); f = false;
+                        w.print("\""+hex(a)+"\"");
+                    }
+                }
+                w.print("], ");
+                w.print("\"dtor\": "+(ce.dtorAddress != null ? "\""+hex(ce.dtorAddress)+"\"" : "null")+", ");
+                w.print("\"vtable_addr\": "+(ce.vtableAddr != null ? "\""+hex(ce.vtableAddr)+"\"" : "null")+", ");
+                w.print("\"has_virtual_draw\": "+ce.hasVirtualDraw+", ");
+                w.print("\"risk_tier\": "+jsonString(ce.riskTier)+", ");
+                w.print("\"methods\": [");
+                {
+                    boolean f = true;
+                    for(String m : ce.methodNames) {
+                        if(!f) w.print(", "); f = false;
+                        w.print(jsonString(m));
+                    }
+                }
+                w.print("], ");
+                w.print("\"method_addrs\": {");
+                {
+                    boolean f = true;
+                    for(Map.Entry<String,Long> me : ce.methodAddrs.entrySet()) {
+                        if(!f) w.print(", "); f = false;
+                        w.print(jsonString(me.getKey())+": \""+hex(me.getValue())+"\"");
+                    }
+                }
+                w.print("}, ");
+                w.print("\"instantiation_sites\": [");
+                {
+                    boolean f = true;
+                    for(Long pc : ce.instantiationSites) {
+                        if(!f) w.print(", "); f = false;
+                        w.print("\""+hex(pc)+"\"");
+                    }
+                }
+                w.print("], ");
+                w.print("\"global_holders\": [");
+                {
+                    boolean f = true;
+                    for(String gh : ce.globalHolders) {
+                        if(!f) w.print(", "); f = false;
+                        w.print(jsonString(gh));
+                    }
+                }
+                w.print("]}");
+            }
+        }
+        w.println("\n  },");
+
+        // v8 Rule 103: asset upload traces (T8/T4HH back-solve).
+        w.println("  \"asset_upload_traces\": {");
+        {
+            boolean first = true;
+            for(Map.Entry<String,List<long[]>> e : assetUploadTraces.entrySet()) {
+                if(!first) w.println(","); first = false;
+                w.print("    "+jsonString(e.getKey())+": {\"matches\": [");
+                List<long[]> bucket = e.getValue();
+                for(int j=0; j<bucket.size(); j++) {
+                    if(j>0) w.print(", ");
+                    w.print("\""+hex(bucket.get(j)[0])+"\"");
+                }
+                w.print("]}");
+            }
+        }
+        w.println("\n  },");
+
+        // v8: frame clock driver shortlist (Rule 100).
+        w.println("  \"frame_clock_drivers\": [");
+        {
+            boolean first = true;
+            for(FuncResult r : results) {
+                if(r.traits != null && r.traits.isFrameClockDriver) {
+                    if(!first) w.println(","); first = false;
+                    w.print("    {\"address\": \""+hex(r.address)+
+                            "\", \"name\": "+jsonString(r.name)+"}");
+                }
+            }
+        }
+        w.println("\n  ],");
+
+        // v8 Rule 109: delta against prior triage_map.json. Empty when no prior.
+        w.println("  \"delta\": {");
+        if(priorTriageMapCats == null || priorTriageMapCats.isEmpty()) {
+            w.println("    \"available\": false");
+        } else {
+            Set<Long> nowAddrs = new HashSet<>();
+            for(FuncResult r : results) nowAddrs.add(r.address & 0xFFFFFFFFL);
+            int added=0, removed=0, changed=0;
+            List<String> changedList = new ArrayList<>();
+            for(FuncResult r : results) {
+                long a = r.address & 0xFFFFFFFFL;
+                String now = r.disposition + "|" + r.category;
+                String prev = priorTriageMapCats.get(a);
+                if(prev == null) { added++; }
+                else if(!prev.equals(now)) {
+                    changed++;
+                    if(changedList.size() < 200)
+                        changedList.add(hex(a)+":"+prev+"->"+now);
+                }
+            }
+            for(Long a : priorTriageMapCats.keySet())
+                if(!nowAddrs.contains(a)) removed++;
+            w.println("    \"available\": true,");
+            w.println("    \"added\": "+added+",");
+            w.println("    \"removed\": "+removed+",");
+            w.println("    \"changed\": "+changed+",");
+            w.println("    \"changed_sample\": [");
+            for(int i=0; i<changedList.size(); i++) {
+                w.print("      "+jsonString(changedList.get(i)));
+                w.println(i<changedList.size()-1 ? "," : "");
+            }
+            w.println("    ]");
+        }
+        w.println("  },");
+
         // ===== v11 AI-facing abstraction layer (additive; derived from existing signals) =====
         // Build per-function recommendation + subsystem/role/gateway metadata ONCE,
         // then reuse it for both the top-level summary blocks and the per-function
         // layer below. This keeps the whole layer to a constant number of O(N) /
-        // O(N+E) passes - no per-function full-graph BFS, no new graph engine.
+        // O(N+E) passes — no per-function full-graph BFS, no new graph engine.
         Map<Long,AiRec> aiRecs = new LinkedHashMap<>();
         for(FuncResult r : results) aiRecs.put(r.address & 0xFFFFFFFFL, buildFunctionRecommendation(r));
         Map<Long,String> aiPrefixByAddr = new HashMap<>();
@@ -8117,18 +11105,25 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"name\": "+jsonString(r.name)+", ");
             w.print("\"category\": \""+r.category+"\", ");
             w.print("\"disposition\": \""+r.disposition+"\", ");
-            // v15: provenance - "auto" (enricher), "step1" (inherited from the
-            // input toml and vetted), "override" (hand-bound in game_override).
+            // v11 (General v15): provenance - "auto" (enricher), "step1"
+            // (inherited from DAC.toml and vetted), "override" (hand-bound in
+            // game_override.cpp).
             w.print("\"origin\": \""+r.origin+"\", ");
             if(r.step1Disposition != null) {
                 w.print("\"step1_disposition\": \""+r.step1Disposition+"\", ");
                 w.print("\"step1_rescue_reason\": "
                     +(r.rescueReason==null?"null":jsonString(r.rescueReason))+", ");
+                // v11.1: exporter vs previous-enricher-run provenance +
+                // explicit user lock.
+                if(r.step1Source != null)
+                    w.print("\"step1_source\": \""+r.step1Source+"\", ");
+                if(r.tags.contains("STEP1_LOCKED"))
+                    w.print("\"step1_locked\": true, ");
             }
-            // v15.3 Rule 157: triage-return suggestion for bound stubs, per
-            // the runtime triage-stub strategy (ret0/ret1/reta0 bindings).
-            // Poll targets (callers spin on v0) need an A/B test: wrong
-            // constant = infinite wait loop.
+            // v11 Rule 157: triage-return suggestion for bound stubs, per the
+            // runtime triage-stub strategy (ret0/ret1/reta0 bindings). Poll
+            // targets (callers spin on v0) need an A/B test: wrong constant =
+            // infinite wait loop.
             if("STUB".equals(r.disposition)) {
                 String sug;
                 if(t.returnsA0 || t.returnsA1) sug = "reta0";
@@ -8137,7 +11132,8 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 else sug = "ret0_then_verify";
                 w.print("\"suggested_triage_return\": \""+sug+"\", ");
                 w.print("\"has_runtime_handler\": "
-                    +(runtimeRosterLoaded ? String.valueOf(hasRuntimeHandler(r.name)) : "null")+", ");
+                    +(runtimeRosterLoaded ? String.valueOf(hasRuntimeHandler(r.name)
+                        || (t.inferredName != null && hasRuntimeHandler(t.inferredName))) : "null")+", ");
             }
             w.print("\"size\": "+t.byteSize+", ");
             w.print("\"metrics\": {");
@@ -8229,7 +11225,16 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 }
             }
             w.print("], ");
-
+            w.print("\"game_globals_touched\": [");
+            {
+                boolean firstD=true;
+                for(String s:t.globalsTouched){
+                    if(!firstD) w.print(", ");
+                    firstD=false;
+                    w.print(jsonString(s));
+                }
+            }
+            w.print("], ");
             // v6 fields
             w.print("\"accesses_ipu_mmio\": "+t.accessesIpuMmio+", ");
             w.print("\"writes_ipu_cmd\": "+t.writesIpuCmd+", ");
@@ -8293,6 +11298,20 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"ctor_risk_tier\": "+jsonString(t.ctorRiskTier)+", ");
             w.print("\"called_via_direct_jal\": "+t.calledViaDirectJal+", ");
             w.print("\"called_via_jr_t9\": "+t.calledViaJrT9+", ");
+            // v11.3: registerFunction overrides are consulted ONLY for indirect jalr/jr $t9.
+            // A function reached via direct jal at any site is NOT fully hookable that way -
+            // fix it by wrapping the jal TARGET or in codegen (the G11 ReloadTexture / F51.8
+            // COP2 gotcha). hookable=true => every observed caller is indirect (safe to override);
+            // partial => mixed (some direct jal sites bypass the override).
+            w.print("\"override_hookable\": "+(t.calledViaJrT9 && !t.calledViaDirectJal)+", ");
+            w.print("\"override_hookable_partial\": "+(t.calledViaJrT9 && t.calledViaDirectJal)+", ");
+            // v11.3 Rules 162-164
+            w.print("\"programs_spr_dma\": "+t.programsSprDma+", ");
+            w.print("\"subword_dma_str_kick\": "+t.subwordDmaStrKick+", ");
+            w.print("\"is_vu1_double_buffer_framer\": "+t.isVu1DoubleBufferFramer+", ");
+            w.print("\"is_stale_ptr_cache_ctor\": "+t.isStalePtrCacheCtor+", ");
+            if(t.stalePtrCacheGetter!=null)
+                w.print("\"stale_ptr_cache_getter\": "+jsonString(t.stalePtrCacheGetter)+", ");
             w.print("\"is_pad_button_mask_consumer\": "+t.isPadButtonMaskConsumer+", ");
             w.print("\"calls_gif_packet_open\": "+t.callsGifPacketOpen+", ");
             w.print("\"calls_gif_packet_close\": "+t.callsGifPacketClose+", ");
@@ -8353,175 +11372,122 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     w.print("{\"pc\": \""+vd[0]+"\", \"vtable_slot\": \""+vd[1]+"\", \"object_reg\": "+jsonString(vd[2])+"}");
                 }
             }
-            w.print("], ");
-            // v9 fields
-            w.print("\"loads_chcr_start_const\": "+t.loadsChcrStartConst+", ");
-            w.print("\"dma_chcr_start_kick\": "+t.dmaChcrStartKick+", ");
-            w.print("\"gif_tag_inline_builder\": "+t.gifTagInlineBuilder+", ");
-            w.print("\"sif_packet_builder\": "+t.sifPacketBuilder+", ");
-            w.print("\"bitbltbuf_macro_sequence\": "+t.bitbltbufMacroSequence+", ");
-            w.print("\"is_render_frame_entry\": "+t.isRenderFrameEntry+", ");
-            w.print("\"refs_archive_strings_v9\": "+t.refsArchiveStrings+", ");
-            w.print("\"is_vu0_macro_helper\": "+t.isVu0MacroHelper+", ");
-            w.print("\"vu0_macro_op_count\": "+t.vu0MacroOps+", ");
-            w.print("\"is_struct_initializer\": "+t.isStructInitializer+", ");
-            w.print("\"is_infinite_spin_loop\": "+t.isInfiniteSpinLoop+", ");
-            w.print("\"float_cmp_ops\": "+t.floatCmpOps+", ");
-            w.print("\"module_id\": "+t.moduleId+", ");
-            w.print("\"archive_string_exts\": [");
-            {
-                boolean f=true;
-                for(String s:t.archiveStringExts){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"gif_tag_flags\": [");
-            {
-                boolean f=true;
-                for(String s:t.gifTagFlags){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"table_dispatch_sites\": [");
-            {
-                boolean f=true;
-                for(String s:t.tableDispatchSites){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"string_refs\": [");
-            {
-                boolean f=true;
-                for(String s:t.stringRefs){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"const_loads\": [");
-            {
-                boolean f=true;
-                int emitted = 0;
-                for(long[] cl : t.constLoads) {
-                    if(emitted >= 24) break;  // cap per function to bound JSON size
-                    if(!f) w.print(", "); f=false;
-                    w.print("{\"pc\": \""+String.format("0x%08X", cl[0])+"\", \"value\": \""+
-                            String.format("0x%X", cl[1])+"\"}");
-                    emitted++;
-                }
-            }
-            w.print("], ");
-            // v10 generic emit
-            w.print("\"section_name\": "+jsonString(t.sectionName)+", ");
-            w.print("\"hi_lo_ops\": "+t.hiLoOps+", ");
-            w.print("\"cyclomatic_proxy\": "+t.cyclomaticProxy+", ");
-            w.print("\"builds_gif_tag_64\": "+t.buildsGifTag64+", ");
-            w.print("\"loads_vif1_chunk_70000\": "+t.loads70000Chunk+", ");
-            w.print("\"stored_vif_opcodes\": [");
-            {
-                boolean f=true;
-                for(String s:t.storedVifOpcodes){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"stored_dma_tag_ids\": [");
-            {
-                boolean f=true;
-                for(String s:t.storedDmaTagIds){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"opcode_top5\": {");
-            {
-                List<Map.Entry<String,Integer>> sorted = new ArrayList<>(t.opcodeHistogram.entrySet());
-                sorted.sort((a,b) -> Integer.compare(b.getValue(), a.getValue()));
-                int cap = Math.min(5, sorted.size());
-                for(int k=0; k<cap; k++) {
-                    if(k>0) w.print(", ");
-                    Map.Entry<String,Integer> e = sorted.get(k);
-                    w.print(jsonString(e.getKey())+": "+e.getValue());
-                }
-            }
-            w.print("}, ");
-            // v11 per-function fields
-            w.print("\"accesses_rcnt\": "+t.accessesRcnt+", ");
-            w.print("\"accesses_vif_ctrl\": "+t.accessesVifCtrl+", ");
-            w.print("\"accesses_dmac_global\": "+t.accessesDmacGlobal+", ");
-            w.print("\"writes_intc_mask\": "+t.writesIntcMask+", ");
-            w.print("\"reads_intc_stat\": "+t.readsIntcStat+", ");
-            w.print("\"accesses_sio\": "+t.accessesSio+", ");
-            w.print("\"writes_dmac_enable\": "+t.writesDmacEnable+", ");
-            w.print("\"touches_sbus_flags\": "+t.touchesSbusFlags+", ");
-            w.print("\"dma_source_chain_tag_builder\": "+t.dmaSourceChainTagBuilder+", ");
-            w.print("\"dma_source_chain_tag_ids\": [");
-            {
-                boolean f=true;
-                for(String s:t.dmaSourceChainTagIds){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"format_magic_hits\": [");
-            {
-                boolean f=true;
-                for(String s:t.formatMagicHits){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"sif_load_module_call_count\": "+t.sifLoadModuleCallCount+", ");
-            w.print("\"is_irx_loader\": "+t.isIrxLoader+", ");
-            w.print("\"is_iop_reboot_handler\": "+t.isIopRebootHandler+", ");
-            w.print("\"irx_module_paths\": [");
-            {
-                boolean f=true;
-                for(String s:t.irxModulePaths){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"is_sync_wait_loop\": "+t.isSyncWaitLoop+", ");
-            w.print("\"contains_infinite_fail_loop\": "+t.containsInfiniteFailLoop+", ");
-            w.print("\"detected_rpc_sids\": [");
-            {
-                boolean f=true;
-                for(Long v:t.detectedRpcSids){ if(!f) w.print(", "); f=false; w.print("\""+hex(v)+"\""); }
-            }
-            w.print("], ");
-            // v12 fields.
-            w.print("\"inferred_name\": "+(t.inferredName==null?"null":jsonString(t.inferredName))+", ");
-            w.print("\"inferred_syscall_imm\": "+(t.inferredSyscallImm<0?"null":("\"0x"+String.format("%02X",t.inferredSyscallImm)+"\""))+", ");
-            w.print("\"calls_mc_sdk\": "+t.callsMcSdk+", ");
-            w.print("\"composite_mmio_ranges\": [");
-            {
-                boolean f=true;
-                for(String s : t.compositeMmioRangesHit){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"discovered_asset_paths\": [");
-            {
-                boolean f=true;
-                for(String s : t.discoveredAssetPaths){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
-            }
-            w.print("], ");
-            w.print("\"patch_candidate_pcs\": [");
-            {
-                boolean f=true;
-                for(Long pc : t.patchCandidatePcs){ if(!f) w.print(", "); f=false; w.print("\""+hex(pc)+"\""); }
-            }
-            w.print("], ");
-            w.print("\"inferred_class_name\": "+(t.inferredClassName==null?"null":jsonString(t.inferredClassName))+", ");
-            w.print("\"inferred_vtable_slot\": "+(t.inferredVtableSlot<0?"null":Integer.toString(t.inferredVtableSlot))+", ");
-            // Rules 140-150 per-function fields
-            w.print("\"cop2_partial_dest_ops\": "+t.cop2PartialDestOps+", ");
+            w.print("]");
+            // ===== v10 hardware-shape fields (the game F47-F52) =====
+            w.print(", \"cop2_partial_dest_ops\": "+t.cop2PartialDestOps+", ");
             w.print("\"cop2_full_dest_ops\": "+t.cop2FullDestOps+", ");
             w.print("\"cop2_dest_mask_verify\": "+t.cop2DestMaskVerify+", ");
             w.print("\"cop2_dest_fields\": [");
-            { boolean f=true; for(String s:t.cop2DestFields){if(!f)w.print(", ");f=false;w.print("\""+s+"\"");} }
+            {
+                boolean f=true;
+                for(String s:t.cop2DestFields){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+            }
             w.print("], ");
-            w.print("\"cop2_special_ops\": [");
-            { boolean f=true; for(String s:t.cop2SpecialOps){if(!f)w.print(", ");f=false;w.print("\""+s+"\"");} }
-            w.print("], ");
-            w.print("\"writes_fpu_control\": "+t.writesFpuControl+", ");
-            w.print("\"uses_fpu_div_sqrt\": "+t.usesFpuDivSqrt+", ");
             w.print("\"is_static_initializer\": "+t.isStaticInitializer+", ");
             w.print("\"static_init_installs_vtable\": "+t.staticInitInstallsVtable+", ");
             w.print("\"is_uncalled_static_init\": "+t.isUncalledStaticInit+", ");
+            w.print("\"static_init_installs\": [");
+            {
+                boolean f=true;
+                for(long[] e:t.staticInitInstalls){
+                    if(!f) w.print(", "); f=false;
+                    w.print("{\"pc\": \""+hex(e[0])+"\", \"value\": \""+hex(e[1])+
+                            "\", \"offset\": \""+hex(e[2])+"\"}");
+                }
+            }
+            w.print("], ");
             w.print("\"is_memory_allocator\": "+t.isMemoryAllocator+", ");
             w.print("\"allocator_kind\": "+jsonString(t.allocatorKind)+", ");
             w.print("\"is_guest_lock_hog_candidate\": "+t.isGuestLockHogCandidate+", ");
             w.print("\"reads_eabi_arg_t0\": "+t.readsEabiArgT0+", ");
             w.print("\"loads_psmct16_const\": "+t.loadsPsmct16Const+", ");
             w.print("\"is_psmct16_clut_uploader\": "+t.isPsmct16ClutUploader+", ");
+            // ===== v10.1 hardware-shape fields =====
+            w.print("\"cop2_special_ops\": [");
+            {
+                boolean f=true;
+                for(String s:t.cop2SpecialOps){ if(!f) w.print(", "); f=false; w.print(jsonString(s)); }
+            }
+            w.print("], ");
+            w.print("\"writes_fpu_control\": "+t.writesFpuControl+", ");
+            w.print("\"uses_fpu_div_sqrt\": "+t.usesFpuDivSqrt+", ");
             w.print("\"is_overlay_loader\": "+t.isOverlayLoader+", ");
-            w.print("\"computed_jump_switch_pcs\": [");
-            { boolean f=true; for(Long pc:t.computedJumpSwitchPcs){if(!f)w.print(", ");f=false;w.print("\""+hex(pc)+"\"");} }
+            // ===== v12 fields (Rules 165-177) =====
+            w.print("\"writes_frame_reg\": "+t.writesFrameReg+", ");
+            w.print("\"is_rtt_target\": "+t.isRttTarget+", ");
+            w.print("\"zbuf_vram_alias_risk\": "+t.zbufVramAliasRisk+", ");
+            w.print("\"vram_known_pages_hit\": [");
+            { boolean f=true; for(Long p : t.vramKnownPagesHit){ if(!f)w.print(", "); f=false;
+                w.print("{\"page\": \""+hex(p)+"\", \"label\": "
+                    +jsonString(KNOWN_TBP_LABELS.getOrDefault(p,""))+"}"); } }
+            w.print("], ");
+            w.print("\"is_vf0_dependent_inverse\": "+t.isVf0DependentInverse+", ");
+            w.print("\"is_audio_completion_gate\": "+t.isAudioCompletionGate+", ");
+            w.print("\"audio_gate_signals\": "+jsonStrArray(new ArrayList<>(t.audioGateSignals))+", ");
+            w.print("\"is_memcard_io\": "+t.isMemcardIo+", ");
+            w.print("\"memcard_callees\": "+jsonStrArray(new ArrayList<>(t.memcardCallees))+", ");
+            w.print("\"writes_presentation_field_state\": "+t.writesPresentationFieldState+", ");
+            w.print("\"presentation_regs\": "+jsonStrArray(new ArrayList<>(t.presentationRegs))+", ");
+            w.print("\"is_display_buffer_flip\": "+t.isDisplayBufferFlip+", ");
+            w.print("\"is_clut_cache_invalidator\": "+t.isClutCacheInvalidator+", ");
+            w.print("\"is_perf_hot_frame_path\": "+t.isPerfHotFramePath+", ");
+            // ===== v13 fields (Rules 178-188) =====
+            w.print("\"is_conditional_init_on_global\": "+t.isConditionalInitOnGlobal+", ");
+            w.print("\"guard_globals\": "+jsonStrArray(new ArrayList<>(t.guardGlobals))+", ");
+            w.print("\"is_render_mode_selector\": "+t.isRenderModeSelector+", ");
+            w.print("\"is_vertex_lighting_term\": "+t.isVertexLightingTerm+", ");
+            w.print("\"lighting_sources\": "+jsonStrArray(new ArrayList<>(t.lightingSources))+", ");
+            w.print("\"is_vtable_tailcall_thunk\": "+t.isVtableTailcallThunk+", ");
+            w.print("\"tailcall_vtable_slots\": [");
+            { boolean f=true; for(Long s : t.tailcallVtableSlots){ if(!f)w.print(", "); f=false; w.print("\""+hex(s)+"\""); } }
+            w.print("], ");
+            w.print("\"is_rtt_no_restore\": "+t.isRttNoRestore+", ");
+            w.print("\"is_vu_flag_pipeline_uploader\": "+t.isVuFlagPipelineUploader+", ");
+            w.print("\"is_packed_rgbaq_builder\": "+t.isPackedRgbaqBuilder+", ");
+            w.print("\"is_frame_resume_risk\": "+t.isFrameResumeRisk+", ");
+            // ===== v15 fields (Rules 190-198) =====
+            w.print("\"is_prim_class_selector\": "+t.isPrimClassSelector+", ");
+            w.print("\"is_adc_kick_vertex_source\": "+t.isAdcKickVertexSource+", ");
+            w.print("\"adc_source\": "+jsonString(t.adcSource==null?"":t.adcSource)+", ");
+            w.print("\"writes_xyz2_reg\": "+t.writesXyz2Reg+", ");
+            w.print("\"writes_xyz3_reg\": "+t.writesXyz3Reg+", ");
+            w.print("\"is_kick_mode_writer\": "+t.isKickModeWriter+", ");
+            w.print("\"kick_const_add_count\": "+t.kickConstAddCount+", ");
+            w.print("\"is_texture_reload_interleave\": "+t.isTextureReloadInterleave+", ");
+            w.print("\"is_vsync_coupled_game_step\": "+t.isVsyncCoupledGameStep+", ");
+            w.print("\"is_view_projection_matrix_writer\": "+t.isViewProjectionMatrixWriter+", ");
+            w.print("\"is_object_array_ctor\": "+t.isObjectArrayCtor+", ");
+            w.print("\"vu_exec_hazards\": "+jsonStrArray(new ArrayList<>(t.vuExecHazards))+", ");
+            // ===== v15.1 fields (PCSX2-grounded, Rules 199-201) =====
+            w.print("\"is_vif_unpack_decompress_state\": "+t.isVifUnpackDecompressState+", ");
+            w.print("\"vif_unpack_state_cmds\": "+jsonStrArray(new ArrayList<>(t.vifUnpackStateCmds))+", ");
+            w.print("\"writes_xyoffset_reg\": "+t.writesXyoffsetReg+", ");
+            w.print("\"writes_tex1_reg\": "+t.writesTex1Reg+", ");
+            // ===== v15.2 fields (skill codegen classes, Rules 203-204) =====
+            w.print("\"uses_mmi\": "+t.usesMmi+", ");
+            w.print("\"mmi_op_count\": "+t.mmiOpCount+", ");
+            w.print("\"mmi_families\": "+jsonStrArray(new ArrayList<>(t.mmiFamilies))+", ");
+            w.print("\"uses_cop2_control_reg\": "+t.usesCop2ControlReg+", ");
+            w.print("\"cop2_control_regs\": "+jsonStrArray(new ArrayList<>(t.cop2ControlRegs))+", ");
+            w.print("\"computed_jump_sites\": [");
+            {
+                Map<Long,List<Long>> byPc = new LinkedHashMap<>();
+                for(Long pc : t.computedJumpSwitchPcs) byPc.put(pc, new ArrayList<>());
+                for(long[] e : t.computedJumpTargets) {
+                    List<Long> lst = byPc.get(e[0]);
+                    if(lst == null) { lst = new ArrayList<>(); byPc.put(e[0], lst); }
+                    lst.add(e[1]);
+                }
+                boolean f=true;
+                for(Map.Entry<Long,List<Long>> e : byPc.entrySet()){
+                    if(!f) w.print(", "); f=false;
+                    w.print("{\"pc\": \""+hex(e.getKey())+"\", \"unresolved\": "+e.getValue().isEmpty()+
+                            ", \"targets\": [");
+                    boolean g=true;
+                    for(Long tg : e.getValue()){ if(!g) w.print(", "); g=false; w.print("\""+hex(tg)+"\""); }
+                    w.print("]}");
+                }
+            }
             w.print("]");
             w.print("}, ");
             // v4 graph-derived fields, hoisted above tags so consumers can sort.
@@ -8545,9 +11511,6 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             }
             w.print("], ");
             // F21-prep: literal-offset memory-access index.
-            // v11 (P) revert: cap removed - user found 669 FF1 functions
-            // truncating at 32 dropped substantial literal_refs data. Uncapped
-            // emit restored. Use jq filtering downstream if size matters.
             w.print("\"literal_refs\": [");
             for(int j=0;j<t.literalRefs.size();j++){
                 if(j>0)w.print(", ");
@@ -8558,12 +11521,24 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                         ", \"dest_reg\": "+jsonString(lr[4])+"}");
             }
             w.print("]");
-
-            // v7: runtime_corroboration block. Emitted whenever there is a
-            // bullseye prediction OR TBP constant load OR safe-stub candidate.
-            // v11 (M) revert: original gate kept - TBP constants are static
-            // facts useful even without GS dump corroboration. Witness fields
-            // stay false/empty when no GS evidence loaded, which is correct.
+            // v4 Rule 41: archive_io_callers — emit per ARCHIVE_IO function for
+            // convenience (the same info exists in `callers`, but consumers
+            // generating phase docs want it at the per-function level without
+            // re-running the reverse lookup).
+            if(t.refsArchiveStrings) {
+                w.print(", \"archive_io_callers\": [");
+                for(int j=0;j<t.callers.size();j++){
+                    if(j>0)w.print(", ");
+                    long[] c = t.callers.get(j);
+                    String cn = nameByAddr.getOrDefault(c[0]&0xFFFFFFFFL, "");
+                    w.print("{\"address\": \""+hex(c[0])+"\", \"name\": "+jsonString(cn)+
+                            ", \"call_site_pc\": \""+hex(c[1])+"\"}");
+                }
+                w.print("]");
+            }
+            // v7: runtime_corroboration block. Emitted only when there is
+            // either a prediction or a TBP-constant match; omitted otherwise
+            // to keep JSON size bounded for leaf/utility functions.
             if (!t.runtimeBullseyePredictions.isEmpty() || !t.tbpConstantsLoaded.isEmpty()
                 || t.gsIrqSafeStubCandidate) {
                 w.print(", \"runtime_corroboration\": {");
@@ -8635,72 +11610,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
         w.println("  ],");
 
-        // v8 class registry
-        // v15.5 fix: the _note line used to carry an unconditional trailing
-        // comma; on stripped binaries (empty classRegistry) that produced
-        // invalid JSON ({"_note": "...",}). The comma is now emitted as a
-        // prefix of each entry instead.
-        w.println("  \"class_registry\": {");
-        w.print("    \"_note\": \"v8: populated during runV8PostPasses()\"");
-        {
-            for(Map.Entry<String,ClassEntry> e : classRegistry.entrySet()) {
-                ClassEntry ce = e.getValue();
-                w.println(",");
-                w.print("    "+jsonString(e.getKey())+": {");
-                w.print("\"ctors\": [");
-                {
-                    boolean f = true;
-                    for(Long a : ce.ctorAddresses) {
-                        if(!f) w.print(", "); f = false;
-                        w.print("\""+hex(a)+"\"");
-                    }
-                }
-                w.print("], ");
-                w.print("\"dtor\": "+(ce.dtorAddress != null ? "\""+hex(ce.dtorAddress)+"\"" : "null")+", ");
-                w.print("\"vtable_addr\": "+(ce.vtableAddr != null ? "\""+hex(ce.vtableAddr)+"\"" : "null")+", ");
-                w.print("\"has_virtual_draw\": "+ce.hasVirtualDraw+", ");
-                w.print("\"risk_tier\": "+jsonString(ce.riskTier)+", ");
-                w.print("\"methods\": [");
-                {
-                    boolean f = true;
-                    for(String m : ce.methodNames) {
-                        if(!f) w.print(", "); f = false;
-                        w.print(jsonString(m));
-                    }
-                }
-                w.print("], ");
-                w.print("\"method_addrs\": {");
-                {
-                    boolean f = true;
-                    for(Map.Entry<String,Long> me : ce.methodAddrs.entrySet()) {
-                        if(!f) w.print(", "); f = false;
-                        w.print(jsonString(me.getKey())+": \""+hex(me.getValue())+"\"");
-                    }
-                }
-                w.print("}, ");
-                w.print("\"instantiation_sites\": [");
-                {
-                    boolean f = true;
-                    for(Long pc : ce.instantiationSites) {
-                        if(!f) w.print(", "); f = false;
-                        w.print("\""+hex(pc)+"\"");
-                    }
-                }
-                w.print("], ");
-                w.print("\"global_holders\": [");
-                {
-                    boolean f = true;
-                    for(String gh : ce.globalHolders) {
-                        if(!f) w.print(", "); f = false;
-                        w.print(jsonString(gh));
-                    }
-                }
-                w.print("]}");
-            }
-        }
-        w.println("\n  },");
-
-        // v5 Rule 57: focus_set - top-priority bullseye. The community lessons
+        // v5 Rule 57: focus_set — top-priority bullseye. The community lessons
         // say "you only need to rewrite the 5 exact functions"; this array is
         // exactly that shortlist (plus PATH3_INITIATOR / TEX0 writers / etc.).
         // Pre-sorted by tag class for the report tool.
@@ -8709,38 +11619,22 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             List<FuncResult> focus = new ArrayList<>();
             for(FuncResult r : results)
                 if(r.traits != null && r.traits.isTopPriorityFix) focus.add(r);
-            // O4: when no GS bullseyes hit (typical of stripped binaries),
-            // synthesize top-32 by composite criticality score.
-            if(focus.isEmpty()) {
-                List<FuncResult> candidates = new ArrayList<>();
-                for(FuncResult r : results) {
+            // v9 Rule 136: synth fallback when no bullseyes fire — top-32 by score.
+            boolean synthetic = focus.isEmpty();
+            if(synthetic) {
+                List<FuncResult> scored = new ArrayList<>(results);
+                scored.sort((a,b) -> Long.compare(
+                    scoreFocus(b.traits == null ? null : b.traits),
+                    scoreFocus(a.traits == null ? null : a.traits)));
+                int cap = Math.min(32, scored.size());
+                for(int i = 0; i < cap; i++) {
+                    FuncResult r = scored.get(i);
                     if(r.traits == null) continue;
-                    FuncTraits t = r.traits;
-                    int score = 0;
-                    if(t.callOps > 5) score += 2;
-                    if(t.accessesMMIO) score += 3;
-                    if(t.mainLoopDepth >= 0 && t.mainLoopDepth <= 4) score += 3;
-                    if(t.writesToGlobal) score += 1;
-                    if(t.indirectCallT9Count > 0) score += 2;
-                    if(t.hasJumpTable) score += 1;
-                    if(t.refsArchiveStrings) score += 2;
-                    if(t.isVu0MacroHelper) score += 3;
-                    if(t.gifTagInlineBuilder) score += 4;
-                    if(t.dmaChcrStartKick) score += 4;
-                    if(t.bitbltbufMacroSequence) score += 4;
-                    if(t.isRenderFrameEntry) score += 4;
-                    if(score >= 4) candidates.add(r);
+                    if(!r.tags.contains("FOCUS_SYNTHETIC")) r.tags.add("FOCUS_SYNTHETIC");
+                    focus.add(r);
                 }
-                candidates.sort((a,b) -> {
-                    int sa = scoreFocus(a.traits);
-                    int sb = scoreFocus(b.traits);
-                    if (sa != sb) return Integer.compare(sb, sa);  // desc
-                    return Long.compare(a.address & 0xFFFFFFFFL, b.address & 0xFFFFFFFFL);
-                });
-                int cap = Math.min(32, candidates.size());
-                focus = candidates.subList(0, cap);
             }
-            // v7 Rule 81: re-rank - CONFIRMED first, INDETERMINATE next,
+            // v7 Rule 81: re-rank — CONFIRMED first, INDETERMINATE next,
             // MENU_ONLY then DORMANT. Stable within a bucket by address.
             focus.sort((a,b) -> {
                 int ra = focusRank(a.traits);
@@ -8761,132 +11655,184 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 w.print("], \"mainloop_depth\": "+t.mainLoopDepth+
                         ", \"drawing_chain_depth\": "+t.drawingChainDepth+
                         ", \"caller_count\": "+t.callers.size()+
-                        ", \"runtime_status\": "+jsonString(t.runtimeStatus)+"}");
+                        ", \"runtime_status\": "+jsonString(t.runtimeStatus)+
+                        ", \"game_role\": "+jsonString(t.knownRole == null ? "" : t.knownRole)+
+                        ", \"game_phase\": "+jsonString(t.knownPhase == null ? "" : t.knownPhase)+
+                        ", \"game_criticality\": "+jsonString(t.knownCriticality == null ? "" : t.knownCriticality)+
+                        ", \"module_id\": "+t.moduleId+
+                        ", \"synthetic\": "+(synthetic ? "true" : "false")+"}");
                 if(i<focus.size()-1) w.println(","); else w.println();
             }
         }
         w.println("  ],");
 
-        // v9: top-level indexes.
-        w.println("  \"function_pointer_tables\": [");
-        {
-            boolean first = true;
-            for(Map.Entry<Long,List<Long>> e : functionPointerTables.entrySet()) {
-                if(!first) w.println(","); first = false;
-                w.print("    {\"address\": \""+hex(e.getKey())+"\", \"entries\": [");
-                List<Long> entries = e.getValue();
-                for(int i=0;i<entries.size();i++) {
-                    if(i>0) w.print(", ");
-                    w.print("\""+hex(entries.get(i))+"\"");
-                }
-                w.print("]}");
-            }
+        // v9 Rule 131: Known function addresses (hardcoded from PROJECT_STATE.md)
+        w.println("  \"known_function_addresses\": [");
+        for(int i=0; i<KNOWN_FUNCTION_ADDRESSES.length; i++) {
+            Object[] row = KNOWN_FUNCTION_ADDRESSES[i];
+            w.print("    {\"address\": \""+hex(((Number)row[0]).longValue())+
+                    "\", \"name\": "+jsonString((String)row[1])+
+                    ", \"phase\": "+jsonString((String)row[2])+
+                    ", \"role\": "+jsonString((String)row[3])+
+                    ", \"criticality\": "+jsonString((String)row[4])+"}");
+            w.println(i<KNOWN_FUNCTION_ADDRESSES.length-1 ? "," : "");
         }
-        w.println("\n  ],");
+        w.println("  ],");
 
-        w.println("  \"module_clusters\": {");
+        // v9 Rule 132: the game VRAM TBP labels
+        w.println("  \"known_tbp_labels\": {");
         {
-            boolean first = true;
-            for(Map.Entry<Integer,Set<Long>> e : moduleClusters.entrySet()) {
-                if(e.getValue().size() < 2) continue;  // skip singletons
-                if(!first) w.println(","); first = false;
-                w.print("    \"m"+e.getKey()+"\": {\"size\": "+e.getValue().size()+
-                        ", \"min_address\": \""+hex(Collections.min(e.getValue()))+"\"}");
+            boolean f = true;
+            for(Map.Entry<Long,String> e : KNOWN_TBP_LABELS.entrySet()) {
+                if(!f) w.println(","); f = false;
+                w.print("    \"0x"+String.format("%04X", e.getKey() & 0xFFFFL)+
+                        "\": "+jsonString(e.getValue()));
             }
         }
         w.println("\n  },");
-        // v11 (K): name-prefix subsystem index.
+
+        // v9 Rule 133: the game runtime invariants confirmed across all 9 GS dumps
+        w.println("  \"runtime_invariants\": [");
+        for(int i=0; i<RUNTIME_INVARIANTS.length; i++) {
+            String[] row = RUNTIME_INVARIANTS[i];
+            w.print("    {\"name\": "+jsonString(row[0])+
+                    ", \"description\": "+jsonString(row[1])+"}");
+            w.println(i<RUNTIME_INVARIANTS.length-1 ? "," : "");
+        }
+        w.println("  ],");
+
+        // v9 Rule 134: the game pre-computed call chains
+        w.println("  \"call_chains\": {");
+        for(int i=0; i<CALL_CHAINS.length; i++) {
+            Object[] row = CALL_CHAINS[i];
+            String tag = (String)row[0];
+            String[] stations = (String[])row[1];
+            w.print("    "+jsonString(tag)+": [");
+            for(int j=0; j<stations.length; j++) {
+                if(j>0) w.print(", ");
+                w.print(jsonString(stations[j]));
+            }
+            w.print("]");
+            w.println(i<CALL_CHAINS.length-1 ? "," : "");
+        }
+        w.println("  },");
+
+        // v9 Rule 135: working PAD_INPUT scripts from fix logs
+        w.println("  \"pad_input_scripts\": [");
+        for(int i=0; i<PAD_INPUT_SCRIPTS.length; i++) {
+            String[] row = PAD_INPUT_SCRIPTS[i];
+            w.print("    {\"tag\": "+jsonString(row[0])+
+                    ", \"script\": "+jsonString(row[1])+
+                    ", \"frame_anchor\": "+jsonString(row[2])+
+                    ", \"observed_effect\": "+jsonString(row[3])+"}");
+            w.println(i<PAD_INPUT_SCRIPTS.length-1 ? "," : "");
+        }
+        w.println("  ],");
+
+        // v9 Rule 128: function pointer tables
+        w.println("  \"function_pointer_tables\": [");
+        {
+            int n = functionPointerTables.size(); int i = 0;
+            for(Map.Entry<Long,List<long[]>> e : functionPointerTables.entrySet()) {
+                w.print("    {\"address\": \""+hex(e.getKey())+
+                        "\", \"entries\": [");
+                List<long[]> entries = e.getValue();
+                for(int j = 0; j < entries.size(); j++) {
+                    if(j>0) w.print(", ");
+                    w.print("\""+hex(entries.get(j)[0])+"\"");
+                }
+                w.print("], \"size\": "+entries.size()+"}");
+                w.println((++i < n) ? "," : "");
+            }
+        }
+        w.println("  ],");
+
+        // v9 Rule 129: module clusters
+        w.println("  \"module_clusters\": {");
+        {
+            int n = moduleClusters.size(); int i = 0;
+            for(Map.Entry<Integer,Set<Long>> e : moduleClusters.entrySet()) {
+                w.print("    \"mod_"+e.getKey()+"\": [");
+                int j = 0;
+                for(Long a : e.getValue()) {
+                    if(j>0) w.print(", "); j++;
+                    w.print("\""+hex(a)+"\"");
+                }
+                w.print("]");
+                w.println((++i < n) ? "," : "");
+            }
+        }
+        w.println("  },");
+
+        // v9 Rule 130: name-prefix modules
         w.println("  \"name_prefix_modules\": {");
         {
-            boolean first = true;
+            int n = namePrefixModules.size(); int i = 0;
             for(Map.Entry<String,List<Long>> e : namePrefixModules.entrySet()) {
-                if(!first) w.println(","); first = false;
-                w.print("    "+jsonString(e.getKey())+": {\"size\": "+e.getValue().size()+
-                        ", \"min_address\": \""+hex(Collections.min(e.getValue()))+"\"}");
+                w.print("    "+jsonString(e.getKey())+": [");
+                List<Long> lst = e.getValue();
+                for(int j = 0; j < lst.size(); j++) {
+                    if(j>0) w.print(", ");
+                    w.print("\""+hex(lst.get(j))+"\"");
+                }
+                w.print("]");
+                w.println((++i < n) ? "," : "");
             }
         }
-        w.println("\n  }");
+        w.println("  },");
+
+        // v9 Rule 139: discovered IOP SIDs with caller list
+        w.println("  \"discovered_iop_sids\": [");
+        {
+            List<Long> sids = new ArrayList<>(discoveredSidToCallers.keySet());
+            Collections.sort(sids);
+            for(int i = 0; i < sids.size(); i++) {
+                long sid = sids.get(i);
+                Set<Long> callers = discoveredSidToCallers.get(sid);
+                w.print("    {\"sid\": \""+hex(sid)+"\", \"callers\": [");
+                int j = 0;
+                for(Long c : callers) {
+                    if(j>0) w.print(", "); j++;
+                    w.print("\""+hex(c)+"\"");
+                }
+                w.print("]}");
+                w.println(i < sids.size()-1 ? "," : "");
+            }
+        }
+        w.println("  ],");
+
+        // v9: discovered FIDs (function-ids for sceSifCallRpc)
+        w.println("  \"discovered_iop_fids\": [");
+        {
+            List<Long> fids = new ArrayList<>(discoveredFidToCallers.keySet());
+            Collections.sort(fids);
+            for(int i = 0; i < fids.size(); i++) {
+                long fid = fids.get(i);
+                Set<Long> callers = discoveredFidToCallers.get(fid);
+                w.print("    {\"fid\": \""+hex(fid)+"\", \"callers\": [");
+                int j = 0;
+                for(Long c : callers) {
+                    if(j>0) w.print(", "); j++;
+                    w.print("\""+hex(c)+"\"");
+                }
+                w.print("]}");
+                w.println(i < fids.size()-1 ? "," : "");
+            }
+        }
+        w.println("  ]");
         w.println("}");
         w.close();
-    }
-
-    class FuncResult{long address;String name,category,disposition;FuncTraits traits;List<String>tags;
-        // v15: provenance. origin: "auto" (enricher decision), "step1"
-        // (inherited from the input toml, vetted), "override" (bound in
-        // game_override.cpp). step1Disposition/rescueReason only for step1.
-        String origin="auto";String step1Disposition=null;String rescueReason=null;
-        // v15.1: which pass rescued the step1 binding (step1_keep_gate /
-        // drawing_chain_firewall / v8_ctor_risk / v8_scevu0_helper /
-        // v13_binding_firewall).
-        String rescuedBy=null;}
-    private static String hex(long v){return String.format("0x%08X",v&0xFFFFFFFFL);}
-    private static String jsonString(String v){
-        if(v==null)return "\"\"";
-        // v15.5: full RFC 8259 escaping. Symbol names scraped from arbitrary
-        // ELFs can carry control bytes; bare emission produced invalid JSON.
-        StringBuilder sb = new StringBuilder(v.length()+8);
-        sb.append('"');
-        for(int i=0;i<v.length();i++){
-            char c = v.charAt(i);
-            switch(c){
-                case '\\': sb.append("\\\\"); break;
-                case '"':  sb.append("\\\""); break;
-                case '\n': sb.append("\\n");  break;
-                case '\r': sb.append("\\r");  break;
-                case '\t': sb.append("\\t");  break;
-                default:
-                    if(c < 0x20) sb.append(String.format("\\u%04x",(int)c));
-                    else sb.append(c);
-            }
-        }
-        return sb.append('"').toString();
-    }
-
-    // v9 O4 helper - composite score for stripped-binary focus fallback.
-    // Rule 136: composite focus score - fallback when no bullseyes fire.
-    private static int scoreFocus(FuncTraits t) {
-        if(t == null) return 0;
-        int score = 0;
-        // Legacy signals
-        if(t.callOps > 5) score += 2;
-        if(t.accessesMMIO) score += 3;
-        if(t.mainLoopDepth >= 0 && t.mainLoopDepth <= 4) score += 3;
-        if(t.writesToGlobal) score += 1;
-        if(t.indirectCallT9Count > 0) score += 2;
-        if(t.hasJumpTable) score += 1;
-        if(t.refsArchiveStrings) score += 2;
-        if(t.isVu0MacroHelper) score += 3;
-        // v9+ high-value signals (DC2 Rule 136)
-        if(t.isCtor)                                            score += 8;
-        if("CRITICAL".equals(t.ctorRiskTier))                  score += 14;
-        if("HIGH".equals(t.ctorRiskTier))                      score += 8;
-        if(t.isRenderFrameEntry)                               score += 20;
-        if(t.isFrameClockDriver)                               score += 12;
-        if(t.isInfiniteSpinLoop)                               score += 10;
-        if(t.isSyncWaitLoop)                                   score += 10;
-        if(t.isBitbltbufT4hhUploader)                         score += 22;
-        if(t.isCtorMultiFieldInit)                             score += 10;
-        if(t.isLifecycleLazyInit)                              score += 10;
-        if(t.gifTagInlineBuilder)                              score += 16;
-        if(t.dmaChcrStartKick)                                 score += 18;
-        if(t.bitbltbufMacroSequence)                           score += 18;
-        if(t.dmaSourceChainTagBuilder)                         score += 12;
-        if(t.isIrxLoader)                                      score += 8;
-        if(t.drawingChainDepth >= 0 && t.drawingChainDepth <= 6) score += 12;
-        score += Math.min(t.calleeNames.size(), 5);
-        score += Math.min(t.callers.size(), 3);
-        return score;
     }
 
     // =========================================================================
     // v11 AI-FACING ABSTRACTION LAYER (additive)
     // -------------------------------------------------------------------------
     // Purpose: expose the intelligence already collected by Rules 1-150 in a
-    // shape another AI can reason about - per-function recommendations, a
+    // shape another AI can reason about — per-function recommendations, a
     // subsystem/relationship view, decision guardrails, and next-rule hints.
     // This is NOT a second triage engine: every field is DERIVED from existing
-    // traits, tags, depths, module clusters, class registry, runtime
-    // corroboration, asset-upload traces and override coverage.
+    // traits, tags, depths, module clusters, call chains, class registry,
+    // runtime corroboration, asset-upload traces and override coverage.
     // Cost: a constant number of O(N) / O(N+E) passes; no per-function BFS.
     // =========================================================================
 
@@ -8906,7 +11852,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         "MICROCODE_UPLOADER","TEX0_REG_WRITER","DISPFB_WRITER","DISPFB_SDK_WRITER",
         "COP2_DESTMASK_VERIFY","STATIC_INIT_VTABLE_INSTALLER","MAP_CLUT_PSMCT16_UPLOADER",
         "FRAME_CLOCK_DRIVER","LIBGCC_INTRINSIC",
-        // v15.5 Rule 161: runtime code linker/loader - stubbing it kills the
+        // v11 Rule 161: runtime code linker/loader - stubbing it kills the
         // game's entire runtime-loaded code path.
         "DYNAMIC_CODE_LOADER"
     };
@@ -8954,8 +11900,9 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         return 0;
     }
     private static String fmtConf(double c){ return String.format(Locale.US, "%.2f", c); }
-    /** v15.2: emit one advisory array as [{"entry": "...", "tags": [...]}].
-     *  Input strings are "name@0xADDR" optionally followed by " # TAG,TAG". */
+    /** v11 (General v15.2): emit one advisory array as
+     *  [{"entry": "...", "tags": [...]}]. Input strings are "name@0xADDR"
+     *  optionally followed by " # TAG,TAG". */
     private static void emitAdvisoryJsonArray(PrintWriter w, String key,
                                               List<String> list, boolean trailingComma) {
         w.println("    \""+key+"\": [");
@@ -8973,7 +11920,6 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         }
         w.println("    ]"+(trailingComma?",":""));
     }
-
     private static String jsonStrArray(Collection<String> c){
         StringBuilder sb = new StringBuilder("["); boolean f = true;
         for(String s : c){ if(!f) sb.append(", "); f = false; sb.append(jsonString(s)); }
@@ -8984,6 +11930,18 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         for(String s : c){ if(n >= cap) break; if(!f) sb.append(", "); f = false; sb.append(jsonString(s)); n++; }
         if(c.size() > cap){ if(!f) sb.append(", "); sb.append(jsonString("+" + (c.size()-cap) + " more")); }
         return sb.append("]").toString();
+    }
+    // v13: emit a [name, addrHex, detail] roster as a JSON array of objects.
+    private static void emitV13Roster(java.io.PrintWriter w, String key,
+                                      List<String[]> rows, String detailKey){
+        w.println("  \""+key+"\": [");
+        for(int i=0;i<rows.size();i++){
+            String[] e = rows.get(i);
+            w.print("    {\"name\": "+jsonString(e[0])+", \"address\": "+jsonString(e[1])
+                +", \""+detailKey+"\": "+jsonString(e[2])+"}");
+            w.println(i<rows.size()-1?",":"");
+        }
+        w.println("  ],");
     }
     private static boolean hasAnyTag(FuncResult r, String[] tags){
         if(r.tags == null) return false;
@@ -8997,9 +11955,9 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             FuncTraits t = r.traits; if(t == null) continue;
             boolean imp = t.isTopPriorityFix || r.tags.contains("TOP_PRIORITY_FIX")
                 || t.isRenderFrameEntry || t.path3Initiator || t.isBitbltbufT4hhUploader
-                || t.isFrameClockDriver || t.isMemoryAllocator
+                || t.knownRole != null || t.isFrameClockDriver || t.isMemoryAllocator
                 || t.mustBeImplemented || t.ctorInstallsVtable || t.isStaticInitializer
-                || t.isIrxLoader || t.callsSifRpc
+                || !t.callChainsTagged.isEmpty() || t.isIrxLoader || t.callsSifRpc
                 || t.mainLoopDepth == 0;
             if(imp){ addrs.add(r.address & 0xFFFFFFFFL); if(r.name != null) names.add(r.name); }
         }
@@ -9020,11 +11978,13 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             || t.writesTex0Reg || t.writesRgbaqReg || t.readsPrimReg || t.writesDispfbReg
             || t.writesZbufReg || t.touchesGifP3Reg || t.writesGifFifo || t.writesVif1Fifo
             || t.writesVif0Fifo || t.accessesVuMicromem || t.accessesVuDatamem || t.isMicrocodeUploader
-            || r.tags.contains("GIF_PATH3_HAZARD") || r.tags.contains("DISPFB_WRITER");
+            || r.tags.contains("GIF_PATH3_HAZARD") || r.tags.contains("DISPFB_WRITER")
+            || (t.methodClassName != null && t.methodClassName.startsWith("mg"))
+            || (t.ctorClassName  != null && t.ctorClassName.startsWith("mg"));
         if(render) return "render";
         boolean iop = t.callsSifRpc || t.isIrxLoader || t.isIopRebootHandler
             || r.tags.contains("IOP_RPC_DISPATCH") || r.tags.contains("IRX_LOADER")
-            || t.detectedRpcSid != 0 || !t.allDetectedSids.isEmpty() || t.touchesSbus;
+            || t.detectedRpcSid != 0 || !t.discoveredRpcSids.isEmpty() || t.touchesSbus;
         if(iop) return "iop_rpc";
         if(t.isAudioRpcHandler || r.tags.contains("AUDIO_RPC_HANDLER")) return "audio";
         boolean archive = t.refsArchiveStrings || t.callsFileOpen || !t.filePathSprintfFormats.isEmpty()
@@ -9069,7 +12029,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         if(t.isMcTransitionGate) return "memory_card_gate";
         if(t.isAudioRpcHandler) return "audio_rpc_handler";
         if(t.mustBeImplemented || t.isSceVu0Helper) return "vu0_math_helper";
-        if(r.tags.contains("HOST_WAIT_CANDIDATE") || r.tags.contains("BACKWARD_BRANCH_SYNC_WAIT")) return "sync_wait_loop";
+        if(t.hostWaitCandidate || r.tags.contains("BACKWARD_BRANCH_SYNC_WAIT")) return "sync_wait_loop";
         if(r.tags.contains("INFINITE_FAIL_LOOP")) return "infinite_fail_loop";
         if(!t.virtualDispatchSites.isEmpty()) return "virtual_dispatcher";
         if(!t.computedJumpSwitchPcs.isEmpty() || t.hasJumpTable) return "jump_table_dispatcher";
@@ -9086,7 +12046,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             || t.isStaticInitializer || t.ctorInstallsVtable
             || (t.callsFileOpen && t.refsArchiveStrings)
             || t.callsSifRpc || t.isMemoryAllocator
-            || t.callers.size() >= 8;
+            || t.callers.size() >= 8 || !t.callChainsTagged.isEmpty();
     }
 
     private List<String> mainLoopHints(FuncTraits t){
@@ -9118,7 +12078,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     }
 
     // -------------------------------------------------------------------------
-    // Per-function recommendation. Pure derivation from existing data.
+    // Per-function recommendation (Part 2). Pure derivation from existing data.
     // -------------------------------------------------------------------------
     private AiRec buildFunctionRecommendation(FuncResult r){
         AiRec rec = new AiRec();
@@ -9147,13 +12107,15 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         if(t.mainLoopDepth >= 0){ ev.add("mainloop_depth=" + t.mainLoopDepth); df.add("RULE_39_MAINLOOP_DEPTH"); }
         if(t.initChainDepth >= 0){ ev.add("init_chain_depth=" + t.initChainDepth); df.add("RULE_40_INIT_CHAIN_DEPTH"); }
         if(t.moduleId >= 0){ df.add("RULE_129_MODULE_CLUSTERS"); }
+        if(!t.callChainsTagged.isEmpty()){ ev.add("game_chains=" + t.callChainsTagged); df.add("RULE_134_CALL_CHAINS"); }
+        if(t.knownRole != null){ ev.add("game_known=" + t.knownRole + "/" + t.knownCriticality); df.add("RULE_131_KNOWN_ADDRESSES"); }
         if(t.isCtor || t.methodClassName != null || t.ctorClassName != null){ df.add("RULE_93_CLASS_REGISTRY"); }
         if(!t.assetUploadTagsHit.isEmpty() || r.tags.contains("UPLOADER_CALLER_D1") || r.tags.contains("ASSET_UPLOAD_BULLSEYE")){ ev.add("asset_upload trace"); df.add("RULE_103_ASSET_UPLOAD_TRACES"); }
         if(t.overrideKind != null){ ev.add("override_kind=" + t.overrideKind); df.add("RULE_98_OVERRIDE_COVERAGE"); }
         if(t.runtimeDormantGlobal){ ev.add("runtime: predicted but never witnessed (dormant)"); }
         if(t.runtimeMenuOnly){ ev.add("runtime: menu/UI pipeline only"); }
 
-        // ---- decision tree (precedence: must-keep-real -> patch -> review -> safe-stub -> skip) ----
+        // ---- decision tree (precedence: must-keep-real → patch → review → safe-stub → skip) ----
         boolean uploader = t.isBitbltbufT4hhUploader || t.writesBitbltbufReg || t.bitbltbufMacroSequence
             || t.isPsmct16ClutUploader || t.loadsPsm4hhConstant || t.isSceGifPkRefLoadImage
             || !t.assetUploadTagsHit.isEmpty();
@@ -9176,11 +12138,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             || r.tags.contains("COMPUTED_JUMP_UNRESOLVED") || !t.computedJumpSwitchPcs.isEmpty()
             || t.tailCallIndirect || t.indirectCallT9Count > 0 || t.hasJumpTable;
         boolean patchable = r.tags.contains("BACKWARD_BRANCH_SYNC_WAIT") || r.tags.contains("INFINITE_FAIL_LOOP")
-            || r.tags.contains("HOST_WAIT_CANDIDATE") || !t.patchCandidatePcs.isEmpty();
+            || t.hostWaitCandidate || !t.patchCandidatePcs.isEmpty();
         boolean archive = t.refsArchiveStrings || t.callsFileOpen || !t.filePathSprintfFormats.isEmpty()
             || r.tags.contains("ARCHIVE_IO") || r.tags.contains("FILE_PATH_SPRINTF_SOURCE");
         boolean iop = t.callsSifRpc || t.isIrxLoader || t.isIopRebootHandler || r.tags.contains("IOP_RPC_DISPATCH")
-            || r.tags.contains("IRX_LOADER") || t.detectedRpcSid != 0 || !t.allDetectedSids.isEmpty();
+            || r.tags.contains("IRX_LOADER") || t.detectedRpcSid != 0 || !t.discoveredRpcSids.isEmpty();
         boolean input = t.callsPadPollCallee || t.isPadButtonMaskConsumer
             || r.tags.contains("PAD_POLL_LOOP") || r.tags.contains("PAD_BUTTON_MASK_CONSUMER");
         boolean mcGate = t.isMcTransitionGate || r.tags.contains("MC_TRANSITION_GATE");
@@ -9196,89 +12158,89 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
         if(isMainLoop){
             rec.action = "force_recompile"; rec.confidence = 0.97; rec.risk = "critical"; rec.humanReview = false;
-            rec.reason = "main loop / frame pump - the recompiler entry; stubbing halts the game";
+            rec.reason = "main loop / frame pump — the recompiler entry; stubbing halts the game";
             rec.riskIfStubbed = "game never advances a frame (hard hang)";
-            rec.riskIfRecompiled = "none - this must run the real body";
+            rec.riskIfRecompiled = "none — this must run the real body";
             rec.suggestedNextStep = "force_recompile; never stub. Confirm it is the recompiler entry.";
             df.add("RULE_11_MAINLOOP_SHIELD");
         } else if(mustImpl){
             rec.action = "native_impl_needed"; rec.confidence = 0.90; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "sceVu0 / must-implement math helper - a throwing or zero stub corrupts transforms";
+            rec.reason = "sceVu0 / must-implement math helper — a throwing or zero stub corrupts transforms";
             rec.riskIfStubbed = "degenerate/off-screen vertices, null transforms";
-            rec.riskIfRecompiled = "n/a - needs a real native implementation, not raw recompile";
+            rec.riskIfRecompiled = "n/a — needs a real native implementation, not raw recompile";
             rec.suggestedNextStep = "implement from ref/assembly.txt; cross-check sce_vu0_unimplemented[]";
             df.add("RULE_102_SCEVU0_MUSTIMPL");
         } else if(allocator){
             rec.action = "force_recompile"; rec.confidence = 0.92; rec.risk = "critical"; rec.humanReview = true;
-            rec.reason = "memory allocator / pool - a 0-returning stub yields construct-on-null and a garbage vtable PC";
-            rec.riskIfStubbed = "Alloc returns 0 -> null-vtable crash deep in an init chain";
-            rec.riskIfRecompiled = "low - recompile the real body or supply a real allocator shim";
+            rec.reason = "memory allocator / pool — a 0-returning stub yields construct-on-null and a garbage vtable PC (F50.1/F50.2)";
+            rec.riskIfStubbed = "Alloc returns 0 → null-vtable crash deep in an init chain";
+            rec.riskIfRecompiled = "low — recompile the real body or supply a real allocator shim";
             rec.suggestedNextStep = "never auto-stub; recompile real body. See memory_allocators[].";
             df.add("RULE_142_MEMORY_ALLOCATOR");
         } else if(cop2Codegen){
             rec.action = "force_recompile"; rec.confidence = 0.85; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "COP2 partial-dest / special-op - verify generated dest-mask lane order";
+            rec.reason = "COP2 partial-dest / special-op — verify generated dest-mask lane order (F51.8 codegen bug)";
             rec.riskIfStubbed = "3D transforms break";
-            rec.riskIfRecompiled = "lane-order codegen bug if the mask is reversed - verify against READ128/WRITE128";
+            rec.riskIfRecompiled = "lane-order codegen bug if the mask is reversed — verify against READ128/WRITE128";
             rec.suggestedNextStep = "force_recompile then verify COP2 dest-mask lane order. See cop2_partial_dest_risk[].";
             df.add("RULE_140_COP2_DESTMASK"); if(!t.cop2SpecialOps.isEmpty()) df.add("RULE_147_COP2_SPECIAL_OPS");
         } else if(uploader){
             rec.action = "force_recompile"; rec.confidence = 0.85; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "texture/CLUT uploader (BITBLTBUF) - drives VRAM; a stub leaves textures black";
+            rec.reason = "texture/CLUT uploader (BITBLTBUF) — drives VRAM; a stub leaves textures black";
             rec.riskIfStubbed = "missing / black textures";
-            rec.riskIfRecompiled = "low - recompile the real upload body";
-            rec.suggestedNextStep = "force_recompile; cross-check tbp vs gs_runtime_evidence.";
+            rec.riskIfRecompiled = "low — recompile the real upload body";
+            rec.suggestedNextStep = "force_recompile; cross-check tbp vs known_tbp_labels and gs_runtime_evidence.";
             df.add("RULE_85_BITBLTBUF_T4HH"); df.add("RULE_103_ASSET_UPLOAD_TRACES");
             if(t.isPsmct16ClutUploader) df.add("RULE_145_PSMCT16_CLUT");
         } else if(lifecycle){
             rec.action = "force_recompile"; rec.confidence = 0.85; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "constructor / vtable / struct initializer - writes object fields or the vtable pointer";
-            rec.riskIfStubbed = "uninitialized fields / null vtable -> silent no-op or crash on next virtual call";
-            rec.riskIfRecompiled = "low - recompile real body";
+            rec.reason = "constructor / vtable / struct initializer — writes object fields or the vtable pointer";
+            rec.riskIfStubbed = "uninitialized fields / null vtable → silent no-op or crash on next virtual call";
+            rec.riskIfRecompiled = "low — recompile real body";
             rec.suggestedNextStep = "force_recompile; never stub. See classes[] for this class.";
             df.add("RULE_82_CTOR_MULTI_FIELD"); df.add("RULE_93_CLASS_REGISTRY");
             if(t.ctorInstallsVtable || r.tags.contains("VTABLE_SETTER")) df.add("RULE_27_VTABLE_SETTER");
         } else if(staticInit){
             rec.action = "force_recompile"; rec.confidence = 0.80; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "static initializer (__sinit) - installs a global vtable/fields via the global-ctors table";
-            rec.riskIfStubbed = "global object vtable stays null -> next virtual dispatch no-ops";
-            rec.riskIfRecompiled = "low - but ensure the global-ctors table actually runs";
+            rec.reason = "static initializer (__sinit) — installs a global vtable/fields via the global-ctors table";
+            rec.riskIfStubbed = "global object vtable stays null → next virtual dispatch no-ops (F50.4)";
+            rec.riskIfRecompiled = "low — but ensure the global-ctors table actually runs";
             rec.suggestedNextStep = "ensure global-ctors run, or replay static_init_manifest[].";
             df.add("RULE_141_STATIC_INIT");
         } else if(renderHw){
             rec.action = "force_recompile"; rec.confidence = 0.80; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "render / GS / GIF / VIF / DMA packet path - must emit real hardware packets";
+            rec.reason = "render / GS / GIF / VIF / DMA packet path — must emit real hardware packets";
             rec.riskIfStubbed = "frame not drawn / GS desync";
-            rec.riskIfRecompiled = "low - recompile real body; verify against gs_runtime_evidence path counts";
+            rec.riskIfRecompiled = "low — recompile real body; verify against gs_runtime_evidence path counts";
             rec.suggestedNextStep = "force_recompile; review against gs_runtime_evidence.";
             df.add("RULE_44_PATH3"); df.add("RULE_61_GIF_PATH3");
             if(t.drawingChainDepth >= 0) df.add("RULE_83_DRAWING_CHAIN_DEPTH");
         } else if(archive && t.callsFileOpen){
             rec.action = "native_impl_needed"; rec.confidence = 0.75; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "archive / file loader - needs real host file I/O";
-            rec.riskIfStubbed = "no asset data loaded -> empty world / immediate failure";
-            rec.riskIfRecompiled = "medium - file-open callees need host shims regardless";
+            rec.reason = "archive / file loader (DATA.DAT / .HD2) — needs real host file I/O";
+            rec.riskIfStubbed = "no asset data loaded → empty world / immediate failure";
+            rec.riskIfRecompiled = "medium — file-open callees need host shims regardless";
             rec.suggestedNextStep = "provide native file-I/O shim; see file_path_sprintf_formats.";
             df.add("RULE_23_ARCHIVE_IO"); df.add("RULE_99_FILE_PATH_SPRINTF");
         } else if(archive){
             rec.action = "review"; rec.confidence = 0.50; rec.risk = "medium"; rec.humanReview = true;
-            rec.reason = "references archive strings but no file-open callee - classify before any action";
+            rec.reason = "references archive strings but no file-open callee — classify before any action";
             rec.suggestedNextStep = "review whether this is a loader or a path/string builder.";
             df.add("RULE_23_ARCHIVE_IO");
         } else if(iop){
             rec.action = "review"; rec.confidence = 0.55; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "IOP RPC / IRX loader / SIF bridge - host IOP services must be wired before stubbing";
-            rec.riskIfStubbed = "missing IOP service (audio / MC / cdvd) - subsystem dead";
-            rec.riskIfRecompiled = "medium - RPC targets resolve on the IOP side";
+            rec.reason = "IOP RPC / IRX loader / SIF bridge — host IOP services must be wired before stubbing";
+            rec.riskIfStubbed = "missing IOP service (audio / MC / cdvd) — subsystem dead";
+            rec.riskIfRecompiled = "medium — RPC targets resolve on the IOP side";
             rec.suggestedNextStep = "review against discovered_iop_sids / known_iop_sids; wire host service.";
             df.add("RULE_22_IOP_RPC"); if(t.isIrxLoader) df.add("RULE_124_IRX_LOADER");
-            if(!t.allDetectedSids.isEmpty()) df.add("RULE_139_DISCOVERED_SIDS");
+            if(!t.discoveredRpcSids.isEmpty()) df.add("RULE_139_DISCOVERED_SIDS");
         } else if(patchable){
             rec.action = "patch_candidate"; rec.confidence = 0.60; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "sync-wait / infinite-fail loop - needs a host-wait patch, not a stub";
+            rec.reason = "sync-wait / infinite-fail loop — needs a host-wait patch, not a stub";
             rec.riskIfStubbed = "deadlock or busy spin";
-            rec.riskIfRecompiled = "high - naive recompile re-creates the guest spin/deadlock";
-            rec.suggestedNextStep = "apply BACKWARD_BRANCH_SYNC_WAIT / HOST_WAIT patch at the patch-candidate PCs.";
+            rec.riskIfRecompiled = "high — naive recompile re-creates the guest spin/deadlock";
+            rec.suggestedNextStep = "apply BACKWARD_BRANCH_SYNC_WAIT / the game_HOST_WAIT patch at the patch-candidate PCs.";
             df.add("RULE_121_SYNC_WAIT"); df.add("RULE_123_INFINITE_FAIL_LOOP");
         } else if(mcGate){
             if(overrideSafe){
@@ -9288,8 +12250,8 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 df.add("RULE_98_OVERRIDE_COVERAGE");
             } else {
                 rec.action = "review"; rec.confidence = 0.50; rec.risk = "medium"; rec.humanReview = true;
-                rec.reason = "memory-card transition gate - review the save/load state machine before any action";
-                rec.suggestedNextStep = "review; only stub if a rule already marks this pattern safe.";
+                rec.reason = "memory-card transition gate — review the save/load state machine before any action";
+                rec.suggestedNextStep = "review; only stub if a the game rule already marks this pattern safe.";
             }
             df.add("RULE_54_MC_GATE");
         } else if(input){
@@ -9300,15 +12262,15 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 df.add("RULE_98_OVERRIDE_COVERAGE");
             } else {
                 rec.action = "review"; rec.confidence = 0.50; rec.risk = "medium"; rec.humanReview = true;
-                rec.reason = "pad polling / button-mask consumer - wire host input before stubbing";
-                rec.suggestedNextStep = "review; corroborate with pad input scripts.";
+                rec.reason = "pad polling / button-mask consumer — wire host input before stubbing";
+                rec.suggestedNextStep = "review; corroborate with pad_input_scripts.";
             }
             df.add("RULE_24_PAD_POLL"); if(t.isPadButtonMaskConsumer) df.add("RULE_97_PAD_MASK");
         } else if(indirect){
             rec.action = "review"; rec.confidence = 0.45; rec.risk = "high"; rec.humanReview = true;
-            rec.reason = "indirect / computed control flow - resolve dispatch targets before any patch";
+            rec.reason = "indirect / computed control flow — resolve dispatch targets before any patch";
             rec.riskIfStubbed = "recompiler may panic on an unresolved indirect jump";
-            rec.riskIfRecompiled = "medium - unresolved targets must be pre-populated";
+            rec.riskIfRecompiled = "medium — unresolved targets must be pre-populated";
             rec.suggestedNextStep = "review computed_jump_targets / virtual_dispatch_sites; never auto-patch.";
             if(t.indirectCallT9Count > 0) df.add("RULE_38_INDIRECT_CALL_T9");
             if(!t.virtualDispatchSites.isEmpty()) df.add("RULE_94_VIRTUAL_DISPATCH");
@@ -9316,45 +12278,47 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             if(!t.computedJumpSwitchPcs.isEmpty()) df.add("RULE_146_COMPUTED_JUMP");
         } else if(gsIrqSafe){
             rec.action = "stub_candidate"; rec.confidence = 0.85; rec.risk = "low"; rec.humanReview = false;
-            rec.reason = "GS IRQ handler - IMR=0x7F00 masks all GS IRQs across every loaded checkpoint -> can never fire";
-            rec.riskIfStubbed = "none - handler is unreachable at runtime";
+            rec.reason = "GS IRQ handler — IMR=0x7F00 masks all GS IRQs across every loaded checkpoint → can never fire";
+            rec.riskIfStubbed = "none — handler is unreachable at runtime";
             rec.riskIfRecompiled = "none";
             rec.suggestedNextStep = "safe to stub per runtime evidence (gs_runtime_evidence.imr_all_masked_gs_irqs).";
             df.add("RULE_79_GS_IRQ_HANDLER"); df.add("RULE_80_RUNTIME_CORROBORATION");
         } else if(overrideSafe){
             rec.action = "stub_candidate"; rec.confidence = 0.80; rec.risk = "low"; rec.humanReview = false;
             rec.reason = "override system already classified a safe " + t.overrideKind;
-            rec.riskIfStubbed = "low - existing override already validated";
+            rec.riskIfStubbed = "low — existing override already validated";
             rec.suggestedNextStep = "apply the existing override " + t.overrideKind + ".";
             df.add("RULE_98_OVERRIDE_COVERAGE");
         } else if(kernelSkip){
             rec.action = "skip_candidate"; rec.confidence = 0.85; rec.risk = "low"; rec.humanReview = false;
-            rec.reason = "kernel-internal (syscall / COP0) - provided by HLE; the existing firewall already skips it";
-            rec.riskIfStubbed = "n/a - skipped, HLE provides behavior";
+            rec.reason = "kernel-internal (syscall / COP0) — provided by HLE; the existing firewall already skips it";
+            rec.riskIfStubbed = "n/a — skipped, HLE provides behavior";
             rec.suggestedNextStep = "leave as SKIP.";
             df.add("RULE_3_SYSCALL_FIREWALL");
         } else if(r.tags.contains("LIBGCC_INTRINSIC")){
             rec.action = "force_recompile"; rec.confidence = 0.70; rec.risk = "medium"; rec.humanReview = false;
-            rec.reason = "libgcc / FP intrinsic - needs the real arithmetic body (auto-stub corrupts math)";
+            rec.reason = "libgcc / FP intrinsic — needs the real arithmetic body (auto-stub corrupts math)";
             rec.riskIfStubbed = "wrong arithmetic results (div/mod/float)";
             rec.riskIfRecompiled = "low";
             rec.suggestedNextStep = "force_recompile (existing triage already promotes these from STUB).";
             df.add("RULE_31_LIBGCC");
         } else if(firewalledStub){
             rec.action = "stub_candidate"; rec.confidence = 0.70; rec.risk = "low"; rec.humanReview = false;
-            rec.reason = "IOP-module / firewalled wrapper - the existing radar/IOP firewall already stubs it";
-            rec.riskIfStubbed = "low - firewall-confirmed";
+            rec.reason = "IOP-module / firewalled wrapper — the existing radar/IOP firewall already stubs it";
+            rec.riskIfStubbed = "low — firewall-confirmed";
             rec.suggestedNextStep = "apply the existing firewall stub.";
             df.add("RULE_2_RADAR_FIREWALL");
         } else if(safeLeaf){
             rec.action = "force_recompile"; rec.confidence = 0.60; rec.risk = "low"; rec.humanReview = false;
-            rec.reason = "safe leaf - small, no callees, no MMIO; recompiling the real body is low-risk";
-            rec.riskIfStubbed = "medium - even leaves may carry meaningful return values";
+            rec.reason = "safe leaf — small, no callees, no MMIO; recompiling the real body is low-risk";
+            rec.riskIfStubbed = "medium — even leaves may carry meaningful return values";
             rec.riskIfRecompiled = "low";
             rec.suggestedNextStep = "force_recompile (low risk).";
             df.add("RULE_1_SAFE_LEAF");
         } else {
-            // Fallback: map from the existing disposition.
+            // Fallback: map from the existing disposition. Recompiling the real body
+            // is the non-destructive default; only stub/skip/patch are "aggressive",
+            // so we never pick those here on weak evidence.
             if("RECOMPILE".equals(r.disposition)){
                 rec.action = "force_recompile"; rec.confidence = 0.55;
                 rec.risk = (t.writesToGlobal || t.usesCop1 || t.usesCop2 || t.accessesMMIO) ? "medium" : "low";
@@ -9363,11 +12327,11 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 rec.suggestedNextStep = "force_recompile.";
             } else if("STUB".equals(r.disposition)){
                 rec.action = "review"; rec.confidence = 0.40; rec.risk = "medium"; rec.humanReview = true;
-                rec.reason = "existing triage stubbed it but no confirming safe-stub rule fired - review before trusting the stub";
+                rec.reason = "existing triage stubbed it but no confirming safe-stub rule fired — review before trusting the stub";
                 rec.suggestedNextStep = "review whether the stub is safe.";
             } else {
                 rec.action = "review"; rec.confidence = 0.40; rec.risk = "medium"; rec.humanReview = true;
-                rec.reason = "no specific signal - review";
+                rec.reason = "no specific signal — review";
                 rec.suggestedNextStep = "review.";
             }
             df.add("RULE_DISPOSITION_BASELINE");
@@ -9380,7 +12344,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         // finalize defaults
         if(rec.reason.isEmpty()) rec.reason = "no specific hazard or safe-stub signal; defaulting conservatively";
         if(rec.suggestedNextStep.isEmpty()) rec.suggestedNextStep = "review";
-        if(rec.riskIfStubbed.isEmpty()) rec.riskIfStubbed = "unknown - verify before stubbing";
+        if(rec.riskIfStubbed.isEmpty()) rec.riskIfStubbed = "unknown — verify before stubbing";
         if(rec.riskIfRecompiled.isEmpty()) rec.riskIfRecompiled = "low (recompiling the real body is non-destructive)";
         if(df.isEmpty()) df.add("RULE_DISPOSITION_BASELINE");
         return rec;
@@ -9471,7 +12435,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         { int n = 0; boolean f = true;
           for(String cn : t.calleeNames){ if(n >= 12) break; if(!f) w.print(", "); f = false; w.print(jsonString(cn)); n++; } }
         w.print("], ");
-        // nearby important functions (callers intersect important, callees intersect important-names)
+        // nearby important functions (callers ∩ important, callees ∩ important-names)
         w.print("\"nearby_important_functions\": [");
         { LinkedHashSet<String> near = new LinkedHashSet<>();
           for(long[] c : t.callers){ long ca = c[0] & 0xFFFFFFFFL;
@@ -9480,7 +12444,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
           int n = 0; boolean f = true;
           for(String s : near){ if(n >= 8) break; if(!f) w.print(", "); f = false; w.print(jsonString(s)); n++; } }
         w.print("], ");
-        w.print("\"known_chain_membership\": [], ");
+        w.print("\"known_chain_membership\": " + jsonStrArray(t.callChainsTagged) + ", ");
         w.print("\"module_cluster_id\": " + (t.moduleId >= 0 ? Integer.toString(t.moduleId) : "null") + ", ");
         String pfx = prefixByAddr.get(r.address & 0xFFFFFFFFL);
         w.print("\"name_prefix_module\": " + (pfx == null ? "null" : jsonString(pfx)) + ", ");
@@ -9491,6 +12455,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         LinkedHashSet<String> df = new LinkedHashSet<>();
         if(t.moduleId >= 0) df.add("RULE_129_MODULE_CLUSTERS");
         if(pfx != null) df.add("RULE_130_NAME_PREFIX_MODULES");
+        if(!t.callChainsTagged.isEmpty()) df.add("RULE_134_CALL_CHAINS");
         if(t.mainLoopDepth >= 0) df.add("RULE_39_MAINLOOP_DEPTH");
         if(t.initChainDepth >= 0) df.add("RULE_40_INIT_CHAIN_DEPTH");
         if(t.drawingChainDepth >= 0) df.add("RULE_83_DRAWING_CHAIN_DEPTH");
@@ -9500,12 +12465,12 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
     }
 
     // -------------------------------------------------------------------------
-    // Top-level blocks
+    // Top-level blocks (Parts 1, 3, 5, 6)
     // -------------------------------------------------------------------------
     private void buildDecisionConstraints(PrintWriter w){
         w.println("  \"decision_constraints\": {");
         w.println("    \"schema_version\": \"1.0\",");
-        w.println("    \"purpose\": \"Hard guardrails so a downstream AI never makes a destructive recommendation; derived from existing dangerous-tag rules.\",");
+        w.println("    \"purpose\": \"Hard guardrails so a downstream AI never makes a destructive recommendation; derived from existing the game dangerous-tag rules.\",");
         w.println("    \"never_auto_stub_if_tags\": " + jsonStrArray(Arrays.asList(NEVER_AUTO_STUB_TAGS)) + ",");
         w.println("    \"never_auto_patch_if_tags\": " + jsonStrArray(Arrays.asList(NEVER_AUTO_PATCH_TAGS)) + ",");
         w.println("    \"requires_human_review_if_tags\": " + jsonStrArray(Arrays.asList(REQUIRE_REVIEW_TAGS)) + ",");
@@ -9566,7 +12531,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
         w.println("  \"ai_decision_support\": {");
         w.println("    \"schema_version\": \"1.0\",");
-        w.println("    \"purpose\": \"AI-facing summary layer derived from existing triage signals (focus_set, runtime_corroboration, module clusters, class registry, override coverage). Pointers + rationale, not a copy of the raw JSON.\",");
+        w.println("    \"purpose\": \"AI-facing summary layer derived from existing triage signals (focus_set, runtime_corroboration, module clusters, Known chains, class registry, override coverage). Pointers + rationale, not a copy of the raw JSON.\",");
         w.println("    \"run_summary\": {");
         w.println("      \"total_functions\": " + results.size() + ",");
         w.println("      \"action_force_recompile\": " + nForce + ",");
@@ -9623,7 +12588,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         return sb.toString();
     }
 
-    /** Next-rule hints - only emitted when there is repeated evidence THIS run. */
+    /** Next-rule hints — only emitted when there is repeated evidence THIS run. */
     private List<String> buildNextRuleCandidates(List<FuncResult> results, Map<Long,AiRec> aiRecs){
         List<String> out = new ArrayList<>();
         Map<Long,FuncResult> byAddr = new HashMap<>();
@@ -9646,7 +12611,17 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                     "MODULE_CLUSTER_" + e.getKey() + "_CLASSIFIER", "medium", ex,
                     Arrays.asList("RULE_129_MODULE_CLUSTERS")));
         }
-        // 2) archive-string references with no recognized loader
+        // 2) UNCATEGORIZED functions sitting on a known the game chain
+        { int c = 0; List<Long> ex = new ArrayList<>();
+          for(FuncResult r : results){ FuncTraits t = r.traits; if(t == null) continue;
+            if(!t.callChainsTagged.isEmpty() && "UNCATEGORIZED".equals(r.category)){ c++; if(ex.size() < 5) ex.add(r.address & 0xFFFFFFFFL); } }
+          if(c >= 3) out.add(ruleCandidate(
+            c + " UNCATEGORIZED functions are tagged into a known the game call chain",
+            "Functions on a known chain but still UNCATEGORIZED are prime candidates for a chain-station-specific rule.",
+            Arrays.asList(c + " chain-tagged UNCATEGORIZED"),
+            "CHAIN_STATION_CLASSIFIER", "medium", ex,
+            Arrays.asList("RULE_134_CALL_CHAINS"))); }
+        // 3) archive-string references with no recognized loader
         { int c = 0; List<Long> ex = new ArrayList<>();
           for(FuncResult r : results){ FuncTraits t = r.traits; if(t == null) continue;
             if(t.refsArchiveStrings && !t.callsFileOpen && "UNCATEGORIZED".equals(r.category)){ c++; if(ex.size() < 5) ex.add(r.address & 0xFFFFFFFFL); } }
@@ -9656,17 +12631,17 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             Arrays.asList(c + " archive-string refs w/o file-open"),
             "INLINE_ARCHIVE_READER", "medium", ex,
             Arrays.asList("RULE_23_ARCHIVE_IO", "RULE_99_FILE_PATH_SPRINTF"))); }
-        // 3) BITBLTBUF writers not covered by an existing uploader rule
+        // 4) BITBLTBUF writers not covered by an existing uploader rule
         { int c = 0; List<Long> ex = new ArrayList<>();
           for(FuncResult r : results){ FuncTraits t = r.traits; if(t == null) continue;
             if(t.writesBitbltbufReg && !t.isBitbltbufT4hhUploader && !t.bitbltbufMacroSequence && !t.isPsmct16ClutUploader){ c++; if(ex.size() < 5) ex.add(r.address & 0xFFFFFFFFL); } }
           if(c >= 3) out.add(ruleCandidate(
             c + " BITBLTBUF writers are matched by no specific uploader rule",
-            "Uncovered BITBLTBUF writers may be a new texture/CLUT upload shape.",
+            "Uncovered BITBLTBUF writers may be a new texture/CLUT upload shape (cf. F50.8-F50.11 PSMCT16 gap).",
             Arrays.asList(c + " uncovered BITBLTBUF writers"),
             "UNCOVERED_BITBLTBUF_UPLOADER", "high", ex,
             Arrays.asList("RULE_85_BITBLTBUF_T4HH", "RULE_145_PSMCT16_CLUT"))); }
-        // 4) virtual-dispatch sites with no resolved class
+        // 5) virtual-dispatch sites with no resolved class
         { int c = 0; List<Long> ex = new ArrayList<>();
           for(FuncResult r : results){ FuncTraits t = r.traits; if(t == null) continue;
             if(!t.virtualDispatchSites.isEmpty() && t.methodClassName == null && t.ctorClassName == null){ c++; if(ex.size() < 5) ex.add(r.address & 0xFFFFFFFFL); } }
@@ -9676,7 +12651,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
             Arrays.asList(c + " virtual-dispatch funcs w/o class"),
             "UNRESOLVED_VTABLE_CLASS", "medium", ex,
             Arrays.asList("RULE_94_VIRTUAL_DISPATCH", "RULE_128_TABLE_DISPATCH"))); }
-        // 5) complex control flow that landed in subsystem=unknown
+        // 6) complex control flow that landed in subsystem=unknown
         { int c = 0; List<Long> ex = new ArrayList<>();
           for(FuncResult r : results){ AiRec rec = aiRecs.get(r.address & 0xFFFFFFFFL);
             if(rec != null && "unknown".equals(rec.subsystem) && r.tags.contains("COMPLEX_CONTROL_FLOW")){ c++; if(ex.size() < 5) ex.add(r.address & 0xFFFFFFFFL); } }
@@ -9702,10 +12677,10 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
     private List<String> subsystemDerivedFrom(String key){
         switch(key){
-            case "render":           return Arrays.asList("RULE_44_PATH3","RULE_83_DRAWING_CHAIN_DEPTH","RULE_61_GIF_PATH3");
-            case "texture_upload":   return Arrays.asList("RULE_85_BITBLTBUF_T4HH","RULE_103_ASSET_UPLOAD_TRACES","RULE_145_PSMCT16_CLUT");
+            case "render":           return Arrays.asList("RULE_44_PATH3","RULE_83_DRAWING_CHAIN_DEPTH","RULE_61_GIF_PATH3","RULE_134_CALL_CHAINS");
+            case "texture_upload":   return Arrays.asList("RULE_85_BITBLTBUF_T4HH","RULE_103_ASSET_UPLOAD_TRACES","RULE_145_PSMCT16_CLUT","RULE_132_KNOWN_TBP_LABELS");
             case "archive_io":       return Arrays.asList("RULE_23_ARCHIVE_IO","RULE_99_FILE_PATH_SPRINTF");
-            case "input":            return Arrays.asList("RULE_24_PAD_POLL","RULE_97_PAD_MASK");
+            case "input":            return Arrays.asList("RULE_24_PAD_POLL","RULE_97_PAD_MASK","RULE_135_PAD_INPUT");
             case "audio":            return Arrays.asList("RULE_52_AUDIO_RPC","RULE_22_IOP_RPC");
             case "memory_card":      return Arrays.asList("RULE_54_MC_GATE");
             case "iop_rpc":          return Arrays.asList("RULE_22_IOP_RPC","RULE_124_IRX_LOADER","RULE_139_DISCOVERED_SIDS");
@@ -9725,7 +12700,7 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
 
         w.println("  \"ai_relationship_view\": {");
         w.println("    \"schema_version\": \"1.0\",");
-        w.println("    \"purpose\": \"AI-facing abstraction over existing callgraph, module, class, and runtime evidence. Not a second source of truth.\",");
+        w.println("    \"purpose\": \"AI-facing abstraction over existing callgraph, module, chain, class, and runtime evidence. Not a second source of truth.\",");
         w.println("    \"subsystems\": {");
         for(int si = 0; si < SUBSYSTEM_KEYS.length; si++){
             String key = SUBSYSTEM_KEYS[si];
@@ -9823,8 +12798,64 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
                 ", \"init_chain_depth\": " + r.traits.initChainDepth + ", \"role\": " + jsonString(rec.role) + "}");
             boolean more = (i < n-1) || (ip.size() > cap); w.println(more ? "," : ""); }
           if(ip.size() > cap) w.println("      {\"truncated\": true, \"omitted\": " + (ip.size()-cap) + "}"); }
+        w.println("    ],");
+
+        // known_chains: reuse the pre-computed CALL_CHAINS + tagged members.
+        w.println("    \"known_chains\": [");
+        for(int ci = 0; ci < CALL_CHAINS.length; ci++){
+            Object[] row = CALL_CHAINS[ci];
+            String tag = (String)row[0]; String[] stations = (String[])row[1];
+            String chainTag = "CHAIN_" + tag.toUpperCase();
+            List<Long> tagged = new ArrayList<>();
+            for(FuncResult r : results){ if(r.tags.contains(chainTag) && tagged.size() < 20) tagged.add(r.address & 0xFFFFFFFFL); }
+            w.print("      {\"tag\": " + jsonString(tag) + ", \"stations\": [");
+            for(int j = 0; j < stations.length; j++){ if(j > 0) w.print(", "); w.print(jsonString(stations[j])); }
+            w.print("], \"tagged_functions\": [");
+            for(int j = 0; j < tagged.size(); j++){ if(j > 0) w.print(", "); w.print("\"" + hex(tagged.get(j)) + "\""); }
+            w.print("]}");
+            w.println(ci < CALL_CHAINS.length-1 ? "," : "");
+        }
         w.println("    ]");
         w.println("  },");
+    }
+
+    class FuncResult{long address;String name,category,disposition;FuncTraits traits;List<String>tags;
+        // v11 (General v15): provenance. origin: "auto" (enricher decision),
+        // "step1" (inherited from DAC.toml, vetted), "override" (bound in
+        // game_override.cpp). step1Disposition/rescueReason only for step1.
+        String origin="auto";String step1Disposition=null;String rescueReason=null;
+        // which pass rescued the step1 binding (step1_keep_gate /
+        // drawing_chain_firewall / v8_ctor_risk / v8_scevu0_helper /
+        // v13_binding_firewall / dynamic_code_loader_firewall).
+        String rescuedBy=null;
+        // v11.1: for origin="step1", whether the entry came from the step1
+        // exporter ("exporter") or a previous enricher run ("enricher_prev").
+        String step1Source=null;
+        // v14: captured listing text for the per-function Markdown docs
+        // (functions/<addr>_<name>.md). Streamed once during the scan.
+        String asmText=null, decompText=null, flowText=null;}
+    private static String hex(long v){return String.format("0x%08X",v&0xFFFFFFFFL);}
+    private static String jsonString(String v){
+        if(v==null)return "\"\"";
+        // v11 (General v15.5 Bugfix S): full RFC 8259 escaping. Symbol names
+        // scraped from arbitrary ELFs can carry control bytes; bare emission
+        // produced invalid JSON.
+        StringBuilder sb = new StringBuilder(v.length()+8);
+        sb.append('"');
+        for(int i=0;i<v.length();i++){
+            char c = v.charAt(i);
+            switch(c){
+                case '\\': sb.append("\\\\"); break;
+                case '"':  sb.append("\\\""); break;
+                case '\n': sb.append("\\n");  break;
+                case '\r': sb.append("\\r");  break;
+                case '\t': sb.append("\\t");  break;
+                default:
+                    if(c < 0x20) sb.append(String.format("\\u%04x",(int)c));
+                    else sb.append(c);
+            }
+        }
+        return sb.append('"').toString();
     }
 
     // v7: bucket sort for focus_set rerank.
@@ -9980,3 +13011,4 @@ public class General_PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("  },");
     }
 }
+
