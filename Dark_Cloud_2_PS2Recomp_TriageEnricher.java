@@ -1,8 +1,8 @@
-// PS2Recomp Triage Enricher v12 (DC2 Edition) - Ghidra Script (Step 2 of Pipeline)
+// PS2Recomp Triage Enricher v17.1 (DC2 Edition) - Ghidra Script (Step 2 of Pipeline)
 // ==================================================================
 // Run AFTER ExportPS2Functions.java on the same Ghidra project.
 //
-// RULES (1-164) - organized numerically for AI readability
+// RULES (1-233) - organized numerically for AI readability
 // ================================================================
 //
 // Rule 1  No DANGEROUS_KEYWORDS (removed - was killing game logic)
@@ -743,6 +743,292 @@
 // Rule 206 SCHEMA_VERSION: 14.2 (v15.2 adds Rules 203-206; surfaces the v15 hazard counts in
 //        functions_index statistics{}; fixes the per-func/index schema_version stamp).
 //
+// ================================================================
+// v16 RULES (207-216) - DC2 G116-G137 retrospective (the ~22-phase title-cavern
+//                       copy/transform packer + near-plane-clip + SPI-dispatch saga)
+//                       + general PS2 GS-clip / packed-field / data-driven-VM hazards.
+// Grounded in plans/phase-G{116..137}-fix-log.md + PS2_PROJECT_STATE.md + ROADMAP.md.
+// ================================================================
+//
+// Rule 207 VERTEX_KICK_FORMAT_ADC_CAPABILITY (per-func + top-level `adc_capable_packers`):
+//        the G131-G137 root (cost ~7 phases). A vertex-emitting VU/EE packer's per-vertex
+//        DRAW-control (ADC = strip-restart / "no draw kick") is only possible if its emitted
+//        GS vertex FORMAT carries the ADC bit. G132 decoded DC2's copy packer 0x1b68: it emits
+//        XYZF2 where word3 is the FOG byte (VF26.w = clamp(VF29.x + VF29.w*VF16.w, 0, 255), a
+//        fog-clamp whose ceiling 255 << 2048) so ADC = bit15(FTOI4(.w)) is STRUCTURALLY ALWAYS
+//        0 BY DESIGN -- it physically cannot carry HW's selective ~45%-at-pos2+ restart pattern.
+//        The transform packer 0x1ff0 emits XYZ2 (ADC-capable via the +2048 guard add) but is
+//        100% nodraw by correct microcode (G117/G119). Classifies each packer's adc_capability =
+//        xyzf2_fog_no_adc (restart impossible) / xyz2_adc_capable (+2048 guard) / xyz3_norestart.
+//        Detection: const-tracked FTOI4 -> SQI/store of a position vector whose .w source is a
+//        fog-clamp (mul+add then clamp to a <=255 ceiling) => xyzf2_fog_no_adc; whose .w is a
+//        +0x800/+2048 guard bias (cf. Rule 191/200) => xyz2_adc_capable. Refines Rule 192
+//        (which only saw the A+D 0x05/0x0D store, not the emitted-format ADC capability).
+//        Firewalled. THE signal that would have ended the streak hunt in one phase.
+//        General PS2: any VU1 packer -- "can this packer even restart a strip?" is a format fact.
+//
+// Rule 208 PERSPECTIVE_DIVIDE_NEAR_PLANE_SOURCE (per-func + top-level `near_plane_sites`):
+//        G125-G129 (cost ~5 phases). PS2 GS performs NO triangle/near-plane clipping (Rule 213),
+//        and FTOI4 packs screen XY as 12.4 fixed point (int32 then masked to 16 bits) -- so a
+//        BEHIND-camera vertex (q = 1/W <= 0) has an already-SATURATED/WRAPPED screen XY before the
+//        GS sees it. Reconstructing clip-space (clip = screen * W) from that saturated XY yields
+//        GARBAGE -> screen-spanning wedges (G128). The near plane MUST be handled on the float
+//        position + q BEFORE FTOI4 (where the true 1/W sign lives), or the straddling triangle
+//        rejected. Flags EE/VU sites that compute 1/W (DIV/RSQRT feeding a position multiply) and
+//        then FTOI4 the result; emits pre_ftoi4_w_available + near_plane_strategy = clip_homog /
+//        reject_q_le_0 so the runtime rasterizer routes near-plane handling to the unsaturated
+//        source, not the reconstructed 12.4. DC2 anchors: copy/transform packer pipelines, the
+//        title-rock g104 clip path. General PS2: every perspective-divide-then-FTOI4 geometry path.
+//
+// Rule 209 SPI_CONFIG_COMMAND_DISPATCH (top-level `spi_config_commands`): G129/G130 (cost ~2
+//        phases) hunting why `cfgWATER_VERTEX@0x1648F0` never dispatches during the title map
+//        load (and then learning HW never dispatches it either -- the trifans are cavern MODEL
+//        geometry, not water). DC2's map-config is a STRING/ID-keyed command table: handlers in
+//        the `cfgXXX` family, args pulled via `spiGetStackInt@0x1463E0` / `spiGetStackVector`,
+//        created objects stored into CMap slots (e.g. CWaterFrame -> CMap+0xcf0). Rosters the
+//        command-name -> handler bindings + whether each handler is reached, so a "missing map
+//        feature" routes to the dispatch table, not a blind render hunt. Anchor cfgWATER_VERTEX,
+//        CreateWaterFrame@0x185D40. Feeds Rule 210. DC2-specific roster; general shape in Rule 210.
+//
+// Rule 210 DATA_DRIVEN_COMMAND_INTERPRETER (per-func + top-level `command_interpreters`, general
+//        PS2): generalises Rule 209 + the CRunScript event VM (Rule 172). Detects a function that
+//        reads an opcode/command-id from a stream/struct (`lw $op, K($stream)`) then dispatches
+//        through a `base + id*4` function-pointer table (Rule 128 / computed-jump / jalr). These
+//        interpreters STALL SILENTLY when one handler is unimplemented/stubbed (DC2 burned this on
+//        the CRunScript audio-gated ext wait F63/F64 and the SPI config dispatch G129/G130). Emits
+//        the table base + resolved handler set + any unresolved/uncalled id. General PS2: every
+//        game ships script / cutscene / map-config / AI VMs on this shape.
+//
+// Rule 211 PASSTHROUGH_PACKER_RENDER_PATH (per-func + top-level `packer_families`): G130 root.
+//        DC2's VU1 dispatcher (routes 0x730/0x760/0x7b0) selects among THREE packer families with
+//        very different render contracts: COPY/passthrough `0x1b68` (EE-pre-projected screen-space,
+//        no VU transform, XYZF2 fog -> Rule 207), TRANSFORM `0x1ff0`(tristrip)/`0x1dc0`(tri)
+//        (VU-projected, XYZ2 +2048 ADC gate), and TRIFAN `0x1c50`. HW draws the visible cavern via
+//        the copy/trifan route; the runner had no working copy-route render so G100 FORCE-routes
+//        everything through the nodraw transform packer (load-bearing band-aid) -> holes + over-floor
+//        + zero trifans. Tags each packer family + flags geometry force-routed away from a
+//        non-functional passthrough path. General PS2: mg/libgraph VU engines all multiplex packers.
+//
+// Rule 212 PRIVATE_DEPTH_SCOPE (per-func, advisory): G125. A scene/RTT draw that depth-orders its
+//        own geometry but shares (or lacks) a Z buffer overdraws back-over-front. The title cavern
+//        needed a PRIVATE per-frame-cleared Z buffer (the back cavern wall was overdrawing the front
+//        mural with no depth test). Flags RTT_TARGET (Rule 166) / scene draws that write FRAME to an
+//        RTT page and emit many overlapping triangles but write no ZBUF in the same scope. Pairs
+//        with Rule 174 (display-buffer flip = when to clear the private Z). General PS2.
+//
+// Rule 213 GS_NO_HW_CLIP_MANIFEST (top-level invariant, general PS2): materialises the hardware
+//        fact that burned G125-G129 -- the PS2 GS does NO triangle, near-plane, or guard-band
+//        CLIPPING; it only SCISSORS, and out-of-guard-band coords WRAP (12.4). All clipping is the
+//        VU's responsibility (per-strip ADC restart / vertex drop), done on float clip-space BEFORE
+//        FTOI4. Consolidates Rule 200 (guard band), Rule 207 (ADC format), Rule 208 (near-plane
+//        source) into a single checklist so a future regen/route cannot silently re-introduce the
+//        "reconstruct clip from saturated 12.4" wedge bug. General PS2.
+//
+// Rule 214 PACKED_FIELD_ALIAS_FOG_ADC (per-func, advisory, general PS2): the GS PACKED-mode
+//        field-alias hazard generalised from the G132 root. Word3 of the XYZ qword is the FOG byte
+//        (XYZF2, when PRIM.FGE=1) OR carries the ADC bit at bit 111 (XYZ2/XYZ3) -- the SAME bytes
+//        mean different things by format. A runtime GS decoder that reads word3 as ADC when the
+//        packer wrote fog (or vice-versa) corrupts per-vertex draw control. Extends Rule 187
+//        (RGBAQ spread) + Rule 192 (XYZ2/XYZ3) with the explicit fog<->ADC overlap. Flags A+D /
+//        PACKED vertex emitters and the format selector they depend on (PRIM.FGE / XYZF2 vs XYZ2).
+//
+// Rule 215 G-CHAIN ROSTER refresh (data): extends DC2_KNOWN_FUNCTION_ADDRESSES + DC2_RUNTIME_INVARIANTS
+//        + DC2_CALL_CHAINS with the G116-G137 title-cavern facts so the report stops re-deriving them:
+//        packer addresses (copy 0x1b68 / trifan 0x1c50 / tri 0x1dc0 / tristrip 0x1ff0), VU dispatcher
+//        route decisions (0x730/0x760/0x7b0) and the qword38 selector, the copy fog-clamp constant
+//        VF29=(-191.25,255,0,535500) (ceiling 255 => ADC always 0), CreateRenderInfoPacket@0x1404d0
+//        (selector builder) + @0x28a660 (motion-MDT), the SPI dispatch anchors (cfgWATER_VERTEX
+//        @0x1648F0, CreateWaterFrame@0x185D40, spiGetStackInt@0x1463E0), and the invariants
+//        TITLE_HAS_NO_WATER_ON_HW (CMap+0xcec/cf0 empty on HW too), GS_NO_HW_TRIANGLE_CLIP,
+//        COPY_PACKER_WORD3_IS_FOG_NOT_ADC, FORCED_0x1ff0_DRAW_IS_LOAD_BEARING. Pure data.
+//
+// Rule 216 SCHEMA_VERSION: 15.0 (v16 adds Rules 207-216).
+//
+// ================================================================
+// v17 RULES (217-225) - DC2 G138-G140 retrospective (the VU1-interpreter
+//                       root-cause arc: FMEQ/FMAND opcode-table swap, 4-deep
+//                       MAC-flag pipeline, same-pair upper->lower VF hazard,
+//                       stale G64 band-aid inverting the VU clipper) + the
+//                       static VU-microcode analysis layer that would have
+//                       front-loaded all four roots (G87/G138/G139/G140,
+//                       ~70 phases) + G141 performance-phase support.
+// Grounded in plans/phase-G{138,139,140}-fix-log.md + ROADMAP.md +
+// PS2_PROJECT_STATE.md "Learned Patterns" + PCSX2 VUops.cpp dispatch tables.
+// ================================================================
+//
+// Rule 217 VU_MICROCODE_EXTRACTOR (top-level `vu_microcode_programs`, general PS2):
+//        VU microcode is STATIC DATA inside the ELF (uploaded via VIF MPG), yet no prior
+//        rule ever disassembled it - G138/G139/G140 all rooted in semantics the ELF bytes
+//        already encode. Scans initialized data blocks for VIF MPG headers (cmd byte 0x4A:
+//        num 64-bit pairs, imm = VU dest addr/8), validates the following payload by
+//        decode plausibility (>=80% valid pairs, >=6 distinct upper opcodes), and groups
+//        consecutive chunks (next imm == prev imm+num, adjacent payload) into whole
+//        programs. Emits per program: elf_addr, vu_dest, size_pairs, chunk list, and a
+//        best-effort uploader function link (const-load match against Rule 51/68 uploaders).
+//
+// Rule 218 VU_MICROCODE_HAZARD_SCAN (per program, general PS2): static disassembly of every
+//        extracted program with the CANONICAL PCSX2 tables (VUops.cpp _vuTablesMess). Emits:
+//        - opcode census (which lower/upper ops the game actually uses - the interpreter
+//          conformance checklist; DC2 uses FMAND, which the runner had parked on FMEQ for
+//          70 phases, G138 root #1);
+//        - flag producer->consumer DISTANCES: for every FMxx/FSxx (MAC/STATUS) and FCxx
+//          (CLIP) consumer, distance in pairs to the nearest preceding producer. DC2's
+//          gates are hand-scheduled at EXACTLY 4 pairs = the real FMAC flag latency
+//          (G138 root #2: MACPIPE depth 4; depths 3/5 kill the gate). Consumers at
+//          distance <4 mean the immediate and pipelined models DIVERGE -> hazard list;
+//        - SAME-PAIR upper->lower VF hazards: a lower op (SQ/SQI/SQD/DIV/MTIR/MOVE/...)
+//          that reads/stores a VF its OWN pair's upper writes. On real VU1 the lower sees
+//          the OLD value (G139 root: `SUB VF24.xyz,VF17,VF16 | SQ VF24` @0x1fa8 stored raw
+//          edge-vector bits as the middle vertex -> beam shards). Statically enumerable;
+//        - Q/P latency events: DIV/SQRT/RSQRT->q-consumer and EFU->MFP distances, WAITQ/
+//          WAITP presence (the G87 class);
+//        - XGKICK sites, CLIPw/FCGET clusters (Sutherland-Hodgman clipper shape - the G140
+//          clipper at 0x2740..0x2f48 would appear on day one).
+//
+// Rule 219 VU_PROGRAM_COVERAGE (per program): branch-target map (B/BAL/IBxx decode),
+//        BAL subroutine entries, dispatcher-region branches (pc < 0x800 - the 0x5e0
+//        pre-dispatcher + 0x708 dispatcher shape), JR/JALR indirect sites, and BFS
+//        reachability from entry 0 + all branch targets -> unreached-region spans.
+//        G140 lesson: the [G39:code] runtime dump was capped at 0x1c90 and the clipper
+//        past 0x2180 was NEVER disassembled -> "trifan route" misattributed for 20+
+//        phases. Static full-program coverage kills that class permanently.
+//
+// Rule 220 VU_OPCODE_CANON + RUNTIME CONFORMANCE DIFF (top-level `vu_lower_opcode_canon`
+//        + `vu_opcode_map_check` + `vu_opcode_coverage_gap`, general PS2): embeds the
+//        AUTHORITATIVE lower-opcode index->name map (PCSX2 _LOWER_OPCODE: 0x18=FMEQ,
+//        0x1A=FMAND, 0x1B=FMOR, 0x1C=FCGET ...) as data - NOT derived from the runner
+//        (shared-bug hazard: pre-G138 g117_vudis.py printed FMAND as "FMEQ" because it
+//        copied the runner's table). Best-effort diff: scrapes ps2_vu1.cpp `case 0xNN:`
+//        bodies for opcode-name tokens and flags disagreements with canon (would have
+//        printed "0x1A: runner says FMEQ, canon says FMAND, game uses it" at map time).
+//        Also: census opcodes (len>=3) absent from the runner source -> coverage gap.
+//
+// Rule 221 RUNTIME_LEVER_REGISTRY (top-level `runtime_lever_registry` +
+//        `runtime_bandaid_status`): scrapes the ps2xRuntime checkout (Rule 153 walk) for
+//        getenv("...") behaviour levers; classifies diagnostic / kill_switch_of_default_on
+//        (_NO_) / reenable_of_retired (FORCE) / semantic_lever; captures VU-pc-shaped hex
+//        literals near the getenv (the G64 shape: IAND patch at pc 0x30d8/0x30f8/0x3168).
+//        A default-ON pc-scoped semantic patch = STALE_BANDAID_SUSPECT. G140 root: the
+//        June G64 "enable fix" inverted the VU clipper's inside/outside test (VI1 = FCGET
+//        clip flags, set=OUTSIDE) and force-broke the water pool for 70 phases after its
+//        credited effect was superseded by the G138/G139 root fixes. The retired-band-aid
+//        roster (G89/G100/G104/G125-clip/G128/G64 + kill-switches) ships as data.
+//
+// Rule 222 PERF_STATIC_COST (per-func `perf_static_cost` + top-level `perf_cost_ranking`
+//        + `memcpy_shaped_loops` + `idle_spin_yield_sites`, general PS2): G141 (ACTIVE)
+//        is performance (~2.4 f/s title). Static cost model: instruction count, inner
+//        loops, COP2 density, callee fan-out, weighted by mainloop depth -> ranked
+//        suspects so the "measure first" phase starts at named functions. Two fast-path
+//        sub-detectors: MEMCPY_SHAPED_LOOP (tight lq/sq copy loop, no callees -> host
+//        memcpy substitution candidate) and IDLE_SPIN_YIELD_SITE (store-free poll spin
+//        -> host-yield patch candidate; refines Rules 121/122/143).
+//
+// Rule 223 G138-G140 ROSTER/INVARIANT refresh (data): DC2_RUNTIME_INVARIANTS +=
+//        VU1_LOWER_OPCODE_TABLE_CANON, VU1_MAC_FLAG_PIPELINE_DEPTH_4,
+//        VU1_SAME_PAIR_UPPER_LOWER_HAZARD, TITLE_VU1_CLIPPER_MAP (pre-dispatcher 0x5e0
+//        bit1=fc4 -> clip packers 0x21b0/0x23e8, clipper 0x2740..0x2f48, edge sub 0x3088,
+//        fan template VU qw39->780, XGKICK 0x2d88/0x2f38 - the "trifans" are CLIPPED WALL
+//        GEOMETRY, not an object route), TITLE_TRANSFORM_GATE_FMAND_CASCADE (corrects the
+//        G117 "structurally never takeable" claim: VI3=0xD0|qw30 under real FMAND),
+//        STALE_PC_SCOPED_BANDAID_SWEEP, GS_DUMP_RECORD_ALIGNMENT_TRICK. PHASE_TRACE_FLAGS
+//        += G138/G140 probes. Golden title smoke = 211646 (frame_001500 PixelNonZero).
+//        Rule 153 default runtime path corrected to D:\ps2r\dc2\PS2Recomp\ps2xRuntime.
+//
+// Rule 224 GIFTAG_TEMPLATE_SCAN (top-level `giftag_templates`, general PS2): scans
+//        initialized data for GIFtag-shaped 16-byte records (structural zeros in word0
+//        bits16-31 + word1 bits0-13, nreg>=1, no reserved REGS nibble 0xB), grouped by
+//        value with counts + example addresses + full decode (nloop/eop/pre/prim/
+//        prim_class/flg/nreg/regs). nloop==0 = TEMPLATE (VIF-delivered, VU-patched -
+//        G140: the trifan giftag 302ec000 existed at exactly TWO RAM addresses, both
+//        nloop=0 templates for VU qw39; a standing scan answers "where do these giftags
+//        come from" for any prim class in one pass).
+//
+// Rule 225 SCHEMA_VERSION: 16.0 (v17 adds Rules 217-225).
+//
+// ================================================================
+// v17.1 RULES (226-233) - PCSX2 source cross-check round 2
+// (D:\ps2r\pcsx2-master\pcsx2: Dmac.h/Dmac.cpp, Vif_Codes.cpp, Gif.h/Gif_Unit.h,
+// GS.cpp/Hw.h, Vif.h, FiFo.cpp, Counters.h/cpp, COP0.cpp). These cover the EE
+// hardware CONTRACTS PCSX2 models that no prior rule flagged: DMA MFIFO rings,
+// DMA stall control, VIF path arbitration, GS downloads, PRMODE attribute
+// source, TEXA/CLAMP sampling contracts, and the EE time sources (perf/G141).
+// ================================================================
+//
+// Rule 226 DMA_MFIFO_RING_CONFIG (per-func + top-level `dma_mfifo_users`, general PS2):
+//        PCSX2 Dmac.h tDMAC_CTRL.MFD (Memory-FIFO Drain: VIF1 or GIF) + DMAC_RBOR
+//        (0x1000E050 ring base) / DMAC_RBSR (0x1000E040 ring size). A game that drives
+//        GIF/VIF1 through an MFIFO ring feeds the drain channel from a circular buffer
+//        the SPR channel fills; a runtime that treats CHCR/MADR as a flat transfer
+//        (no ring wrap, no drain-on-fill) silently drops geometry or hangs on the
+//        stalled drain. Detected: composite const hits on RBOR/RBSR/CTRL (exact reg
+//        split of the old blanket DMAC_GLOBAL range hit). DC2 expectation: unused
+//        (statistic 0 is the finding, like Rule 150); many PS2 engines (Jak, GT) live on it.
+//
+// Rule 227 DMA_STALL_CONTROL_SYNC (per-func + top-level `dma_stall_control_sync`, general
+//        PS2): PCSX2 Dmac.h STS/STD (stall source/drain) + DMAC_STADR (0x1000E060) + the
+//        REFS source-chain tag (id 4, stall-controlled REF). The producer channel updates
+//        STADR as it writes; the consumer channel STALLS until STADR passes its MADR -
+//        the EE's hardware read-after-write interlock for streamed data. A runtime that
+//        ignores stall control runs the consumer ahead of the producer -> reads garbage
+//        (streaming geometry/texture corruption with no other witness). Detected:
+//        STADR const hit, or REFS in dmaTagIdsBuilt/storedDmaTagIds.
+//
+// Rule 228 VIF_PATH_ARBITRATION (per-func + top-level `vif_path_arbitration`, general PS2):
+//        PCSX2 Vif_Codes.cpp MSKPATH3 (VIF cmd 0x06) / FLUSH 0x11 / FLUSHA 0x13 / FLUSHE
+//        0x10 / MARK 0x07 + Gif_Unit GIF MODE (0x10003010) M3R/IMT (Path3 mask +
+//        intermittent mode). These are the GIF PATH1/2/3 arbitration controls: MSKPATH3
+//        masks texture Path3 while VU1 XGKICK geometry owns the GIF; FLUSHA waits for
+//        Path3 idle; FLUSHE waits for the VU program end. A runtime that executes VIF
+//        streams but ignores arbitration interleaves Path3 texture qwords INTO Path1
+//        geometry packets (corruption) or waits forever (FLUSHA deadlock). The VIF codes
+//        were already decoded (VIF_OPCODES) but NO rule consumed them. DC2 relevance:
+//        Path3 is the primary pipe AND VU1 XGKICK is live for models/title - the mask
+//        windows matter exactly there.
+//
+// Rule 229 GS_DOWNLOAD_READBACK_PATH (per-func + top-level `gs_readback_sites`, general
+//        PS2): the GS->EE download path PCSX2 models in GS.cpp GS_BUSDIR + Vif.h
+//        VIF1_STAT.FDR (bit 23, VIF1 FIFO reversed) + FiFo.cpp ReadFIFO_VIF1 + TRXDIR=1
+//        (local->host). Games use it for RTT readback, save-file screenshots, picking/
+//        collision-from-render tricks. A runtime with no readback returns zeros ->
+//        wrong-but-silent data (or a hang polling FDR). Detected: BUSDIR priv-reg hit,
+//        VIF1_STAT const with bit23 shape near VIF CTRL access, or a TRXDIR (0x53) A+D
+//        store whose const-tracked value is 1. DC2: READFIFO2_DEAD invariant says unused
+//        in the 9 dumps - the roster proves ABSENCE for DC2 and coverage for other games.
+//
+// Rule 230 GS_PRMODE_ATTRIBUTE_SOURCE (per-func + top-level `prmode_attr_writers`,
+//        general PS2): GS PRMODECONT (A+D 0x1A) selects whether primitive attributes
+//        (IIP/TME/FGE/ABE/AA1/FST/CTXT/FIX) come from PRIM or from PRMODE (A+D 0x1B).
+//        A runtime GS decoder that always reads PRIM mis-attributes every prim drawn
+//        under PRMODECONT.AC=0 (wrong context -> wrong TEX0/FRAME pair, fog/blend flips).
+//        Both regs sat in KNOWN_GS_REGS with NO detector. Detected via the Rule A
+//        const-tracked A+D store path (0x1A/0x1B).
+//
+// Rule 231 GS_TEXA_CLAMP_CONTRACT (per-func + top-level `texa_clamp_writers`, general
+//        PS2): two sampling contracts a software rasterizer must honour:
+//        (a) TEXA (A+D 0x3B) - the 16/24-bit texel alpha expansion (AEM/TA0/TA1). DC2
+//        samples PSMCT16 CLUTs; wrong TEXA turns "black = transparent" into opaque
+//        black boxes (or everything invisible).
+//        (b) CLAMP_1/2 (A+D 0x08/0x09) with WMS/WMT >= 2 - REGION_CLAMP/REGION_REPEAT,
+//        the atlas sub-rectangle wrap modes (UMIN/UMAX/VMIN/VMAX). An atlas-heavy UI
+//        (DC2 menus: fukusel/cursor sheets) draws sub-sprites via region clamp; a
+//        rasterizer that wraps on the full texture bleeds neighbouring atlas cells.
+//        Detected via the Rule A const-tracked A+D store path (0x3B/0x08/0x09).
+//
+// Rule 232 EE_TIME_SOURCE_ROSTER (per-func + top-level `ee_time_sources`, general PS2 +
+//        G141 perf): WHERE the game reads time. Three hardware sources: EE timers
+//        T0-T3 COUNT/MODE (0x10000000/0x10000800/0x10001000/0x10001800 +0x10, PCSX2
+//        Counters.cpp - MODE gate bits tie a timer to h/v-blank), COP0 Count (mfc0 reg
+//        9, the cycle counter PCSX2 models in COP0.cpp UpdateCP0Count), and vsync waits
+//        (already Rule 100/195). A recompiled runtime whose timers/cycle-counter advance
+//        at the wrong RATE makes the game step slow/fast/never - exactly the G141
+//        "title steps ~2.4 f/s" class: if game logic paces on a timer the runtime
+//        never advances, no amount of render optimisation fixes pacing. The roster
+//        names every function that consumes a time source so the perf phase checks
+//        the runtime's clock model FIRST. Detected: exact RCNT COUNT/MODE/TARGET reg
+//        split of the old blanket RCNT range hit + an mfc0-Count operand scan.
+//
+// Rule 233 SCHEMA_VERSION: 16.1 (v17.1 adds Rules 226-233).
+//
 // PIPELINE (v11.3): the script now asks "FIRST run for this ELF?" up front:
 //   - YES -> full pipeline. Delegates the Step-1 export to ExportPS2Functions via runScript,
 //            then enriches; emits csv + assembly + decompiled + flowchart + unified TOML + triage_map.json.
@@ -1354,6 +1640,16 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         { 0x001425B0L, "mgEndFrame",                                         "F40",        "frame_clock_driver",      "HIGH"    },
         { 0x002A1220L, "TitleModeKey__Fv",                                   "F41",        "title_input_consumer",    "HIGH"    },
         { 0x002A2280L, "TitleMapDraw__Fv",                                   "F46.5",      "title_render_chain",      "HIGH"    },
+        // v16 (G116-G137 title-cavern): the motion-MDT selector builder + SPI dispatch anchors.
+        // (0x1404d0 CreateRenderInfoPacket is ALREADY in this table below as vu1_model_packet_builder
+        // and already fires isPrimClassSelector via the hardcoded addr check; not duplicated here.)
+        // The four VU packer addresses (copy 0x1b68 / trifan 0x1c50 / tri 0x1dc0 / tristrip 0x1ff0)
+        // are VU1 micro-mem PCs, not EE function entries, so they live in the invariants text.
+        { 0x0028A660L, "CreateRenderInfoPacket_motionMDT_0x28a660",          "G120",       "prim_class_selector",     "HIGH"    },
+        { 0x001648F0L, "cfgWATER_VERTEX__Fv",                                "G129/G130",  "spi_config_command",      "MEDIUM"  },
+        { 0x00185D40L, "CreateWaterFrame__Fv",                               "G129/G130",  "spi_config_command",      "MEDIUM"  },
+        { 0x001463E0L, "spiGetStackInt__Fv",                                 "G130",       "spi_stack_arg_getter",    "LOW"     },
+        { 0x0015E800L, "DrawWater__4CMapFv",                                 "G129/G130",  "title_water_gate",        "LOW"     },
         { 0x00131A90L, "__ct__18mgCCameraFollowFv",                          "F42",        "ctor_critical",           "HIGH"    },
         { 0x0012E850L, "ReloadTexture__17mgCTextureManagerFiP13sceVif1Packet","F43",       "texture_upload_entry",    "BLOCKER" },
         { 0x0012E600L, "mgLoadImage__FPUiiiiP1iiiii",                        "F43",        "texture_upload_path",     "BLOCKER" },
@@ -1563,6 +1859,20 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         { "MGFRAME_VTABLE_TAILCALL","G59: Draw__8mgCFrame@0x1387f0 is `a1=0; jr *(vtable+0x44)` - an inherited-virtual TAIL CALL. The recompiler mistranslated it into a return-to-dispatcher (`Function at address 0xN not found`) instead of completing the inherited call -> mgDraw@0x142f90 exited early with its frame still active -> the process fell through the startup _Exit path. FIX g59_frame_draw_tailcall_fix sets a1=0, calls the virtual slot synchronously, returns to mgDraw continuation 0x142fac. General PS2: a terminal `jr` through a loaded vtable slot (not ra/t9) needs explicit tail-call handling. Statically: VTABLE_TAILCALL_THUNK." },
         { "TITLE_RESUME_STACK_FRAME","G58/G59: TitleMapDraw@0x2a2280 is preempted/resumed mid-body; the runner resumed interior labels 0x2a2548/0x2a2644 with sp one 0x830 frame too low -> the epilogue `ld $ra,0xA0($sp)` loaded garbage -> bad-PC 0x9f84a0. NOT a saved-$ra overwrite (refuted) and NOT a mistranslated store. FIX = title-scoped resume wrappers restoring sp=0x1fff760. General PS2: a large draw/frame function re-entered at an interior label must restore a consistent frame. Statically: FRAME_RESUME_RISK." },
         { "COSTUME_RTT_STATE_LEAK_ON_ROUNDTRIP","G79: after Title->New Game->costume->back, the front-end runs TitleLoop (titleMode=2) and MenuCostumeDraw@0x2be040 (menuId 0x17) CONCURRENTLY - costume never tore down. The costume RTT GS-state (FRAME=fbp=0x139 / scissor) is left set, so TitleMapDraw's rock copy geom reaches the GS but is invisible (drawn into the RTT target, not the display buffer). FIX = restore the display FRAME / tear down the costume before the title draw. General PS2: an RTT writer that never restores the display-buffer FRAME leaks render-target scope. Statically: RTT_NO_RESTORE / LoopNo+menuId contradiction (loop_state_model)." },
+        // ===== v16: G116-G137 main-title 3D-background copy/transform/clip invariants (Rules 207-215) =====
+        { "COPY_PACKER_WORD3_IS_FOG_NOT_ADC","G132 (cost ~7 phases, G131-G137): the title COPY packer 0x1b68 emits XYZF2 where word3 is the FOG byte (VF26.w = clamp(VF29.x + VF29.w*VF16.w, 0, 255), VF29=(-191.25,255,0,535500)). Packed by FTOI4 into word3 bits [4:11]; the ADC bit15 needs VF26.w>=2048 but the clamp ceiling is 255 << 2048, so the copy packer's per-vertex ADC is STRUCTURALLY ALWAYS 0 BY DESIGN - it CANNOT carry HW's selective ~45%-at-pos2+ tristrip restart pattern. The G131 `ILWR VI7,(VI12)&0x8000` per-vertex flag is REFUTED (that runs once pre-loop and writes the GIFtag word). A packer's per-vertex strip-restart capability is a FORMAT fact (XYZF2 fog vs XYZ2 ADC), not a lost flag. Statically: VERTEX_KICK_FORMAT_ADC_CAPABILITY / PACKED_FIELD_ALIAS_FOG_ADC." },
+        { "GS_NO_HW_TRIANGLE_CLIP","G125-G129 (cost ~5 phases): the PS2 GS performs NO triangle / near-plane / guard-band CLIPPING - it only SCISSORS, and out-of-guard-band 12.4 coords WRAP. FTOI4 packs screen XY as 12.4 fixed point (int32 then masked to 16 bits), so a BEHIND-camera vertex (q=1/W<=0) has an already-SATURATED/WRAPPED screen XY before the GS. Reconstructing clip-space (clip = screen*W) from that saturated XY yields GARBAGE -> screen-spanning wedges (G128). The near plane MUST be handled on the float position + q BEFORE FTOI4 (homogeneous clip where the true 1/W sign lives) or the straddling triangle REJECTED (q<=0). Tristrips can't be per-vertex clipped (shared vertex -> swimming connectors, G102) so reject. Statically: PERSPECTIVE_DIVIDE_NEAR_PLANE_SOURCE / GS_XYOFFSET_GUARD_BAND." },
+        { "TITLE_HAS_NO_WATER_ON_HW","G130 (corrects G129): the title CMap (0x8fc880) water arrays (+0xcec/+0xcf0/+0xcf4/+0xcf8) are EMPTY, cfgWater=0, WaterIndex=0 - BYTE-IDENTICAL between the runner and LIVE HW. HW never creates a CWaterFrame for the title map and its DrawWater@0x15e800 ALSO gates SKIP. The SPI map-config command cfgWATER_VERTEX@0x1648F0 (->CreateWaterFrame@0x185D40) NEVER fires during title load on EITHER side. The reference's ~1012 trifans are cavern MODEL geometry (100% draw under wall pages 0x2b20/0x2720/0x2760/0x2f20), NOT a water pool. Implementing the WATER_VERTEX SPI dispatch is the WRONG target. The string/id-keyed SPI config dispatcher (spiGetStackInt@0x1463E0) is the place to verify a 'missing map feature'. Statically: SPI_CONFIG_COMMAND_DISPATCH." },
+        { "TITLE_PACKER_DISPATCH_MAP","G117/G130/G137: the title VU1 dispatcher routes (decode pcs 0x730/0x760/0x7b0) the qword38 selector to one of FOUR packers: COPY/passthrough 0x1b68 (EE-pre-projected screen-space, no VU transform, XYZF2 fog), TRANSFORM tristrip 0x1ff0 (100% nodraw by correct microcode - the +2048/ADC gate is structurally never-taken, ==PCSX2 _vuFMEQ), TRANSFORM tri 0x1dc0, TRIFAN 0x1c50. selector built in CreateRenderInfoPacket@0x1404d0 (motion-MDT direct call @0x28a660): bit2=desc+0x2c, bit0=fc0||fc4. HW draws the visible cavern via the copy/tri/trifan route; routing (desc+0x2c) is BYTE-IDENTICAL runner-vs-HW (G121), so the defect is the copy RENDER contract, not routing. G100 FORCE-routes everything through the nodraw 0x1ff0 (LOAD-BEARING band-aid). Statically: PASSTHROUGH_PACKER_RENDER_PATH." },
+        { "TITLE_NEEDS_PRIVATE_Z","G125: the title cavern needs a PRIVATE per-frame-cleared Z buffer - without a depth test the back cavern wall overdrew the front carved mural. The full title transform-matrix chain (mgRENDER_INFO@0x380ec0 +0x10/+0x110/+0x150/+0x1a0/+0x260) is BYTE-IDENTICAL to LIVE HW (refutes any 'X-scale'/projection bug, G124/G125); the residual was the near-plane clip + depth ordering, fixed by a homogeneous clip (clip=screen*W, q preserved) + a private title Z. Statically: PRIVATE_DEPTH_SCOPE / RTT_TARGET." },
+        // ===== v17: G138-G140 VU1-interpreter root-cause invariants (Rules 217-223) =====
+        { "VU1_LOWER_OPCODE_TABLE_CANON","G138 ROOT #1 (ended the whole G70-G137 title blue-void line): the real VU lower-opcode dispatch (PCSX2 _LOWER_OPCODE, index=code>>25) is 0x18=FMEQ, 0x1A=FMAND, 0x1B=FMOR, 0x1C=FCGET. The runner had FMEQ/FMAND SWAPPED (+FMOR parked on 0x1C) - DC2's draw gates are FMAND mask cascades and could never equal the mask under FMEQ 0/1 semantics ('gate structurally never takeable' was true only under the swapped table). SHARED-BUG HAZARD: the g117_vudis.py disassembler copied the runner's table, so every 'FMEQ' in the G70-G137 analyses was really FMAND - verify opcode maps against PCSX2's dispatch tables, never against the runner's own case labels. Kill-switch DC2_VU1_NO_FMSWAPFIX=1. Statically: Rules 218/220." },
+        { "VU1_MAC_FLAG_PIPELINE_DEPTH_4","G138 ROOT #2: real VU1 MAC/STATUS flags become visible ~4 instruction pairs after the producing FMAC, and DC2's gate chains are hand-scheduled at EXACTLY that distance (each FMAND reads the guard SUB 4 pairs earlier). The runner read flags un-pipelined -> FMANDs consumed the interleaved fog/pos ops' flags. Fix = 4-deep flag shift register (DC2_VU1_MACPIPE_DEPTH=4 validated; 3 kills the gate entirely, 5 mostly kills it). Same defect class as the G87 Q-register latency. Kill DC2_VU1_NO_MACPIPE=1. Statically: Rule 218 flag-consumer distances (all ==4 -> pipeline REQUIRED; <4 -> program needs exact latency)." },
+        { "VU1_SAME_PAIR_UPPER_LOWER_HAZARD","G139 ROOT (beam shards): a lower op can NEVER see its same-pair upper's result on real VU1 (FMAC latency). Tri packer pair 0x1fa8 `SUB VF24.xyz,VF17,VF16 | SQ VF24` is a store-then-clobber idiom - the SQ must store the OLD VF24 (=FTOI4(VF17) from exactly 4 pairs back); the runner's immediate upper commit made it store the just-computed edge vector's raw float bits as the middle vertex XYZ (.w survived via the .xyz dest mask - why ADC/fog stats matched HW while positions exploded). SIGNATURE: 'positions garbage but ADC/fog fine' = look for a dest-masked upper clobbering a lower-read VF in one pair. Fix default-ON (kill DC2_VU1_NO_PAIRHAZ=1). Statically: Rule 218 same_pair_hazards." },
+        { "TITLE_VU1_CLIPPER_MAP","G140 (corrects the G132/G139 'trifan wall route 0x1c50' framing TWICE): HW never routes the cavern through 0x1c50 (live selector sweep: no title object has bit2=0&&bit0=1). The title VU program has a PRE-dispatcher at 0x5e0 - selector bit1 (=fc4, mgClipInBoxW 'frame straddles clip box') routes batches to CLIP-transform packers 0x21b0(tri)/0x23e8(tstrip); only bit1=0 batches reach the known 0x708 bit2/bit0 dispatcher. The Sutherland-Hodgman polygon clipper at 0x2740..0x2f48 (per-edge sub 0x3088: CLIPw->FCGET->IAND inside/outside; intersection sub 0x3210 with DIV Q+WAITQ+MR32) emits clipped polys as TRIFANS from the template at VU qw39->780 (nloop|=0x8000), XGKICKed at 0x2d88/0x2f38 - the alternating `00008000/0000800N 302ec000` records in the HW .gs. The HW's ~1012 'trifan' verts = CLIPPED WALL GEOMETRY at the frame edge (incl. the water pool / bottom strip), NOT a water object and NOT an object route." },
+        { "TITLE_TRANSFORM_GATE_FMAND_CASCADE","G138 (corrects TITLE_PACKER_DISPATCH_MAP's '0x1ff0 is 100% nodraw by correct microcode' and retires FORCED_0x1ff0_DRAW_IS_LOAD_BEARING): under the REAL opcode table the transform gates are takeable and bit-exact vs HW. Gate formula: draw when the FMAND mask cascade equals VI3 = 0xD0|qw30, where 0xD0 = MAC S-flags x,y,w ('guard SUB negative in all three tested lanes' = inside guard planes), 0x20 = OPMSUB winding cross S.z (backface), and qw30 = the winding-flip bit written by the setup determinant code at VU 0x01c0..0x0210 (FMAND VI9,0x80 on the view determinant's S.x). 5-vert tstrip loop 0x2070..0x2180 (IBEQ @0x2128), 3-vert loop 0x1ec8..0x1fd0 (IBEQ @0x1f68), tri packer 0x1d08..0x1da0 (IBEQ @0x1d48). G100 forced-draw RETIRED (re-enable DC2_G100_FORCE_DRAW=1); with faithful gates it OVER-draws." },
+        { "STALE_PC_SCOPED_BANDAID_SWEEP","G140 DURABLE LESSON: a stale default-ON band-aid can BE the 'missing feature'. The June G64 'enable fix' (ps2_vu1.cpp IAND patch scoped to pc 0x30d8/0x30f8/0x3168) ORed the tested mask into VI1 - but VI1 there is the clipper's FCGET CLIP FLAGS (set = OUTSIDE), so every vertex read outside, all 6 Sutherland-Hodgman passes emptied, and the water pool never rendered. G64's credited effect was really the then-unfixed G138/G139 roots. When retiring a root fix's band-aids, sweep OLD pc-scoped interpreter patches too (G64 predated G138 by 70 phases). Retired default-OFF: G100 forced-draw, G89 guard cull, G104/G125 near-plane tri clip, G128 behind-drop, G64 enable-fix (DC2_*_FORCE_* re-enables); G125 title Z stays default-ON. Golden title smoke: frame_001500 PixelNonZero=211646. Statically: Rule 221 runtime_lever_registry." },
+        { "GS_DUMP_RECORD_ALIGNMENT_TRICK","G139 reusable tooling lesson: runner GS dumps write one strip per record with order preserved, so a contiguous runner record window aligns to the HW dump by (prim,tbp,nverts) SIGNATURE matching - no camera-pose matching needed. This record-order alignment found the per-vertex slot-1 corruption (G139) that centroid-join missed. Harness: DC2_G138_GSDUMP (runner .gs container with per-XGKICK packer-PC NOP markers) + tools/g138_hw_slice.py (per-TBP/per-strip census: ALLDRAW/PRIMED/MIXED/ALLNODRAW) + tools/g138_join.py (geometry join + per-vertex outlier A/B). ALSO: split-IMAGE continuation records misparse as giant fake PACKED groups (the 'MIXED >=2048px:842' artifact) - dedupe/validate before trusting extent stats." },
     };
 
     // v9 Rule 134: pre-computed forward callgraphs to bullseye sinks. Each
@@ -1905,6 +2215,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         TAG_PRIORITY.put("VERTEX_LIGHTING_NORMAL_TERM", 934);
         TAG_PRIORITY.put("VTABLE_TAILCALL_THUNK", 932);
         TAG_PRIORITY.put("RTT_NO_RESTORE", 930);
+        // v16 (G116-G137 title-cavern): render-path classes, ranked just under the v13 render rules.
+        TAG_PRIORITY.put("VERTEX_KICK_FORMAT_ADC_CAPABILITY", 928);
+        TAG_PRIORITY.put("PERSPECTIVE_DIVIDE_NEAR_PLANE_SOURCE", 926);
+        TAG_PRIORITY.put("PASSTHROUGH_PACKER_RENDER_PATH", 924);
+        TAG_PRIORITY.put("PACKED_FIELD_ALIAS_FOG_ADC", 922);
+        TAG_PRIORITY.put("SPI_CONFIG_COMMAND_DISPATCH", 520);
+        TAG_PRIORITY.put("DATA_DRIVEN_COMMAND_INTERPRETER", 510);
+        TAG_PRIORITY.put("PRIVATE_DEPTH_SCOPE", 700);
         TAG_PRIORITY.put("FRAME_RESUME_RISK", 760);
         TAG_PRIORITY.put("VU_FLAG_PIPELINE_UPLOADER", 705);
         TAG_PRIORITY.put("PACKED_RGBAQ_BUILDER", 655);
@@ -2097,7 +2415,26 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         "DC2_TRACE_VU1","DC2_TRACE_RENDER_QUALITY","DC2_TRACE_HANG",
         "DC2_TRACE_FRAME_REGS","DC2_DEBUG_MENU","DC2_TRACE_MAP_ENTRY",
         "DC2_TRACE_MENU_STATE","DC2_TRACE_F50_10","DC2_TRACE_F50_11",
-        "DC2_TRACE_F50_12","DC2_T8_ALIAS_TBW"
+        "DC2_TRACE_F50_12","DC2_T8_ALIAS_TBW",
+        // v17: G138-G140 packet-level A/B + VU1 clipper probes (env-gated, quiet by default).
+        "DC2_G138_GSDUMP","DC2_G138_GSDUMP_MAX","DC2_G140_CLIP","DC2_G63_GATE",
+        "DC2_VU1_MACPIPE_DEPTH","DC2_G22_VU1_CYCLES"
+    };
+
+    // v17 Rule 221/223: the retired/kill-switch band-aid roster from the G138-G140
+    // root-cause arc. Emitted as `runtime_bandaid_status` so a future phase never
+    // re-tunes a retired lever or misses a stale pc-scoped patch (the G64 class).
+    // Format: {env, phase, default_state, note}.
+    private static final String[][] DC2_RETIRED_BANDAIDS = {
+        { "DC2_G100_FORCE_DRAW",        "G138", "retired_off", "title forced-draw band-aid; with faithful FMAND gates it OVER-draws (and never covered the 3-vert loop gate 0x1f68)" },
+        { "DC2_VU1_NO_FMSWAPFIX",       "G138", "fix_on",      "kill-switch for the FMEQ/FMAND lower-opcode-table root fix (0x18=FMEQ,0x1A=FMAND,0x1B=FMOR,0x1C=FCGET)" },
+        { "DC2_VU1_NO_MACPIPE",         "G138", "fix_on",      "kill-switch for the 4-deep MAC/STATUS flag pipeline (DC2_VU1_MACPIPE_DEPTH=4; 3/5 kill the gate)" },
+        { "DC2_VU1_NO_PAIRHAZ",         "G139", "fix_on",      "kill-switch for the same-pair upper->lower VF hazard fix (lower reads pre-upper value; upper's masked lanes overlaid after)" },
+        { "DC2_G89_FORCE_GUARD_CULL",   "G139", "retired_off", "rasterizer guard-cull band-aid retired; natural gates+positions are HW-faithful" },
+        { "DC2_G104_FORCE_TRI_CLIP",    "G139", "retired_off", "near-plane homogeneous tri-clip band-aid retired (G104/G125)" },
+        { "DC2_G128_FORCE_BEHIND_DROP", "G139", "retired_off", "behind-drop reject band-aid retired" },
+        { "DC2_G125_NO_TITLE_Z",        "G125", "still_on",    "title private-Z substitute STILL default-ON - load-bearing for depth order (foreground rocks); re-A/B before deleting" },
+        { "DC2_G64_FORCE_ENABLE_FIX",   "G140", "retired_off", "G64 IAND VI1-forcing retired: VI1 at pc 0x30d8/0x30f8/0x3168 is the clipper's FCGET clip flags (set=OUTSIDE); forcing bits inverted the inside/outside test and emptied all 6 clip passes (no water pool)" },
     };
 
     // Rule 104: expected GS uploads per phase (current blocker: T8 dbp=0x2720
@@ -2707,6 +3044,63 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // Rule 204: CFC2/CTC2 VU0 control-register access (control-reg map codegen class).
         boolean usesCop2ControlReg = false;
         Set<String> cop2ControlRegs = new LinkedHashSet<>();  // resolved index names (STATUS/MAC/CLIP/Q/...)
+
+        // ===== v16 fields (DC2 G116-G137 retrospective + general PS2) =====
+        // Rule 207: vertex-emit packer's ADC capability by emitted GS format. G132.
+        boolean usesFtoi4 = false;          // has an FTOI4 (COP2) pack op
+        boolean hasFogClampShape = false;   // mul+add then clamp to a <=255 ceiling (XYZF2 fog .w)
+        boolean isAdcCapablePacker = false;
+        String  adcCapability = null;       // xyzf2_fog_no_adc | xyz2_adc_capable | xyz3_norestart | unknown_packer
+        // Rule 208: perspective-divide -> FTOI4 site; near-plane must be handled pre-FTOI4. G125-G129.
+        boolean computesPerspectiveDivide = false; // DIV/RSQRT feeding a position multiply
+        boolean isNearPlaneSite = false;
+        String  nearPlaneStrategy = null;   // clip_homog | reject_q_le_0
+        // Rule 209/210: data-driven command/config interpreter (SPI cfgXXX, CRunScript VM). G129/G130/F63.
+        boolean isSpiConfigCommand = false;
+        boolean isCommandInterpreter = false;
+        String  interpreterDetail = null;
+        // Rule 211: which VU packer family this func feeds / is. G130.
+        boolean isPackerFamily = false;
+        String  packerFamily = null;        // copy_passthrough | transform | trifan | dispatcher
+        // Rule 212: scene/RTT draw needing a private per-frame Z buffer. G125.
+        boolean isPrivateDepthScope = false;
+        // Rule 214: PACKED word3 fog<->ADC field-alias hazard. G132.
+        boolean isPackedFieldAlias = false;
+
+        // ===== v17 fields (G138-G140 retrospective + G141 perf support) =====
+        // Rule 222: static frame-cost estimate (instr count + loops + COP2 density
+        // + fan-out, weighted by mainloop depth). Ranks the G141 perf suspects.
+        long perfStaticCost = 0;
+        // Rule 222: tight lq/sq copy loop, no callees -> host memcpy/memset
+        // substitution candidate (guest exec is the perf blocker).
+        boolean isMemcpyShapedLoop = false;
+        // Rule 222: store-free poll spin -> host-yield patch candidate
+        // (refines Rules 121/122/143 into an actionable perf roster).
+        boolean isIdleSpinYieldSite = false;
+
+        // ===== v17.1 fields (PCSX2 cross-check round 2, Rules 226-232) =====
+        // Rule 226/227: exact DMAC-global reg names hit (CTRL/STAT/PCR/SQWC/
+        // RBSR/RBOR/STADR) - splits the blanket DMAC_GLOBAL range stamp.
+        Set<String> dmacGlobalRegsHit = new LinkedHashSet<>();
+        boolean isDmaMfifoUser = false;         // Rule 226
+        boolean isDmaStallControlSync = false;  // Rule 227
+        // Rule 228: path-arbitration VIF codes this func builds/stores.
+        Set<String> vifPathArbCodes = new LinkedHashSet<>();
+        boolean isVifPathArbiter = false;
+        // Rule 229: GS->EE download signals (BUSDIR / TRXDIR=1 / VIF1 FDR).
+        Set<String> gsReadbackSignals = new LinkedHashSet<>();
+        boolean isGsReadbackSite = false;
+        boolean storesTrxdirLocalToHost = false; // TRXDIR store, const value == 1
+        // Rule 230: PRMODECONT (0x1A) / PRMODE (0x1B) A+D writers.
+        boolean writesPrmodecontReg = false;
+        boolean writesPrmodeReg = false;
+        // Rule 231: TEXA (0x3B) / CLAMP_1/2 (0x08/0x09) A+D writers.
+        boolean writesTexaReg = false;
+        boolean writesClampReg = false;
+        // Rule 232: EE time sources - exact timer regs hit + COP0 Count reads.
+        Set<String> rcntRegsHit = new LinkedHashSet<>();  // e.g. T0_COUNT, T2_MODE
+        boolean readsCop0Count = false;
+        boolean isEeTimeSource = false;
     }
 
     // =========================================================
@@ -2980,6 +3374,83 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private final List<String[]> cop2ControlRegAccess = new ArrayList<>();
     // Rule 205 UNFUNDED_TEXTURE_PAGE: [pageHex, label, samplerFunc].
     private final List<String[]> unfundedTexturePages = new ArrayList<>();
+    // ===== v16 counters + rosters (Rules 207-216, G116-G137 retrospective) =====
+    private int adcCapablePackerCount=0, nearPlaneSiteCount=0, spiConfigCommandCount=0;
+    private int commandInterpreterCount=0, packerFamilyCount=0, privateDepthScopeCount=0;
+    private int packedFieldAliasCount=0;
+    // [name, addrHex, detail] triads (reuse emitV13Roster).
+    private final List<String[]> adcCapablePackers   = new ArrayList<>(); // Rule 207
+    private final List<String[]> nearPlaneSites       = new ArrayList<>(); // Rule 208
+    private final List<String[]> spiConfigCommands    = new ArrayList<>(); // Rule 209
+    private final List<String[]> commandInterpreters  = new ArrayList<>(); // Rule 210
+    private final List<String[]> packerFamilies       = new ArrayList<>(); // Rule 211
+    private final List<String[]> privateDepthScopes   = new ArrayList<>(); // Rule 212
+    private final List<String[]> packedFieldAliases   = new ArrayList<>(); // Rule 214
+    // ===== v17 counters + rosters (Rules 217-225, G138-G140 retrospective) =====
+    private int memcpyShapedLoopCount=0, idleSpinYieldCount=0;
+    private final List<String[]> memcpyShapedLoops  = new ArrayList<>(); // Rule 222
+    private final List<String[]> idleSpinYieldSites = new ArrayList<>(); // Rule 222
+    // Rule 217-219: extracted + analyzed VU microcode programs.
+    private final List<VuProgram> vuMicrocodePrograms = new ArrayList<>();
+    // Rule 220: runner-vs-canon lower-opcode map check [idxHex, canon, runnerToken, status].
+    private final List<String[]> vuOpcodeMapCheck = new ArrayList<>();
+    private int vuOpcodeMapMismatchCount = 0;
+    // Rule 220: census opcode names (len>=3) absent from the runner VU source.
+    private final List<String> vuOpcodeCoverageGap = new ArrayList<>();
+    // Rule 221: [env, file, line, classification, pcLiterals, staleSuspect]
+    private final List<String[]> runtimeLeverRegistry = new ArrayList<>();
+    private int staleBandaidSuspectCount = 0;
+    // Rule 224: GIFtag-shaped data records grouped by value.
+    private final List<GiftagTemplate> giftagTemplates = new ArrayList<>();
+    // ===== v17.1 counters + rosters (Rules 226-232, PCSX2 cross-check 2) =====
+    private int dmaMfifoUserCount=0, dmaStallControlCount=0, vifPathArbCount=0;
+    private int gsReadbackSiteCount=0, prmodeAttrWriterCount=0, texaClampWriterCount=0;
+    private int eeTimeSourceCount=0;
+    private final List<String[]> dmaMfifoUsers        = new ArrayList<>(); // Rule 226
+    private final List<String[]> dmaStallControlSync  = new ArrayList<>(); // Rule 227
+    private final List<String[]> vifPathArbitration   = new ArrayList<>(); // Rule 228
+    private final List<String[]> gsReadbackSites      = new ArrayList<>(); // Rule 229
+    private final List<String[]> prmodeAttrWriters    = new ArrayList<>(); // Rule 230
+    private final List<String[]> texaClampWriters     = new ArrayList<>(); // Rule 231
+    private final List<String[]> eeTimeSources        = new ArrayList<>(); // Rule 232
+    // Rule 153/220/221: runtime checkout root actually used for the roster scrape.
+    private File runtimeRootDir = null;
+
+    /** Rule 217-219: one extracted VU microcode program + its static hazard scan. */
+    static class VuProgram {
+        long elfAddr;              // payload start of first chunk
+        int  vuDestQw;             // first chunk's MPG imm (64-bit units)
+        int  sizePairs;            // total instruction pairs across chunks
+        int  chunkCount;
+        String uploaderFunc = "";  // best-effort Rule 51/68 const-load link
+        Map<String,Integer> census = new LinkedHashMap<>();
+        // flag consumers: MAC/STATUS + CLIP producer->consumer distances.
+        int flagConsumers=0, flagConsumersUnder4=0, flagConsumersExactly4=0;
+        Map<Integer,Integer> flagDistHistogram = new LinkedHashMap<>(); // dist(cap 9+)->count
+        List<String[]> flagUnder4Examples = new ArrayList<>();  // [pcHex, op, dist]
+        // same-pair upper->lower VF hazards (the G139 class).
+        List<String[]> samePairHazards = new ArrayList<>();     // [pcHex, upper, lower, vf]
+        int samePairHazardCount=0;
+        // Q/P latency events (the G87 class).
+        int qProducers=0, qConsumers=0, qMinGap=Integer.MAX_VALUE, waitqCount=0;
+        int pProducers=0, pConsumers=0, pMinGap=Integer.MAX_VALUE, waitpCount=0;
+        // Rule 219: dispatch/coverage.
+        List<Long> xgkickPcs = new ArrayList<>();
+        List<Long> balSubroutines = new ArrayList<>();          // BAL targets (byte pcs)
+        List<Long> dispatcherBranchPcs = new ArrayList<>();     // branches with pc < 0x800
+        int branchTargetCount=0, jrIndirectCount=0, clipwCount=0, fcgetCount=0;
+        int reachablePairs=0;
+        List<long[]> unreachedSpans = new ArrayList<>();        // [startPc, endPc] byte pcs
+    }
+
+    /** Rule 224: one distinct GIFtag-shaped 16-byte record found in data. */
+    static class GiftagTemplate {
+        long w0, w1, w2, w3;
+        int count=0;
+        List<Long> exampleAddrs = new ArrayList<>();
+        int nloop, eop, pre, prim, flg, nreg;
+        String primClass;
+    }
     // v11.3: run mode. false => FIRST run (full pipeline: generate functions.csv
     // + base config + assembly/decompiled/flowchart + unified TOML + JSON).
     // true => INCREMENTAL (emit the new JSON, and MODIFY the existing live
@@ -3234,7 +3705,12 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // known DC2 working-tree location first so the common case needs no
         // dialog; fall back to askDirectory (Cancel to skip).
         try {
-            File dc2Runtime = new File("D:\\ps2r\\PS2Recomp\\ps2xRuntime");
+            // v17 Rule 223: the runtime lives at D:\ps2r\dc2\PS2Recomp\ps2xRuntime
+            // in the current working layout; the old D:\ps2r\PS2Recomp path kept
+            // as a fallback for older checkouts.
+            File dc2Runtime = new File("D:\\ps2r\\dc2\\PS2Recomp\\ps2xRuntime");
+            if (!dc2Runtime.isDirectory())
+                dc2Runtime = new File("D:\\ps2r\\PS2Recomp\\ps2xRuntime");
             if (dc2Runtime.isDirectory()) {
                 println("[RUNTIME-ROSTER] Using known DC2 runtime checkout: "
                         + dc2Runtime.getAbsolutePath());
@@ -3511,7 +3987,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                                        || traits.isPrimClassSelector
                                        || traits.isAdcKickVertexSource
                                        || traits.isViewProjectionMatrixWriter
-                                       || traits.isObjectArrayCtor;
+                                       || traits.isObjectArrayCtor
+                                       // v16 Rules 207/208/211: vertex-emit packers (ADC
+                                       // capability), perspective-divide near-plane sites, and
+                                       // the copy/transform/trifan packer family are all render
+                                       // path - a nop-stub kills the title cavern (G116-G137).
+                                       || traits.isAdcCapablePacker
+                                       || traits.isNearPlaneSite
+                                       || traits.isPackerFamily;
 
                 // --- Disposition decision ---
                 // v11 (ported from General v13 SF3-benchmark corrections - all
@@ -4412,6 +4895,18 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             // v15 Rules 190-198: ADC/PRIM-class packer, allocator-family coherence,
             // frame-pacing, view-matrix, object-array ctor, VU-exec hazard manifest.
             applyV15Rules(results);
+            // v16 Rules 207-216: packer ADC-capability, near-plane source, SPI/command
+            // dispatch, packer families, private depth scope, packed fog/ADC alias.
+            applyV16Rules(results);
+            // v17 Rules 217-225 (G138-G140 retrospective + G141 perf support):
+            // static VU-microcode extraction + hazard scan (the analysis layer that
+            // would have front-loaded G87/G138/G139/G140), GIFtag template scan,
+            // runtime lever registry, canon-vs-runner VU opcode diff, perf ranking.
+            applyV17Rules(results);
+            scanVuMicrocodePrograms(results);
+            scanGiftagTemplates();
+            scanRuntimeLeverRegistry();
+            checkVuOpcodeConformance();
             println(String.format("  v9 post: GIF_INLINE=%d BITBLTBUF_MACRO=%d CHCR_KICK=%d DMA_SRC_CHAIN=%d MMIO_RECOVERED=%d SYSCALL_TR=%d SYNC_WAIT=%d INF_SPIN=%d INF_FAIL=%d IRX=%d REBOOT=%d RENDER_ENTRY=%d STRUCT_INIT=%d DISPATCH_TGT=%d TABLE_CALL=%d HOST_WAIT=%d DC2_KNOWN=%d DISC_SIDS=%d FPT_TABLES=%d MODULES=%d PREFIXES=%d",
                 gifTagInlineBuilderCount, bitbltbufMacroSeqCount, dmaChcrStartKickCount,
                 dmaSourceChainBuilderCount, compositeMmioRecoveryCount, syscallTrampolineCount,
@@ -5296,6 +5791,9 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // NEVER descends into runner/ or build dirs (30k generated files).
     // =========================================================
     private void loadRuntimeHandlerRoster(File root) {
+        // v17 Rules 220/221 reuse the same checkout for the VU-opcode
+        // conformance diff and the env-lever registry scrape.
+        runtimeRootDir = root;
         // Prefer src/ when present - handlers live in src/lib per the
         // PS2Recomp layout; fall back to the given dir.
         File start = new File(root, "src");
@@ -6256,6 +6754,16 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(ml.equalsIgnoreCase("syscall")) traits.hasSyscall=true;
             if(ml.equals("di")||ml.equals("ei")||ml.equals("mfc0")||ml.equals("mtc0")||
                ml.equals("eret")||ml.startsWith("c0")) traits.hasCOP0=true;
+            // v17.1 Rule 232: mfc0 of COP0 reg 9 (Count) - the EE cycle counter as a
+            // game time source (PCSX2 COP0.cpp UpdateCP0Count). Operand-name match
+            // covers both "Count" symbolic and raw-index disassembly variants.
+            if(ml.equals("mfc0") && !traits.readsCop0Count) {
+                try {
+                    String rep = inst.getDefaultOperandRepresentation(1);
+                    if(rep != null && (rep.toLowerCase().contains("count") || rep.trim().equals("9")))
+                        traits.readsCop0Count = true;
+                } catch(Exception ignore) {}
+            }
 
             // [FIX v4] Folded from referencesIopModule: detect IOP module strings inline.
             // Only check if not already found and function is small enough (-800 bytes).
@@ -7018,6 +7526,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         detectVifUnpackState(func, traits);
         // v15.2 Rules 203/204: MMI SIMD ops + CFC2/CTC2 control-reg access (skill codegen classes).
         detectCodegenClasses(func, traits);
+        // v16 Rules 207/208: FTOI4 + fog-clamp shape (ADC capability) + perspective-divide near-plane.
+        detectV16Signals(func, fname, traits);
 
         cache.put(key,traits);
         return traits;
@@ -7175,6 +7685,22 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         java.util.Arrays.asList("mgPerspective", "mgLookAt", "mgSetView", "mgProjection",
             "mgSetCamera", "sceVu0CameraMatrix", "mgSetProjection", "mgFrustum"));
 
+    // v16 name rosters (G116-G137).
+    // Rule 209: SPI map-config command handlers + the stack-arg getters that mark a handler.
+    private static final String[] SPI_CONFIG_NAMES = {
+        "cfgWATER", "cfgMAP", "cfgOBJ", "cfgLIGHT", "cfgCAMERA", "cfg_", "spiSet", "spiCfg" };
+    private static final java.util.Set<String> SPI_STACK_GETTERS = new java.util.HashSet<>(
+        java.util.Arrays.asList("spiGetStackInt", "spiGetStackVector", "spiGetStackFloat",
+            "spiGetStackStr", "spiGetStackPtr"));
+    // Rule 210: data-driven interpreter anchors (CRunScript event VM, Rule 172).
+    private static final String[] CMD_INTERP_NAMES = {
+        "exe__10CRunScript", "resume__10CRunScript", "run__10CRunScript",
+        "Interpret", "ExecScript", "RunScript", "VmExec", "DispatchCmd", "ParseCmd" };
+    // Rule 211: VU packer family anchors (passthrough/copy vs transform vs trifan vs dispatcher).
+    private static final String[] PACKER_FAMILY_NAMES = {
+        "CreateRenderInfoPacket", "RenderInfoPacket", "PacketBuilder", "AddPacket",
+        "DrawDirect", "mgDrawDirect", "VuPacker" };
+
     // v15 Rule 190/191/196/197: per-function structural signals decoded over the
     // course of G83-G115. One light instruction pass for the per-vertex kick add
     // (0x800), the rest derived from already-collected traits + name rosters. Only
@@ -7246,6 +7772,69 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             && traits.hasBackwardBranch && (traits.readsEabiArgT0 || traits.callOps > 0);
         if(arrayCtorName || ctorLoopShape)
             traits.isObjectArrayCtor = true;
+    }
+
+    // v16 Rule 207/208: one instruction pass for the FTOI4 pack op, the EFU divide
+    // (DIV/RSQRT = perspective 1/W), and the fog-clamp shape (MUL/ADD feeding a MIN/MAX
+    // pair). These structural facts decide a packer's ADC capability (G132) and whether
+    // a near-plane site has the unsaturated float available pre-FTOI4 (G125-G129). Only
+    // the scan-time facts are set here; tags/rosters are derived in applyV16Rules.
+    private void detectV16Signals(Function func, String fname, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        int scanned = 0;
+        boolean sawMul = false, sawAdd = false, sawMinMax = false, sawDiv = false;
+        while(it.hasNext() && scanned < 4000) {
+            Instruction inst = it.next(); scanned++;
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String m = mn.toLowerCase();
+            // VU/COP2 macro ops Ghidra renders as vftoi4 / vdiv / vrsqrt / vmul / vadd / vmini/vmax,
+            // and the EE FPU forms cvt.w.s / div.s / mul.s / add.s. Match both.
+            if(m.contains("ftoi4") || m.equals("cvt.w.s") || m.contains("vftoi"))
+                traits.usesFtoi4 = true;
+            if(m.contains("vdiv") || m.contains("vrsqrt") || m.equals("div.s")
+               || m.equals("rsqrt.s") || m.contains("vsqrt"))
+                { sawDiv = true; }
+            if(m.contains("vmul") || m.equals("mul.s") || m.contains("vmadd")) sawMul = true;
+            if(m.contains("vadd") || m.equals("add.s") || m.contains("vmadd"))  sawAdd = true;
+            if(m.contains("vmini")|| m.contains("vmax") || m.contains("vclip")
+               || m.equals("min.s")|| m.equals("max.s")) sawMinMax = true;
+        }
+        // Fog-clamp shape (XYZF2 .w = clamp(a + b*w, lo, hi)): a multiply+add feeding a min/max
+        // clamp pair. The fog byte ceiling is <=255 so the ADC bit15 (>=2048) is never set (G132).
+        traits.hasFogClampShape = sawMul && sawAdd && sawMinMax;
+        // Perspective divide -> position: an EFU divide present alongside a multiply (1/W * pos).
+        traits.computesPerspectiveDivide = sawDiv && sawMul;
+
+        long a = func.getEntryPoint().getOffset() & 0xFFFFFFFFL;
+        // --- Rule 207 ADC capability (scan-time so the STUB firewall can honour it) ---
+        // writesXyz2Reg/writesXyz3Reg are set by the GS-reg scan that runs before this; the
+        // v15 detector above also consumes them, so they are reliable here.
+        boolean emitsVertex = traits.writesXyz2Reg || traits.writesXyz3Reg
+            || (traits.usesFtoi4 && (traits.gifTagInlineBuilder || traits.isAdcKickVertexSource));
+        if(emitsVertex) {
+            if(traits.hasFogClampShape && !traits.writesXyz3Reg) {
+                traits.adcCapability = "xyzf2_fog_no_adc";   traits.isAdcCapablePacker = false;
+            } else if(traits.writesXyz3Reg) {
+                traits.adcCapability = "xyz3_norestart";      traits.isAdcCapablePacker = false;
+            } else if(traits.writesXyz2Reg || traits.kickConstAddCount > 0) {
+                traits.adcCapability = "xyz2_adc_capable";    traits.isAdcCapablePacker = true;
+            } else {
+                traits.adcCapability = "unknown_packer";      traits.isAdcCapablePacker = false;
+            }
+        }
+        // --- Rule 208 near-plane source (scan-time) ---
+        if(traits.computesPerspectiveDivide && traits.usesFtoi4) {
+            traits.isNearPlaneSite = true;
+            traits.nearPlaneStrategy = (traits.writesXyz3Reg || "xyzf2_fog_no_adc".equals(traits.adcCapability))
+                ? "reject_q_le_0" : "clip_homog";
+        }
+        // --- Rule 211 packer family (scan-time; address + the prim-class selector flag) ---
+        if(a == 0x1b68L)        { traits.isPackerFamily = true; traits.packerFamily = "copy_passthrough"; }
+        else if(a == 0x1c50L)   { traits.isPackerFamily = true; traits.packerFamily = "trifan"; }
+        else if(a == 0x1dc0L || a == 0x1ff0L) { traits.isPackerFamily = true; traits.packerFamily = "transform"; }
+        else if(traits.isPrimClassSelector)   { traits.isPackerFamily = true; traits.packerFamily = "dispatcher"; }
+        else if(fname.contains("DrawDirect") || fname.contains("mgDrawDirect"))
+            { traits.isPackerFamily = true; traits.packerFamily = "copy_passthrough"; }
     }
 
     // v8 Rule 92: vtable install detector — looks for lui+addiu+sw $rN, 0($a0).
@@ -8151,6 +8740,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if(norm >= RCNT_RANGE_START && norm <= RCNT_RANGE_END) {
             traits.compositeMmioRangesHit.add("RCNT");
             traits.accessesRcnt = true;
+            // v17.1 Rule 232: exact timer reg split (PCSX2 Hw.h RCNTn_COUNT/MODE/
+            // TARGET/HOLD at +0x00/+0x10/+0x20/+0x30 per 0x800-stride timer).
+            long tOff = norm & 0x7FFL;
+            int timer = (int)((norm - RCNT_RANGE_START) >>> 11);
+            if(timer >= 0 && timer <= 3){
+                String rn = (tOff == 0x00) ? "COUNT" : (tOff == 0x10) ? "MODE"
+                          : (tOff == 0x20) ? "TARGET" : (tOff == 0x30) ? "HOLD" : null;
+                if(rn != null) traits.rcntRegsHit.add("T"+timer+"_"+rn);
+            }
         }
         if((norm >= VIF0_CTRL_START && norm <= VIF0_CTRL_END) ||
            (norm >= VIF1_CTRL_START && norm <= VIF1_CTRL_END)) {
@@ -8160,6 +8758,19 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         if(norm >= DMAC_GLOBAL_START && norm <= DMAC_GLOBAL_END) {
             traits.compositeMmioRangesHit.add("DMAC_GLOBAL");
             traits.accessesDmacGlobal = true;
+            // v17.1 Rules 226/227: exact DMAC-global reg split (PCSX2 Hw.h:
+            // CTRL 0x1000E000, STAT E010, PCR E020, SQWC E030, RBSR E040
+            // (MFIFO ring size), RBOR E050 (MFIFO ring base), STADR E060
+            // (stall-control address)).
+            switch((int)(norm & 0xF0L)){
+                case 0x00: traits.dmacGlobalRegsHit.add("CTRL");  break;
+                case 0x10: traits.dmacGlobalRegsHit.add("STAT");  break;
+                case 0x20: traits.dmacGlobalRegsHit.add("PCR");   break;
+                case 0x30: traits.dmacGlobalRegsHit.add("SQWC");  break;
+                case 0x40: traits.dmacGlobalRegsHit.add("RBSR");  break;
+                case 0x50: traits.dmacGlobalRegsHit.add("RBOR");  break;
+                case 0x60: traits.dmacGlobalRegsHit.add("STADR"); break;
+            }
         }
         if(norm == INTC_MASK_ADDR) {
             traits.compositeMmioRangesHit.add("INTC_MASK");
@@ -8431,6 +9042,16 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(adRegIdsStored.contains(0x14L) || adRegIdsStored.contains(0x15L)) traits.writesTex1Reg = true;
             // v15.1 Rule 200: XYOFFSET_1/2 (0x18/0x19) guard-band centre (G88).
             if(adRegIdsStored.contains(0x18L) || adRegIdsStored.contains(0x19L)) traits.writesXyoffsetReg = true;
+            // v17.1 Rule 230: PRMODECONT (0x1A) / PRMODE (0x1B) - attribute-source select.
+            if(adRegIdsStored.contains(0x1AL)) traits.writesPrmodecontReg = true;
+            if(adRegIdsStored.contains(0x1BL)) traits.writesPrmodeReg = true;
+            // v17.1 Rule 231: TEXA (0x3B) alpha expansion / CLAMP_1/2 (0x08/0x09) region wrap.
+            if(adRegIdsStored.contains(0x3BL)) traits.writesTexaReg = true;
+            if(adRegIdsStored.contains(0x08L) || adRegIdsStored.contains(0x09L)) traits.writesClampReg = true;
+            // v17.1 Rule 229: TRXDIR (0x53) writer - direction value (0 up / 1 down)
+            // is not statically proven here; the readback post-pass requires an
+            // additional BUSDIR / VIF-CTRL signal before flagging.
+            if(adRegIdsStored.contains(0x53L)) traits.storesTrxdirLocalToHost = true;
             for(Long v : adRegIdsStored) {
                 String nm = KNOWN_GS_REGS.get(v);
                 if(nm != null) traits.gsRegHits.add(nm);
@@ -9225,6 +9846,859 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         println(String.format(
             "  v15.2 (skill): MMI_CODEGEN=%d COP2_CONTROL_REG=%d UNFUNDED_TEX_PAGE=%d",
             mmiCodegenRiskCount, cop2ControlRegCount, unfundedTexturePages.size()));
+    }
+
+    // =========================================================
+    // v16: G116-G137 title-cavern retrospective + general PS2.
+    // Tags/counters/rosters only. The firewalled booleans (207/208/211) and the
+    // classification strings (adcCapability / nearPlaneStrategy / packerFamily)
+    // are set earlier in detectV16Signals (scan time), so forceRecompile honours
+    // them at disposition; this post-pass just surfaces them + derives the
+    // non-firewalled rules (209/210/212/214) from the collected traits.
+    // =========================================================
+    private void applyV16Rules(List<FuncResult> results) {
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+            long a = r.address & 0xFFFFFFFFL;
+
+            // --- Rule 207 VERTEX_KICK_FORMAT_ADC_CAPABILITY (classified in detectV16Signals) ---
+            if(t.adcCapability != null) {
+                if(!r.tags.contains("VERTEX_KICK_FORMAT_ADC_CAPABILITY")) {
+                    r.tags.add("VERTEX_KICK_FORMAT_ADC_CAPABILITY"); adcCapablePackerCount++;
+                }
+                adcCapablePackers.add(new String[]{ nm, hex(r.address), t.adcCapability });
+                // Rule 214 PACKED_FIELD_ALIAS_FOG_ADC: a fog-clamp packer's word3 IS the fog byte,
+                // not the ADC bit — flag the alias for the runtime GS decoder.
+                if(t.hasFogClampShape) {
+                    t.isPackedFieldAlias = true;
+                    if(!r.tags.contains("PACKED_FIELD_ALIAS_FOG_ADC")) {
+                        r.tags.add("PACKED_FIELD_ALIAS_FOG_ADC"); packedFieldAliasCount++;
+                    }
+                    packedFieldAliases.add(new String[]{ nm, hex(r.address),
+                        "word3=fog(XYZF2,FGE)_not_adc_bit111" });
+                }
+            }
+
+            // --- Rule 208 PERSPECTIVE_DIVIDE_NEAR_PLANE_SOURCE (classified in detectV16Signals) ---
+            if(t.isNearPlaneSite) {
+                if(!r.tags.contains("PERSPECTIVE_DIVIDE_NEAR_PLANE_SOURCE")) {
+                    r.tags.add("PERSPECTIVE_DIVIDE_NEAR_PLANE_SOURCE"); nearPlaneSiteCount++;
+                }
+                nearPlaneSites.add(new String[]{ nm, hex(r.address),
+                    "pre_ftoi4_w_available;" + t.nearPlaneStrategy });
+            }
+
+            // --- Rule 209 SPI_CONFIG_COMMAND_DISPATCH ---
+            boolean spiName = false;
+            for(String f : SPI_CONFIG_NAMES) if(nm.contains(f)) { spiName = true; break; }
+            boolean spiArgGetter = false;
+            for(String cn : t.calleeNames) if(SPI_STACK_GETTERS.contains(cn)) { spiArgGetter = true; break; }
+            if(a == 0x1648f0L /*cfgWATER_VERTEX*/ || a == 0x185d40L /*CreateWaterFrame*/
+               || spiName || spiArgGetter) {
+                t.isSpiConfigCommand = true;
+                if(!r.tags.contains("SPI_CONFIG_COMMAND_DISPATCH")) {
+                    r.tags.add("SPI_CONFIG_COMMAND_DISPATCH"); spiConfigCommandCount++;
+                }
+                spiConfigCommands.add(new String[]{ nm, hex(r.address),
+                    spiArgGetter ? "reads_spi_stack_args" : "cfg_handler" });
+            }
+
+            // --- Rule 210 DATA_DRIVEN_COMMAND_INTERPRETER (general PS2) ---
+            boolean interpName = false;
+            for(String f : CMD_INTERP_NAMES) if(nm.contains(f)) { interpName = true; break; }
+            // Structural: reads an id then dispatches through an ID-KEYED TABLE — a computed-jump
+            // switch table (Rule 146) or a discovered function-pointer table (Rule 128). Deliberately
+            // EXCLUDES generic vtable jalr $t9 (polymorphic dispatch is not command interpretation;
+            // including it made nearly every loop-with-virtual-call a false "interpreter").
+            boolean tableDispatch = !t.tableDispatchSites.isEmpty()
+                || !t.computedJumpTargets.isEmpty();
+            boolean interpShape = t.hasBackwardBranch && tableDispatch && t.loadOps > 0;
+            if(interpName || t.isSpiConfigCommand || interpShape) {
+                t.isCommandInterpreter = true;
+                t.interpreterDetail = interpName ? "named_vm"
+                    : t.isSpiConfigCommand ? "spi_config" : "id_keyed_table_dispatch";
+                if(!r.tags.contains("DATA_DRIVEN_COMMAND_INTERPRETER")) {
+                    r.tags.add("DATA_DRIVEN_COMMAND_INTERPRETER"); commandInterpreterCount++;
+                }
+                commandInterpreters.add(new String[]{ nm, hex(r.address), t.interpreterDetail });
+            }
+
+            // --- Rule 211 PASSTHROUGH_PACKER_RENDER_PATH (classified in detectV16Signals) ---
+            if(t.isPackerFamily) {
+                if(!r.tags.contains("PASSTHROUGH_PACKER_RENDER_PATH")) {
+                    r.tags.add("PASSTHROUGH_PACKER_RENDER_PATH"); packerFamilyCount++;
+                }
+                packerFamilies.add(new String[]{ nm, hex(r.address), t.packerFamily });
+            }
+
+            // --- Rule 212 PRIVATE_DEPTH_SCOPE ---
+            // An RTT/scene draw emitting many overlapping triangles but no ZBUF write in scope
+            // needs a private per-frame Z (G125 title cavern back-over-front overdraw).
+            boolean drawsMany = t.gifTagInlineBuilder || t.isAdcKickVertexSource
+                || (t.drawingChainDepth >= 0 && t.drawingChainDepth <= 6);
+            if(t.isRttTarget && drawsMany && !t.writesZbufReg) {
+                t.isPrivateDepthScope = true;
+                if(!r.tags.contains("PRIVATE_DEPTH_SCOPE")) {
+                    r.tags.add("PRIVATE_DEPTH_SCOPE"); privateDepthScopeCount++;
+                }
+                privateDepthScopes.add(new String[]{ nm, hex(r.address),
+                    "rtt_draw_no_zbuf_in_scope" });
+            }
+        }
+
+        println(String.format(
+            "  v16 (G116-G137): ADC_CAPABLE_PACKER=%d NEAR_PLANE_SITE=%d SPI_CFG_CMD=%d "
+          + "CMD_INTERP=%d PACKER_FAMILY=%d PRIVATE_Z=%d PACKED_ALIAS=%d",
+            adcCapablePackerCount, nearPlaneSiteCount, spiConfigCommandCount,
+            commandInterpreterCount, packerFamilyCount, privateDepthScopeCount,
+            packedFieldAliasCount));
+    }
+
+    // =========================================================
+    // v17 Rules 217-220: canonical VU instruction tables + decoder.
+    // Source of truth: PCSX2 VUops.cpp _vuTablesMess (read directly from
+    // D:\ps2r\pcsx2-master\pcsx2\VUops.cpp, 2026-07-06). NEVER derive these
+    // from the runner - the G138 shared-bug hazard (g117_vudis.py copied the
+    // runner's swapped table and printed FMAND as "FMEQ" for 70 phases).
+    // Encoding: 64-bit pair = lower word at +0, upper word at +4.
+    //   upper: op = code&0x3F; 0x3C-0x3F -> FD tables[(code>>6)&0x1F].
+    //   lower: idx = code>>>25 into the 128-table; idx 0x40 -> special
+    //          op = code&0x3F; 0x3C-0x3F -> T3 tables[(code>>6)&0x1F].
+    //   upper bit31 = I (lower word is a 32-bit float immediate),
+    //   bit30 = E (end after next pair).
+    // =========================================================
+    private static final String[]   VU_LOWER_MAIN    = new String[128];
+    private static final String[]   VU_LOWER_SPECIAL = new String[64];
+    private static final String[][] VU_LOWER_T3      = new String[4][32];
+    private static final String[]   VU_UPPER_MAIN    = new String[64];
+    private static final String[][] VU_UPPER_FD      = new String[4][32];
+    // Rule 220: the disputed main-table region emitted as `vu_lower_opcode_canon`.
+    private static final Map<Integer,String> VU_LOWER_CANON_MAP = new LinkedHashMap<>();
+    private static final Set<String> VU_EFU_OPS = new HashSet<>(Arrays.asList(
+        "ESADD","ERSADD","ELENG","ERLENG","EATANxy","EATANxz","EATAN","ESUM",
+        "ERCPR","ESQRT","ERSQRT","ESIN","EEXP"));
+    private static final Set<String> VU_BRANCH_OPS = new HashSet<>(Arrays.asList(
+        "B","BAL","IBEQ","IBNE","IBLTZ","IBGTZ","IBLEZ","IBGEZ"));
+    private static final String[] GIF_PRIM_CLASS = {
+        "point","line","linestrip","triangle","tristrip","trifan","sprite","reserved"};
+    static {
+        String[] lm = VU_LOWER_MAIN;
+        lm[0x00]="LQ"; lm[0x01]="SQ"; lm[0x04]="ILW"; lm[0x05]="ISW";
+        lm[0x08]="IADDIU"; lm[0x09]="ISUBIU";
+        lm[0x10]="FCEQ"; lm[0x11]="FCSET"; lm[0x12]="FCAND"; lm[0x13]="FCOR";
+        lm[0x14]="FSEQ"; lm[0x15]="FSSET"; lm[0x16]="FSAND"; lm[0x17]="FSOR";
+        lm[0x18]="FMEQ"; lm[0x1A]="FMAND"; lm[0x1B]="FMOR"; lm[0x1C]="FCGET";
+        lm[0x20]="B"; lm[0x21]="BAL"; lm[0x24]="JR"; lm[0x25]="JALR";
+        lm[0x28]="IBEQ"; lm[0x29]="IBNE";
+        lm[0x2C]="IBLTZ"; lm[0x2D]="IBGTZ"; lm[0x2E]="IBLEZ"; lm[0x2F]="IBGEZ";
+        String[] ls = VU_LOWER_SPECIAL;
+        ls[0x30]="IADD"; ls[0x31]="ISUB"; ls[0x32]="IADDI";
+        ls[0x34]="IAND"; ls[0x35]="IOR";
+        String[][] t3 = VU_LOWER_T3;
+        t3[0][0x0C]="MOVE";  t3[0][0x0D]="LQI";  t3[0][0x0E]="DIV";   t3[0][0x0F]="MTIR";
+        t3[0][0x10]="RNEXT"; t3[0][0x19]="MFP";  t3[0][0x1A]="XTOP";  t3[0][0x1B]="XGKICK";
+        t3[0][0x1C]="ESADD"; t3[0][0x1D]="EATANxy"; t3[0][0x1E]="ESQRT"; t3[0][0x1F]="ESIN";
+        t3[1][0x0C]="MR32";  t3[1][0x0D]="SQI";  t3[1][0x0E]="SQRT";  t3[1][0x0F]="MFIR";
+        t3[1][0x10]="RGET";  t3[1][0x1A]="XITOP";
+        t3[1][0x1C]="ERSADD"; t3[1][0x1D]="EATANxz"; t3[1][0x1E]="ERSQRT"; t3[1][0x1F]="EATAN";
+        t3[2][0x0D]="LQD";   t3[2][0x0E]="RSQRT"; t3[2][0x0F]="ILWR"; t3[2][0x10]="RINIT";
+        t3[2][0x1C]="ELENG"; t3[2][0x1D]="ESUM";  t3[2][0x1E]="ERCPR"; t3[2][0x1F]="EEXP";
+        t3[3][0x0D]="SQD";   t3[3][0x0E]="WAITQ"; t3[3][0x0F]="ISWR"; t3[3][0x10]="RXOR";
+        t3[3][0x1C]="ERLENG"; t3[3][0x1E]="WAITP";
+        String[] um = VU_UPPER_MAIN;
+        String[] lanes = {"x","y","z","w"};
+        String[] fams  = {"ADD","SUB","MADD","MSUB","MAX","MINI","MUL"};
+        for(int fi=0; fi<7; fi++) for(int li=0; li<4; li++) um[fi*4+li] = fams[fi]+lanes[li];
+        um[0x1C]="MULq"; um[0x1D]="MAXi"; um[0x1E]="MULi"; um[0x1F]="MINIi";
+        um[0x20]="ADDq"; um[0x21]="MADDq"; um[0x22]="ADDi"; um[0x23]="MADDi";
+        um[0x24]="SUBq"; um[0x25]="MSUBq"; um[0x26]="SUBi"; um[0x27]="MSUBi";
+        um[0x28]="ADD";  um[0x29]="MADD";  um[0x2A]="MUL";  um[0x2B]="MAX";
+        um[0x2C]="SUB";  um[0x2D]="MSUB";  um[0x2E]="OPMSUB"; um[0x2F]="MINI";
+        String[][] fd = VU_UPPER_FD;
+        for(int t=0; t<4; t++){
+            fd[t][0]="ADDA"+lanes[t];  fd[t][1]="SUBA"+lanes[t];
+            fd[t][2]="MADDA"+lanes[t]; fd[t][3]="MSUBA"+lanes[t];
+            fd[t][6]="MULA"+lanes[t];
+        }
+        fd[0][4]="ITOF0";  fd[0][5]="FTOI0";  fd[0][7]="MULAq"; fd[0][8]="ADDAq";  fd[0][9]="SUBAq";  fd[0][10]="ADDA";  fd[0][11]="SUBA";
+        fd[1][4]="ITOF4";  fd[1][5]="FTOI4";  fd[1][7]="ABS";   fd[1][8]="MADDAq"; fd[1][9]="MSUBAq"; fd[1][10]="MADDA"; fd[1][11]="MSUBA";
+        fd[2][4]="ITOF12"; fd[2][5]="FTOI12"; fd[2][7]="MULAi"; fd[2][8]="ADDAi";  fd[2][9]="SUBAi";  fd[2][10]="MULA";  fd[2][11]="OPMULA";
+        fd[3][4]="ITOF15"; fd[3][5]="FTOI15"; fd[3][7]="CLIP";  fd[3][8]="MADDAi"; fd[3][9]="MSUBAi"; fd[3][11]="NOP";
+        for(int i=0; i<0x30; i++) if(lm[i] != null) VU_LOWER_CANON_MAP.put(i, lm[i]);
+    }
+
+    private static String vuDecodeUpper(int code){
+        int op = code & 0x3F;
+        if(op >= 0x3C) return VU_UPPER_FD[op-0x3C][(code>>>6)&0x1F];
+        return VU_UPPER_MAIN[op];
+    }
+    private static String vuDecodeLower(int code){
+        int top = code >>> 25;
+        if(top == 0x40){
+            int op = code & 0x3F;
+            if(op >= 0x3C) return VU_LOWER_T3[op-0x3C][(code>>>6)&0x1F];
+            return VU_LOWER_SPECIAL[op];
+        }
+        return top < 128 ? VU_LOWER_MAIN[top] : null;
+    }
+    /** VF register the upper op writes (fd for ALU, ft for ITOF/FTOI/ABS), or -1 for
+     *  ACC/CLIP/NOP writers. VF00 (hardwired) treated as no hazard by callers. */
+    private static int vuUpperDestVf(int code, String name){
+        if(name == null || name.equals("NOP") || name.equals("CLIP")) return -1;
+        if(name.startsWith("ITOF") || name.startsWith("FTOI") || name.equals("ABS"))
+            return (code>>>16)&0x1F;
+        if(name.matches("(ADD|SUB|MADD|MSUB|MUL|OPMUL)A.*")) return -1; // ACC writers
+        return (code>>>6)&0x1F;
+    }
+    /** Primary VF a lower op READS (the G139 hazard side): fs for stores/DIV/MTIR/
+     *  MOVE/MR32/EFU, ft for SQRT. -1 when the op reads no VF. */
+    private static int vuLowerReadVfPrimary(int code, String name){
+        if(name == null) return -1;
+        switch(name){
+            case "SQ": case "SQI": case "SQD": case "MTIR": case "MOVE": case "MR32":
+            case "DIV": case "RSQRT":
+                return (code>>>11)&0x1F;
+            case "SQRT":
+                return (code>>>16)&0x1F;
+            default:
+                return VU_EFU_OPS.contains(name) ? (code>>>11)&0x1F : -1;
+        }
+    }
+    private static int vuLowerReadVfSecondary(int code, String name){
+        if("DIV".equals(name) || "RSQRT".equals(name)) return (code>>>16)&0x1F;
+        return -1;
+    }
+    /** Branch displacement: signed 11-bit pair offset relative to the NEXT pair. */
+    private static int vuBranchTargetPair(int idx, int code){
+        int imm = code & 0x7FF;
+        if(imm >= 0x400) imm -= 0x800;
+        return idx + 1 + imm;
+    }
+    private static int leWord(byte[] d, int off){
+        return (d[off]&0xFF) | ((d[off+1]&0xFF)<<8) | ((d[off+2]&0xFF)<<16) | ((d[off+3]&0xFF)<<24);
+    }
+
+    /** Rule 217 payload gate: >=80% decodable pairs, >=50% non-zero, >=6 distinct
+     *  upper opcodes (kills zero-fill and repetitive-data false positives - every
+     *  32-bit value lands in SOME table slot, so emptiness alone is not enough). */
+    private static boolean vuPayloadPlausible(byte[] d, int off, int pairs){
+        int valid=0, nonZero=0;
+        Set<String> distinctUpper = new HashSet<>();
+        for(int i=0; i<pairs; i++){
+            int lo = leWord(d, off+i*8), hi = leWord(d, off+i*8+4);
+            if(lo!=0 || hi!=0) nonZero++;
+            String un = vuDecodeUpper(hi);
+            if(un == null) continue;
+            distinctUpper.add(un);
+            if((hi & 0x80000000)!=0) { valid++; continue; }  // I bit: lower = float imm
+            if(vuDecodeLower(lo) != null) valid++;
+        }
+        return valid >= pairs*4/5 && nonZero >= pairs/2 && distinctUpper.size() >= 6;
+    }
+
+    // =========================================================
+    // v17 Rules 217-219: VU microcode extraction + static hazard scan.
+    // The analysis layer that would have front-loaded G87 (Q latency),
+    // G138 (opcode table + MAC pipeline), G139 (same-pair VF hazard) and
+    // G140 (clipper never disassembled) - ~70 phases of runtime archaeology
+    // over facts the ELF data bytes already encode.
+    // =========================================================
+    private void scanVuMicrocodePrograms(List<FuncResult> results) {
+        try {
+            // [payloadAddr, imm, pairs, headerAddr]
+            List<long[]> candidates = new ArrayList<>();
+            for(MemoryBlock block : memory.getBlocks()){
+                if(!block.isInitialized() || block.isExecute()) continue;
+                long bsize = block.getSize();
+                if(bsize < 64 || bsize > 64L*1024*1024) continue;
+                byte[] data = new byte[(int)bsize];
+                try { block.getBytes(block.getStart(), data); } catch(Exception e){ continue; }
+                long base = block.getStart().getOffset();
+                for(int off=0; off+8<=data.length && candidates.size()<256; off+=4){
+                    int w = leWord(data, off);
+                    if(((w>>>24)&0x7F) != 0x4A) continue;         // VIF MPG (irq bit masked)
+                    int num = (w>>>16)&0xFF;
+                    int pairs = (num==0) ? 256 : num;
+                    if(pairs < 16) continue;                      // noise gate
+                    int imm = w & 0xFFFF;
+                    int p = off+4;
+                    // MPG data is 64-bit aligned in the VIF stream; a single NOP pad allowed.
+                    if(((base+p)&7) != 0){
+                        if(p+4 > data.length || leWord(data,p) != 0) continue;
+                        p += 4;
+                    }
+                    if(p + pairs*8 > data.length) continue;
+                    if(!vuPayloadPlausible(data, p, pairs)) continue;
+                    candidates.add(new long[]{ base+p, imm, pairs, base+off });
+                }
+            }
+            candidates.sort((a,b)->Long.compare(a[0],b[0]));
+            // Rule 217: group consecutive chunks (adjacent payload + continuing imm)
+            // into whole programs - DC2's 16KB title program uploads as num=0 (256-pair)
+            // chunks with increasing imm.
+            int ci=0;
+            while(ci < candidates.size() && vuMicrocodePrograms.size() < 32){
+                long[] first = candidates.get(ci);
+                List<long[]> chunks = new ArrayList<>(); chunks.add(first);
+                long expectAddr = first[0] + first[2]*8;
+                long expectImm  = first[1] + first[2];
+                int cj = ci+1;
+                while(cj < candidates.size()){
+                    long[] nx = candidates.get(cj);
+                    if(nx[3] >= expectAddr && nx[3] <= expectAddr+16 && nx[1] == expectImm){
+                        chunks.add(nx);
+                        expectAddr = nx[0] + nx[2]*8;
+                        expectImm  = nx[1] + nx[2];
+                        cj++;
+                    } else break;
+                }
+                ci = cj;
+                int total=0; for(long[] c : chunks) total += (int)c[2];
+                int[] loArr = new int[total], hiArr = new int[total];
+                int k=0; boolean ok=true;
+                for(long[] c : chunks){
+                    try {
+                        byte[] buf = new byte[(int)c[2]*8];
+                        memory.getBytes(toAddr(c[0]), buf);
+                        for(int i=0; i<(int)c[2]; i++){
+                            loArr[k]=leWord(buf,i*8); hiArr[k]=leWord(buf,i*8+4); k++;
+                        }
+                    } catch(Exception e){ ok=false; break; }
+                }
+                if(!ok) continue;
+                VuProgram p = analyzeVuProgram(chunks.get(0)[0], (int)chunks.get(0)[1],
+                                               loArr, hiArr, chunks.size());
+                // Best-effort uploader link: a Rule 51/68 uploader (or mgSendVuProg)
+                // whose captured const loads hit the header/payload address.
+                long hdr = chunks.get(0)[3], pay = chunks.get(0)[0];
+                outer:
+                for(FuncResult r : results){
+                    FuncTraits t = r.traits; if(t==null) continue;
+                    boolean uploaderShape = t.isMicrocodeUploader
+                        || t.vifOpcodesBuilt.contains("MPG")
+                        || (r.name != null && r.name.contains("SendVuProg"));
+                    if(!uploaderShape) continue;
+                    for(long[] cl : t.constLoads){
+                        long v = cl[1] & 0xFFFFFFFFL;
+                        if(Math.abs(v-hdr) <= 64 || Math.abs(v-pay) <= 64){
+                            p.uploaderFunc = r.name; break outer;
+                        }
+                    }
+                }
+                vuMicrocodePrograms.add(p);
+            }
+            int spTot=0, u4Tot=0;
+            for(VuProgram p : vuMicrocodePrograms){ spTot+=p.samePairHazardCount; u4Tot+=p.flagConsumersUnder4; }
+            println(String.format(
+                "  v17 Rules 217-219: %d MPG candidates -> %d VU programs; "
+              + "same-pair hazards=%d, flag consumers <4 pairs=%d.",
+                candidates.size(), vuMicrocodePrograms.size(), spTot, u4Tot));
+        } catch(Exception ex) {
+            println("  v17 Rules 217-219: VU microcode scan skipped: " + ex.getMessage());
+        }
+    }
+
+    /** Rules 218/219: full static pass over one extracted program. */
+    private VuProgram analyzeVuProgram(long elfAddr, int vuDestQw,
+                                       int[] loArr, int[] hiArr, int chunkCount){
+        VuProgram p = new VuProgram();
+        p.elfAddr = elfAddr; p.vuDestQw = vuDestQw;
+        p.sizePairs = loArr.length; p.chunkCount = chunkCount;
+        int n = loArr.length;
+        int lastMacProducer = -1000, lastClipProducer = -1000;
+        int lastQProducer = -1000, lastPProducer = -1000;
+        for(int i=0; i<n; i++){
+            int hi = hiArr[i], lo = loArr[i];
+            String un = vuDecodeUpper(hi);
+            boolean iBit = (hi & 0x80000000) != 0;
+            String ln = iBit ? null : vuDecodeLower(lo);
+            long pc = i*8L;
+            if(un != null) p.census.merge(un, 1, Integer::sum);
+            if(ln != null) p.census.merge(ln, 1, Integer::sum);
+            // ---- lower side first: flag consumers see producers from EARLIER pairs only ----
+            if(ln != null){
+                boolean macCons = ln.equals("FMEQ")||ln.equals("FMAND")||ln.equals("FMOR")
+                               || ln.equals("FSEQ")||ln.equals("FSAND")||ln.equals("FSOR");
+                boolean clipCons = ln.equals("FCEQ")||ln.equals("FCAND")||ln.equals("FCOR")
+                               || ln.equals("FCGET");
+                if(macCons || clipCons){
+                    int dist = i - (macCons ? lastMacProducer : lastClipProducer);
+                    if(dist < 0 || dist > 900) dist = 9;
+                    p.flagConsumers++;
+                    p.flagDistHistogram.merge(Math.min(dist,9), 1, Integer::sum);
+                    if(dist == 4) p.flagConsumersExactly4++;
+                    if(dist < 4){
+                        p.flagConsumersUnder4++;
+                        if(p.flagUnder4Examples.size() < 40)
+                            p.flagUnder4Examples.add(new String[]{
+                                "0x"+Long.toHexString(pc), ln, String.valueOf(dist)});
+                    }
+                }
+                if(ln.equals("FCGET")) p.fcgetCount++;
+                if(ln.equals("XGKICK") && p.xgkickPcs.size() < 64) p.xgkickPcs.add(pc);
+                if(ln.equals("WAITQ")){ p.waitqCount++; lastQProducer = -1000; }
+                if(ln.equals("WAITP")){ p.waitpCount++; lastPProducer = -1000; }
+                if(ln.equals("DIV")||ln.equals("SQRT")||ln.equals("RSQRT")){
+                    p.qProducers++; lastQProducer = i;
+                }
+                if(VU_EFU_OPS.contains(ln)){ p.pProducers++; lastPProducer = i; }
+                if(ln.equals("MFP")){
+                    p.pConsumers++;
+                    int g = i - lastPProducer;
+                    if(g > 0 && g < p.pMinGap) p.pMinGap = g;
+                }
+                if(ln.equals("JR")||ln.equals("JALR")) p.jrIndirectCount++;
+                if(ln.equals("BAL")){
+                    int t = vuBranchTargetPair(i, lo);
+                    long tpc = t*8L;
+                    if(t>=0 && t<n && p.balSubroutines.size()<32 && !p.balSubroutines.contains(tpc))
+                        p.balSubroutines.add(tpc);
+                }
+                if(VU_BRANCH_OPS.contains(ln)){
+                    p.branchTargetCount++;
+                    if(pc < 0x800 && p.dispatcherBranchPcs.size() < 48)
+                        p.dispatcherBranchPcs.add(pc);
+                }
+            }
+            // ---- upper side: same-pair hazard, Q consumers, then producer updates ----
+            if(un != null){
+                if(un.endsWith("q")){
+                    p.qConsumers++;
+                    int g = i - lastQProducer;
+                    if(g > 0 && g < p.qMinGap) p.qMinGap = g;
+                }
+                int destVf = vuUpperDestVf(hi, un);
+                if(destVf > 0 && ln != null){
+                    int r1 = vuLowerReadVfPrimary(lo, ln);
+                    int r2 = vuLowerReadVfSecondary(lo, ln);
+                    if(r1 == destVf || r2 == destVf){
+                        p.samePairHazardCount++;
+                        if(p.samePairHazards.size() < 40)
+                            p.samePairHazards.add(new String[]{
+                                "0x"+Long.toHexString(pc), un, ln,
+                                "VF"+String.format("%02d", destVf)});
+                    }
+                }
+                if(un.equals("CLIP")){ p.clipwCount++; lastClipProducer = i; }
+                else if(!un.equals("NOP") && !un.startsWith("MAX") && !un.startsWith("MINI"))
+                    lastMacProducer = i;   // MAX/MINI do not update MAC flags on real VU
+            }
+        }
+        // ---- Rule 219: reachability from entry 0 + every static branch target ----
+        boolean[] reached = new boolean[n];
+        Deque<Integer> pending = new ArrayDeque<>();
+        pending.add(0);
+        for(int i=0; i<n; i++){
+            if((hiArr[i] & 0x80000000) != 0) continue;
+            String ln = vuDecodeLower(loArr[i]);
+            if(ln != null && VU_BRANCH_OPS.contains(ln)){
+                int t = vuBranchTargetPair(i, loArr[i]);
+                if(t>=0 && t<n) pending.add(t);
+            }
+        }
+        while(!pending.isEmpty()){
+            int i = pending.poll();
+            while(i >= 0 && i < n && !reached[i]){
+                reached[i] = true;
+                int hi = hiArr[i];
+                boolean iBit = (hi & 0x80000000) != 0;
+                String ln = iBit ? null : vuDecodeLower(loArr[i]);
+                if(ln != null && (ln.equals("B") || ln.equals("JR"))){
+                    if(i+1 < n) reached[i+1] = true;   // delay slot
+                    break;
+                }
+                if((hi & 0x40000000) != 0){            // E bit: end after next pair
+                    if(i+1 < n) reached[i+1] = true;
+                    break;
+                }
+                i++;
+            }
+        }
+        int rp=0; for(boolean b : reached) if(b) rp++;
+        p.reachablePairs = rp;
+        int i2=0;
+        while(i2 < n && p.unreachedSpans.size() < 8){
+            if(!reached[i2]){
+                int s=i2;
+                while(i2 < n && !reached[i2]) i2++;
+                if(i2-s >= 4) p.unreachedSpans.add(new long[]{ s*8L, (i2-1)*8L+8 });
+            } else i2++;
+        }
+        return p;
+    }
+
+    // =========================================================
+    // v17 Rule 224: GIFtag-shaped records in initialized data.
+    // Structural filter: GIFtag word0 bits16-31 and word1 bits0-13 are
+    // architecturally ZERO; nreg>=1; PACKED REGS nibbles never 0xB (reserved).
+    // nloop==0 = TEMPLATE (VIF-delivered, VU-patched - the G140 trifan
+    // template shape: exactly two 302ec000 nloop=0 hits in 32MB of RAM).
+    // =========================================================
+    private void scanGiftagTemplates() {
+        try {
+            Map<String,GiftagTemplate> byValue = new LinkedHashMap<>();
+            for(MemoryBlock block : memory.getBlocks()){
+                if(!block.isInitialized() || block.isExecute()) continue;
+                long bsize = block.getSize();
+                if(bsize < 32 || bsize > 64L*1024*1024) continue;
+                byte[] data = new byte[(int)bsize];
+                try { block.getBytes(block.getStart(), data); } catch(Exception e){ continue; }
+                long base = block.getStart().getOffset();
+                for(int off=0; off+16<=data.length; off+=4){
+                    int w0 = leWord(data,off), w1 = leWord(data,off+4);
+                    if((w0>>>16) != 0) continue;
+                    if(w0 == 0 && w1 == 0) continue;
+                    if((w1 & 0x3FFF) != 0) continue;
+                    int nreg = (w1>>>28)&0xF; if(nreg == 0) continue;
+                    int flg = (w1>>>26)&3; if(flg == 3) continue;   // disabled/IMAGE2
+                    int nloop = w0 & 0x7FFF; if(nloop > 0x2000) continue;
+                    int w2 = leWord(data,off+8), w3 = leWord(data,off+12);
+                    if(flg == 0){
+                        long regs = ((long)w3 << 32) | (w2 & 0xFFFFFFFFL);
+                        boolean bad = false;
+                        for(int ri=0; ri<nreg; ri++)
+                            if(((regs >>> (ri*4)) & 0xF) == 0xB){ bad=true; break; }
+                        if(bad) continue;
+                        if(w2 == 0 && w3 == 0 && nreg > 1) continue; // all-PRIM run = noise
+                    }
+                    String key = String.format("%08x%08x%08x%08x", w3, w2, w1, w0);
+                    GiftagTemplate g = byValue.get(key);
+                    if(g == null){
+                        if(byValue.size() >= 512) continue;
+                        g = new GiftagTemplate();
+                        g.w0=w0&0xFFFFFFFFL; g.w1=w1&0xFFFFFFFFL;
+                        g.w2=w2&0xFFFFFFFFL; g.w3=w3&0xFFFFFFFFL;
+                        g.nloop=nloop; g.eop=(w0>>>15)&1; g.pre=(w1>>>14)&1;
+                        g.prim=(w1>>>15)&0x7FF; g.flg=flg; g.nreg=nreg;
+                        g.primClass = GIF_PRIM_CLASS[g.prim & 7];
+                        byValue.put(key, g);
+                    }
+                    g.count++;
+                    if(g.exampleAddrs.size() < 4) g.exampleAddrs.add(base+off);
+                }
+            }
+            List<GiftagTemplate> kept = new ArrayList<>();
+            for(GiftagTemplate g : byValue.values())
+                if(g.nloop == 0 || g.count >= 2) kept.add(g);
+            kept.sort((a,b)->Integer.compare(b.count, a.count));
+            if(kept.size() > 128) kept = new ArrayList<>(kept.subList(0,128));
+            giftagTemplates.addAll(kept);
+            int templates=0; for(GiftagTemplate g : kept) if(g.nloop==0) templates++;
+            println(String.format(
+                "  v17 Rule 224: %d distinct GIFtag-shaped patterns kept (%d nloop=0 templates).",
+                kept.size(), templates));
+        } catch(Exception ex) {
+            println("  v17 Rule 224: giftag template scan skipped: " + ex.getMessage());
+        }
+    }
+
+    // =========================================================
+    // v17 Rule 221: runtime env-lever registry + stale-band-aid suspects.
+    // The G64 class: a default-ON pc-scoped interpreter patch outliving the
+    // root fix that superseded it (it force-broke the VU clipper for 70
+    // phases). Every getenv lever is inventoried; VU-pc-shaped hex literals
+    // near a semantic lever in a VU/GS source = STALE_BANDAID_SUSPECT.
+    // =========================================================
+    private void scanRuntimeLeverRegistry() {
+        if(runtimeRootDir == null){
+            println("  v17 Rule 221: no runtime checkout - lever registry skipped.");
+            return;
+        }
+        File start = new File(runtimeRootDir, "src");
+        if(!start.isDirectory()) start = runtimeRootDir;
+        java.util.regex.Pattern pEnv = java.util.regex.Pattern.compile(
+            "getenv\\s*\\(\\s*\"([A-Za-z0-9_]+)\"");
+        java.util.regex.Pattern pPc = java.util.regex.Pattern.compile(
+            "0x[0-9a-fA-F]{3,4}\\b");
+        Set<String> emitted = new HashSet<>();
+        Deque<File> stack = new ArrayDeque<>();
+        stack.push(start);
+        int filesScanned = 0;
+        while(!stack.isEmpty() && filesScanned < 800 && runtimeLeverRegistry.size() < 400){
+            File f = stack.pop();
+            String nl = f.getName().toLowerCase();
+            if(f.isDirectory()){
+                if(nl.equals("runner") || nl.startsWith("build")
+                   || nl.equals(".git") || nl.equals("out")) continue;
+                File[] kids = f.listFiles();
+                if(kids != null) for(File kf : kids) stack.push(kf);
+                continue;
+            }
+            if(!(nl.endsWith(".cpp")||nl.endsWith(".h")||nl.endsWith(".hpp")||nl.endsWith(".cc"))) continue;
+            filesScanned++;
+            try {
+                List<String> lines = new ArrayList<>();
+                BufferedReader br = utf8Reader(f);
+                String ln;
+                while((ln = br.readLine()) != null) lines.add(ln);
+                br.close();
+                boolean vuOrGsFile = nl.contains("vu") || nl.contains("rasterizer")
+                                  || nl.contains("gs") || nl.contains("gif");
+                for(int i=0; i<lines.size() && runtimeLeverRegistry.size() < 400; i++){
+                    java.util.regex.Matcher m = pEnv.matcher(lines.get(i));
+                    while(m.find()){
+                        String env = m.group(1);
+                        if(!emitted.add(env + "|" + f.getName())) continue;
+                        String up = env.toUpperCase();
+                        String cls;
+                        if(up.contains("TRACE")||up.contains("DUMP")||up.contains("LOG")
+                           ||up.contains("CENSUS")||up.contains("PROBE"))
+                            cls = "diagnostic";
+                        else if(up.contains("_NO_"))  cls = "kill_switch_of_default_on_fix";
+                        else if(up.contains("FORCE")) cls = "reenable_of_retired_bandaid";
+                        else                          cls = "semantic_lever";
+                        StringBuilder pcs = new StringBuilder();
+                        if(vuOrGsFile){
+                            int lo = Math.max(0, i-3), hi2 = Math.min(lines.size()-1, i+15);
+                            Set<String> found = new LinkedHashSet<>();
+                            for(int j=lo; j<=hi2 && found.size()<6; j++){
+                                java.util.regex.Matcher pm = pPc.matcher(lines.get(j));
+                                while(pm.find() && found.size()<6) found.add(pm.group());
+                            }
+                            pcs.append(String.join("|", found));
+                        }
+                        boolean stale = cls.equals("semantic_lever") && pcs.length() > 0;
+                        if(stale) staleBandaidSuspectCount++;
+                        runtimeLeverRegistry.add(new String[]{
+                            env, f.getName(), String.valueOf(i+1), cls,
+                            pcs.toString(), stale ? "true" : "false"});
+                    }
+                }
+            } catch(Exception ignored) {}
+        }
+        println(String.format(
+            "  v17 Rule 221: %d env levers from %d files; %d stale-band-aid suspects.",
+            runtimeLeverRegistry.size(), filesScanned, staleBandaidSuspectCount));
+    }
+
+    // =========================================================
+    // v17 Rule 220: canon-vs-runner lower-opcode conformance (best-effort).
+    // Would have printed "0x1a: runner token FMEQ, canon FMAND" at map time
+    // (the G138 root). Advisory: case labels are matched textually, so an
+    // unrelated switch can produce a false pairing - MISMATCH? entries are
+    // leads to verify against PCSX2 _LOWER_OPCODE, not verdicts.
+    // =========================================================
+    private void checkVuOpcodeConformance() {
+        File vuSrc = null;
+        if(runtimeRootDir != null){
+            File direct = new File(runtimeRootDir, "src" + File.separator + "lib"
+                + File.separator + "ps2_vu1.cpp");
+            if(direct.isFile()) vuSrc = direct;
+            else {
+                Deque<File> stack = new ArrayDeque<>();
+                stack.push(runtimeRootDir);
+                int seen = 0;
+                while(!stack.isEmpty() && seen < 2000 && vuSrc == null){
+                    File f = stack.pop(); seen++;
+                    String nl = f.getName().toLowerCase();
+                    if(f.isDirectory()){
+                        if(nl.equals("runner")||nl.startsWith("build")||nl.equals(".git")||nl.equals("out")) continue;
+                        File[] kids = f.listFiles();
+                        if(kids != null) for(File kf : kids) stack.push(kf);
+                    } else if(nl.equals("ps2_vu1.cpp")) vuSrc = f;
+                }
+            }
+        }
+        if(vuSrc == null){
+            println("  v17 Rule 220: ps2_vu1.cpp not found - conformance diff skipped.");
+            return;
+        }
+        try {
+            String src = readFileFully(vuSrc);
+            java.util.regex.Pattern pCase = java.util.regex.Pattern.compile(
+                "case\\s+0x([0-9a-fA-F]{1,2})\\s*:");
+            java.util.regex.Pattern pTok = java.util.regex.Pattern.compile(
+                "\\b(FMEQ|FMAND|FMOR|FCGET|FCEQ|FCSET|FCAND|FCOR|FSEQ|FSSET|FSAND|FSOR|"
+              + "IADDIU|ISUBIU|IBLTZ|IBGTZ|IBLEZ|IBGEZ|IBEQ|IBNE|JALR|BAL|ILW|ISW)\\b",
+                java.util.regex.Pattern.CASE_INSENSITIVE);
+            java.util.regex.Matcher cm = pCase.matcher(src);
+            Set<String> seenPair = new HashSet<>();
+            while(cm.find() && vuOpcodeMapCheck.size() < 64){
+                int idx;
+                try { idx = Integer.parseInt(cm.group(1), 16); } catch(Exception e){ continue; }
+                String canon = VU_LOWER_CANON_MAP.get(idx);
+                if(canon == null) continue;
+                int end = Math.min(src.length(), cm.end()+400);
+                java.util.regex.Matcher tm = pTok.matcher(src.substring(cm.end(), end));
+                if(!tm.find()) continue;
+                String tok = tm.group(1).toUpperCase();
+                if(!seenPair.add(idx + "|" + tok)) continue;
+                String status = tok.equals(canon) ? "match" : "MISMATCH?";
+                if(!tok.equals(canon)) vuOpcodeMapMismatchCount++;
+                vuOpcodeMapCheck.add(new String[]{
+                    String.format("0x%02x", idx), canon, tok, status});
+            }
+            // Coverage gap: census opcodes (len>=3, avoids trivial B/LQ/SQ hits)
+            // with no textual presence anywhere in the runner's VU source.
+            Set<String> used = new TreeSet<>();
+            for(VuProgram p : vuMicrocodePrograms) used.addAll(p.census.keySet());
+            for(String name : used){
+                if(name.length() < 3) continue;
+                if(vuOpcodeCoverageGap.size() >= 32) break;
+                java.util.regex.Pattern pw = java.util.regex.Pattern.compile(
+                    "\\b" + java.util.regex.Pattern.quote(name) + "\\b",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+                if(!pw.matcher(src).find()) vuOpcodeCoverageGap.add(name);
+            }
+            println(String.format(
+                "  v17 Rule 220: %d case-label pairings checked, %d mismatch leads, "
+              + "%d census opcodes absent from %s.",
+                vuOpcodeMapCheck.size(), vuOpcodeMapMismatchCount,
+                vuOpcodeCoverageGap.size(), vuSrc.getName()));
+        } catch(Exception ex) {
+            println("  v17 Rule 220: conformance diff skipped: " + ex.getMessage());
+        }
+    }
+
+    // =========================================================
+    // v17 Rule 222: perf static cost + fast-path sub-detectors (G141 support).
+    // Static cannot measure FPS; it ranks WHERE the measure-first phase
+    // starts (skill 17-performance-optimization doctrine).
+    // =========================================================
+    private void applyV17Rules(List<FuncResult> results) {
+        for(FuncResult r : results){
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+            // perf cost model: instruction count, inner loops, COP2 density,
+            // IO-dispatch overhead, fan-out; weighted by mainloop depth.
+            long instr = Math.max(1, t.byteSize/4);
+            long cost = instr;
+            if(t.hasBackwardBranch) cost += instr;
+            if(t.usesCop2)          cost += instr/2;
+            if(t.accessesMMIO)      cost += 64;
+            cost += (long)t.calleeCount * 8;
+            int d = t.mainLoopDepth;
+            if(d >= 0 && d <= 2)      cost *= 4;
+            else if(d >= 3 && d <= 4) cost *= 2;
+            else if(d < 0)            cost /= 2;
+            t.perfStaticCost = cost;
+            // MEMCPY_SHAPED_LOOP: tight wide-copy loop -> host memcpy candidate.
+            int wideMemOps = 0;
+            for(String[] lr : t.literalRefs){
+                String mn = lr[1];
+                if("lq".equals(mn)||"sq".equals(mn)||"ld".equals(mn)||"sd".equals(mn)) wideMemOps++;
+            }
+            boolean copyName = nm.contains("memcpy")||nm.contains("memset")
+                || nm.contains("memmove")||nm.contains("bcopy")||nm.contains("bzero");
+            if(copyName || (t.hasBackwardBranch && t.calleeCount == 0 && t.byteSize <= 200
+                            && wideMemOps >= 2 && t.loadOps > 0 && t.storeOps > 0
+                            && !t.accessesMMIO)){
+                t.isMemcpyShapedLoop = true;
+                if(!r.tags.contains("MEMCPY_SHAPED_LOOP")){
+                    r.tags.add("MEMCPY_SHAPED_LOOP"); memcpyShapedLoopCount++;
+                }
+                memcpyShapedLoops.add(new String[]{ nm, hex(r.address),
+                    (copyName ? "named_copy" : "tight_wide_copy_loop") + ";wide_ops=" + wideMemOps });
+            }
+            // IDLE_SPIN_YIELD_SITE: store-free poll spin -> host-yield candidate.
+            if((t.isInfiniteSpinLoop || t.isSyncWaitLoop || (t.hasBusyWait && t.hasBackwardBranch))
+               && t.storeOps == 0 && t.calleeCount <= 1 && !t.isMemcpyShapedLoop){
+                t.isIdleSpinYieldSite = true;
+                if(!r.tags.contains("IDLE_SPIN_YIELD_SITE")){
+                    r.tags.add("IDLE_SPIN_YIELD_SITE"); idleSpinYieldCount++;
+                }
+                idleSpinYieldSites.add(new String[]{ nm, hex(r.address),
+                    "mainloop_depth=" + t.mainLoopDepth + ";kind="
+                    + (t.isInfiniteSpinLoop ? "infinite_spin"
+                       : t.isSyncWaitLoop ? "sync_wait" : "busy_wait") });
+            }
+            // ===== v17.1 Rules 226-232 (PCSX2 cross-check round 2) =====
+            // Rule 226 DMA_MFIFO_RING_CONFIG: MFIFO ring base/size writers.
+            if(t.dmacGlobalRegsHit.contains("RBOR") || t.dmacGlobalRegsHit.contains("RBSR")){
+                t.isDmaMfifoUser = true;
+                if(!r.tags.contains("DMA_MFIFO_RING_CONFIG")){
+                    r.tags.add("DMA_MFIFO_RING_CONFIG"); dmaMfifoUserCount++;
+                }
+                dmaMfifoUsers.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.dmacGlobalRegsHit) });
+            }
+            // Rule 227 DMA_STALL_CONTROL_SYNC: STADR writer or REFS tag builder.
+            boolean refsTag = t.dmaTagIdsBuilt.contains("REFS") || t.storedDmaTagIds.contains("REFS");
+            if(t.dmacGlobalRegsHit.contains("STADR") || refsTag){
+                t.isDmaStallControlSync = true;
+                if(!r.tags.contains("DMA_STALL_CONTROL_SYNC")){
+                    r.tags.add("DMA_STALL_CONTROL_SYNC"); dmaStallControlCount++;
+                }
+                dmaStallControlSync.add(new String[]{ nm, hex(r.address),
+                    t.dmacGlobalRegsHit.contains("STADR")
+                        ? "stadr_writer" + (refsTag ? "+refs_tag" : "") : "refs_tag_builder" });
+            }
+            // Rule 228 VIF_PATH_ARBITRATION: MSKPATH3/FLUSH*/MARK codes or GIF MODE toucher.
+            for(String code : new String[]{"MSKPATH3","FLUSH","FLUSHA","FLUSHE","MARK"})
+                if(t.vifOpcodesBuilt.contains(code) || t.storedVifOpcodes.contains(code))
+                    t.vifPathArbCodes.add(code);
+            boolean gifModeTouch = t.compositeMmioRangesHit.contains("GIF_P3_CTRL")
+                                || t.touchesGifP3Reg;
+            if(!t.vifPathArbCodes.isEmpty() || (gifModeTouch && !t.vifOpcodesBuilt.isEmpty())){
+                t.isVifPathArbiter = true;
+                if(!r.tags.contains("VIF_PATH_ARBITRATION")){
+                    r.tags.add("VIF_PATH_ARBITRATION"); vifPathArbCount++;
+                }
+                vifPathArbitration.add(new String[]{ nm, hex(r.address),
+                    t.vifPathArbCodes.isEmpty() ? "gif_mode_m3r_imt"
+                        : String.join("|", t.vifPathArbCodes) });
+            }
+            // Rule 229 GS_DOWNLOAD_READBACK_PATH: BUSDIR, or TRXDIR writer + VIF-reverse context.
+            if(t.compositeMmioRangesHit.contains("GS_PRIV_BUSDIR"))
+                t.gsReadbackSignals.add("BUSDIR");
+            if(t.storesTrxdirLocalToHost && (t.accessesVifCtrl || t.writesVif1Fifo))
+                t.gsReadbackSignals.add("TRXDIR+VIF1_REVERSE_CONTEXT");
+            if(!t.gsReadbackSignals.isEmpty()){
+                t.isGsReadbackSite = true;
+                if(!r.tags.contains("GS_DOWNLOAD_READBACK_PATH")){
+                    r.tags.add("GS_DOWNLOAD_READBACK_PATH"); gsReadbackSiteCount++;
+                }
+                gsReadbackSites.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.gsReadbackSignals) });
+            }
+            // Rule 230 GS_PRMODE_ATTRIBUTE_SOURCE.
+            if(t.writesPrmodecontReg || t.writesPrmodeReg){
+                if(!r.tags.contains("GS_PRMODE_ATTRIBUTE_SOURCE")){
+                    r.tags.add("GS_PRMODE_ATTRIBUTE_SOURCE"); prmodeAttrWriterCount++;
+                }
+                prmodeAttrWriters.add(new String[]{ nm, hex(r.address),
+                    (t.writesPrmodecontReg ? "PRMODECONT" : "")
+                    + (t.writesPrmodecontReg && t.writesPrmodeReg ? "+" : "")
+                    + (t.writesPrmodeReg ? "PRMODE" : "") });
+            }
+            // Rule 231 GS_TEXA_CLAMP_CONTRACT.
+            if(t.writesTexaReg || t.writesClampReg){
+                if(!r.tags.contains("GS_TEXA_CLAMP_CONTRACT")){
+                    r.tags.add("GS_TEXA_CLAMP_CONTRACT"); texaClampWriterCount++;
+                }
+                texaClampWriters.add(new String[]{ nm, hex(r.address),
+                    (t.writesTexaReg ? "TEXA_alpha_expansion" : "")
+                    + (t.writesTexaReg && t.writesClampReg ? "+" : "")
+                    + (t.writesClampReg ? "CLAMP_region_wrap" : "") });
+            }
+            // Rule 232 EE_TIME_SOURCE_ROSTER: timer COUNT/MODE consumers + COP0 Count readers.
+            boolean timerHit = false;
+            for(String rn : t.rcntRegsHit)
+                if(rn.endsWith("_COUNT") || rn.endsWith("_MODE")) { timerHit = true; break; }
+            if(timerHit || t.readsCop0Count){
+                t.isEeTimeSource = true;
+                if(!r.tags.contains("EE_TIME_SOURCE")){
+                    r.tags.add("EE_TIME_SOURCE"); eeTimeSourceCount++;
+                }
+                StringBuilder det = new StringBuilder();
+                if(!t.rcntRegsHit.isEmpty()) det.append(String.join("|", t.rcntRegsHit));
+                if(t.readsCop0Count){
+                    if(det.length() > 0) det.append("|");
+                    det.append("COP0_COUNT");
+                }
+                det.append(";mainloop_depth=").append(t.mainLoopDepth);
+                eeTimeSources.add(new String[]{ nm, hex(r.address), det.toString() });
+            }
+        }
+        println(String.format(
+            "  v17 Rule 222: MEMCPY_LOOP=%d IDLE_SPIN_YIELD=%d (perf ranking in perf_cost_ranking).",
+            memcpyShapedLoopCount, idleSpinYieldCount));
+        println(String.format(
+            "  v17.1 (PCSX2 x2): MFIFO=%d STALL_CTRL=%d PATH_ARB=%d READBACK=%d "
+          + "PRMODE=%d TEXA_CLAMP=%d TIME_SOURCE=%d",
+            dmaMfifoUserCount, dmaStallControlCount, vifPathArbCount, gsReadbackSiteCount,
+            prmodeAttrWriterCount, texaClampWriterCount, eeTimeSourceCount));
     }
 
     // v15 Rule 194: fuzzy allocator-family membership for demangled/underscore variants
@@ -10061,7 +11535,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(r.name != null && !r.name.isEmpty()) nameToAddr.putIfAbsent(r.name, r.address & 0xFFFFFFFFL);
         }
         String exportTs  = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date());
-        String exportVer = "DC2 enricher v15.2 (schema 14.2)";
+        String exportVer = "DC2 enricher v17.1 (schema 16.1)";
         int n = 0;
         for(FuncResult r : results) {
             if(monitor.isCancelled()) break;
@@ -10076,7 +11550,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     +"** · origin `"+r.origin+"`");
                 w.println();
                 // --- Export metadata (stale-export protection) ---
-                w.println("> schema_version `14.2` · elf_hash `"+elfHash+"` · global_pointer `"+hex(gpValue)
+                w.println("> schema_version `16.1` · elf_hash `"+elfHash+"` · global_pointer `"+hex(gpValue)
                     +"` · exported `"+exportTs+"` · enricher `"+exportVer+"`");
                 w.println(">");
                 w.println("> _If elf_hash / global_pointer differ from the current ELF, this doc is stale — re-run the enricher._");
@@ -10171,6 +11645,14 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     // v15.2 (skill codegen classes)
                     sig(s,t.usesMmi,"MMI_SIMD_OP ("+t.mmiOpCount+" ops — verify recompiler lane/pack codegen)");
                     sig(s,t.usesCop2ControlReg,"COP2_CONTROL_REG_ACCESS (CFC2/CTC2 — verify control-reg map)");
+                    // v16 (G116-G137 title-cavern retrospective)
+                    sig(s,t.isAdcCapablePacker||t.adcCapability!=null,"VERTEX_KICK_FORMAT_ADC_CAPABILITY ("+(t.adcCapability==null?"":t.adcCapability)+", G132)");
+                    sig(s,t.isNearPlaneSite,"PERSPECTIVE_DIVIDE_NEAR_PLANE_SOURCE ("+(t.nearPlaneStrategy==null?"":t.nearPlaneStrategy)+", G125-G129)");
+                    sig(s,t.isSpiConfigCommand,"SPI_CONFIG_COMMAND_DISPATCH (cfgXXX map-config, G129/G130)");
+                    sig(s,t.isCommandInterpreter,"DATA_DRIVEN_COMMAND_INTERPRETER ("+(t.interpreterDetail==null?"":t.interpreterDetail)+")");
+                    sig(s,t.isPackerFamily,"PASSTHROUGH_PACKER_RENDER_PATH ("+(t.packerFamily==null?"":t.packerFamily)+", G130)");
+                    sig(s,t.isPrivateDepthScope,"PRIVATE_DEPTH_SCOPE (needs private per-frame Z, G125)");
+                    sig(s,t.isPackedFieldAlias,"PACKED_FIELD_ALIAS_FOG_ADC (word3 fog vs ADC bit111, G132)");
                     sigList(s,new ArrayList<>(t.mmiFamilies),"MMI families");
                     sigList(s,new ArrayList<>(t.cop2ControlRegs),"COP2 control regs");
                     sigList(s,t.guardGlobals,"guard globals");
@@ -10465,8 +11947,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
         PrintWriter w=utf8Writer(outFile);
         w.println("{");
-        w.println("  \"schema_version\": 14.2,");
-        w.println("  \"enricher_version\": \"DC2 enricher v15.2 (schema 14.2)\",");
+        w.println("  \"schema_version\": 16.1,");
+        w.println("  \"enricher_version\": \"DC2 enricher v17.1 (schema 16.1)\",");
         w.println("  \"export_timestamp\": \""
             +new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date())+"\",");
         w.println("  \"elf_hash\": \""+elfHash+"\",");
@@ -10565,6 +12047,43 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"mmi_codegen_risk\": "+mmiCodegenRiskCount+",");
         w.println("    \"cop2_control_reg_access\": "+cop2ControlRegCount+",");
         w.println("    \"unfunded_texture_pages\": "+unfundedTexturePages.size()+",");
+        // v16 Rules 207-214 (G116-G137 title-cavern retrospective)
+        w.println("    \"adc_capable_packer\": "+adcCapablePackerCount+",");
+        w.println("    \"near_plane_site\": "+nearPlaneSiteCount+",");
+        w.println("    \"spi_config_command\": "+spiConfigCommandCount+",");
+        w.println("    \"command_interpreter\": "+commandInterpreterCount+",");
+        w.println("    \"packer_family\": "+packerFamilyCount+",");
+        w.println("    \"private_depth_scope\": "+privateDepthScopeCount+",");
+        w.println("    \"packed_field_alias\": "+packedFieldAliasCount+",");
+        // v17 Rules 217-225 (G138-G140 VU1-interpreter retrospective + G141 perf)
+        w.println("    \"vu_microcode_programs\": "+vuMicrocodePrograms.size()+",");
+        {
+            int spTot=0, u4Tot=0, x4Tot=0;
+            for(VuProgram vp : vuMicrocodePrograms){
+                spTot += vp.samePairHazardCount;
+                u4Tot += vp.flagConsumersUnder4;
+                x4Tot += vp.flagConsumersExactly4;
+            }
+            w.println("    \"vu_same_pair_hazards\": "+spTot+",");
+            w.println("    \"vu_flag_consumers_under4\": "+u4Tot+",");
+            w.println("    \"vu_flag_consumers_exactly4\": "+x4Tot+",");
+        }
+        w.println("    \"vu_opcode_map_mismatch_leads\": "+vuOpcodeMapMismatchCount+",");
+        w.println("    \"vu_opcode_coverage_gap\": "+vuOpcodeCoverageGap.size()+",");
+        w.println("    \"giftag_template_patterns\": "+giftagTemplates.size()+",");
+        w.println("    \"runtime_levers\": "+runtimeLeverRegistry.size()+",");
+        w.println("    \"stale_bandaid_suspects\": "+staleBandaidSuspectCount+",");
+        w.println("    \"memcpy_shaped_loop\": "+memcpyShapedLoopCount+",");
+        w.println("    \"idle_spin_yield_site\": "+idleSpinYieldCount+",");
+        // v17.1 Rules 226-232 (PCSX2 cross-check round 2). dma_mfifo_users==0 and
+        // gs_readback_sites==0 are FINDINGS for DC2 (flat DMA, READFIFO2 dead).
+        w.println("    \"dma_mfifo_users\": "+dmaMfifoUserCount+",");
+        w.println("    \"dma_stall_control_sync\": "+dmaStallControlCount+",");
+        w.println("    \"vif_path_arbitration\": "+vifPathArbCount+",");
+        w.println("    \"gs_readback_sites\": "+gsReadbackSiteCount+",");
+        w.println("    \"prmode_attr_writers\": "+prmodeAttrWriterCount+",");
+        w.println("    \"texa_clamp_writers\": "+texaClampWriterCount+",");
+        w.println("    \"ee_time_sources\": "+eeTimeSourceCount+",");
         w.println("    \"ctor_field_writer\": "+ctorFieldWriterCount+",");
         w.println("    \"vtable_setter\": "+vtableSetterCount+",");
         w.println("    \"a0_passthrough_returner\": "+a0PassthroughCount+",");
@@ -10974,6 +12493,198 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("    {\"name\": "+jsonString(e[0])+", \"address\": "+jsonString(e[1])
                 +", \"disposition\": "+jsonString(e[2])+"}");
             w.println(i<allocatorFamily.size()-1?",":"");
+        }
+        w.println("  ],");
+
+        // ===== v16 rosters (Rules 207-214, G116-G137 title-cavern retrospective) =====
+        // Rule 207 VERTEX_KICK_FORMAT_ADC_CAPABILITY (xyzf2_fog_no_adc vs xyz2_adc_capable, G132).
+        emitV13Roster(w, "adc_capable_packers", adcCapablePackers, "adc_capability");
+        // Rule 208 PERSPECTIVE_DIVIDE_NEAR_PLANE_SOURCE (pre-FTOI4 1/W available, G125-G129).
+        emitV13Roster(w, "near_plane_sites", nearPlaneSites, "strategy");
+        // Rule 209 SPI_CONFIG_COMMAND_DISPATCH (cfgXXX map-config command handlers, G129/G130).
+        emitV13Roster(w, "spi_config_commands", spiConfigCommands, "role");
+        // Rule 210 DATA_DRIVEN_COMMAND_INTERPRETER (script/config VMs, general PS2).
+        emitV13Roster(w, "command_interpreters", commandInterpreters, "kind");
+        // Rule 211 PASSTHROUGH_PACKER_RENDER_PATH (copy/transform/trifan/dispatcher, G130).
+        emitV13Roster(w, "packer_families", packerFamilies, "family");
+        // Rule 212 PRIVATE_DEPTH_SCOPE (RTT draw needing a private per-frame Z, G125).
+        emitV13Roster(w, "private_depth_scopes", privateDepthScopes, "detail");
+        // Rule 214 PACKED_FIELD_ALIAS_FOG_ADC (word3 fog vs ADC bit111, G132).
+        emitV13Roster(w, "packed_field_aliases", packedFieldAliases, "detail");
+
+        // ===== v17 sections (Rules 217-225, G138-G140 retrospective + G141 perf) =====
+        // Rule 222 fast-path rosters + static perf ranking (G141 ACTIVE blocker).
+        emitV13Roster(w, "memcpy_shaped_loops", memcpyShapedLoops, "detail");
+        emitV13Roster(w, "idle_spin_yield_sites", idleSpinYieldSites, "detail");
+        // ===== v17.1 rosters (Rules 226-232, PCSX2 cross-check round 2) =====
+        // Rule 226 DMA_MFIFO_RING_CONFIG (RBOR/RBSR MFIFO ring; 0 = flat-DMA finding).
+        emitV13Roster(w, "dma_mfifo_users", dmaMfifoUsers, "regs");
+        // Rule 227 DMA_STALL_CONTROL_SYNC (STADR / REFS read-after-write interlock).
+        emitV13Roster(w, "dma_stall_control_sync", dmaStallControlSync, "kind");
+        // Rule 228 VIF_PATH_ARBITRATION (MSKPATH3 / FLUSH family / GIF MODE M3R+IMT).
+        emitV13Roster(w, "vif_path_arbitration", vifPathArbitration, "codes");
+        // Rule 229 GS_DOWNLOAD_READBACK_PATH (BUSDIR / TRXDIR=down / VIF1 FDR; 0 = finding for DC2).
+        emitV13Roster(w, "gs_readback_sites", gsReadbackSites, "signals");
+        // Rule 230 GS_PRMODE_ATTRIBUTE_SOURCE (PRIM-vs-PRMODE attribute select).
+        emitV13Roster(w, "prmode_attr_writers", prmodeAttrWriters, "regs");
+        // Rule 231 GS_TEXA_CLAMP_CONTRACT (16/24-bit alpha expansion + atlas region wrap).
+        emitV13Roster(w, "texa_clamp_writers", texaClampWriters, "contract");
+        // Rule 232 EE_TIME_SOURCE_ROSTER (timer COUNT/MODE + COP0 Count readers - the
+        // G141 pacing checklist: verify the runtime's clock model at these functions first).
+        emitV13Roster(w, "ee_time_sources", eeTimeSources, "detail");
+        w.println("  \"perf_cost_ranking\": [");
+        {
+            List<FuncResult> pr = new ArrayList<>();
+            for(FuncResult r : results)
+                if(r.traits != null && r.traits.perfStaticCost > 0) pr.add(r);
+            pr.sort((a,b)->Long.compare(b.traits.perfStaticCost, a.traits.perfStaticCost));
+            int cap = Math.min(100, pr.size());
+            for(int i=0; i<cap; i++){
+                FuncResult r = pr.get(i);
+                w.print("    {\"address\": \""+hex(r.address)+"\", \"name\": "+jsonString(r.name)
+                    +", \"perf_static_cost\": "+r.traits.perfStaticCost
+                    +", \"mainloop_depth\": "+r.traits.mainLoopDepth
+                    +", \"callee_count\": "+r.traits.calleeCount
+                    +", \"has_inner_loop\": "+r.traits.hasBackwardBranch
+                    +", \"uses_cop2\": "+r.traits.usesCop2+"}");
+                w.println(i<cap-1?",":"");
+            }
+        }
+        w.println("  ],");
+
+        // Rules 217-219: extracted VU microcode programs + static hazard scan.
+        // needs_flag_pipeline: gates hand-scheduled at exactly 4 pairs (the G138
+        // MACPIPE depth). immediate_model_diverges: consumers closer than 4 pairs.
+        // same_pair_hazards: the G139 store-then-clobber class, per exact VU pc.
+        // coverage.unreached_spans: regions no branch targets and no fallthrough
+        // reaches (the G140 "clipper never disassembled" class).
+        w.println("  \"vu_microcode_programs\": [");
+        for(int i=0; i<vuMicrocodePrograms.size(); i++){
+            VuProgram p = vuMicrocodePrograms.get(i);
+            w.print("    {\"elf_addr\": \""+hex(p.elfAddr)+"\", \"vu_dest_qw\": "+p.vuDestQw
+                +", \"vu_dest_bytes\": \"0x"+Long.toHexString((long)p.vuDestQw*8L)+"\""
+                +", \"size_pairs\": "+p.sizePairs+", \"chunks\": "+p.chunkCount
+                +", \"uploader\": "+jsonString(p.uploaderFunc)+", ");
+            w.print("\"opcode_census\": {");
+            boolean f = true;
+            for(Map.Entry<String,Integer> e : p.census.entrySet()){
+                if(!f) w.print(", "); f=false;
+                w.print(jsonString(e.getKey())+": "+e.getValue());
+            }
+            w.print("}, ");
+            w.print("\"flag_consumers\": {\"total\": "+p.flagConsumers
+                +", \"exactly_4_pairs\": "+p.flagConsumersExactly4
+                +", \"under_4_pairs\": "+p.flagConsumersUnder4
+                +", \"needs_flag_pipeline\": "+(p.flagConsumersExactly4 > 0)
+                +", \"immediate_model_diverges\": "+(p.flagConsumersUnder4 > 0)
+                +", \"distance_histogram\": {");
+            f = true;
+            for(Map.Entry<Integer,Integer> e : new TreeMap<>(p.flagDistHistogram).entrySet()){
+                if(!f) w.print(", "); f=false;
+                w.print("\""+(e.getKey()>=9 ? "9+" : String.valueOf(e.getKey()))+"\": "+e.getValue());
+            }
+            w.print("}, \"under4_examples\": [");
+            f = true;
+            for(String[] ex : p.flagUnder4Examples){
+                if(!f) w.print(", "); f=false;
+                w.print("{\"pc\": \""+ex[0]+"\", \"op\": \""+ex[1]+"\", \"dist\": "+ex[2]+"}");
+            }
+            w.print("]}, ");
+            w.print("\"same_pair_hazards\": {\"count\": "+p.samePairHazardCount+", \"sites\": [");
+            f = true;
+            for(String[] ex : p.samePairHazards){
+                if(!f) w.print(", "); f=false;
+                w.print("{\"pc\": \""+ex[0]+"\", \"upper\": \""+ex[1]
+                    +"\", \"lower\": \""+ex[2]+"\", \"vf\": \""+ex[3]+"\"}");
+            }
+            w.print("]}, ");
+            w.print("\"q_pipeline\": {\"producers\": "+p.qProducers+", \"consumers\": "+p.qConsumers
+                +", \"min_gap_pairs\": "+(p.qMinGap==Integer.MAX_VALUE ? -1 : p.qMinGap)
+                +", \"waitq\": "+p.waitqCount+"}, ");
+            w.print("\"p_pipeline\": {\"producers\": "+p.pProducers+", \"consumers\": "+p.pConsumers
+                +", \"min_gap_pairs\": "+(p.pMinGap==Integer.MAX_VALUE ? -1 : p.pMinGap)
+                +", \"waitp\": "+p.waitpCount+"}, ");
+            w.print("\"clipper_shape\": {\"clipw\": "+p.clipwCount+", \"fcget\": "+p.fcgetCount
+                +", \"looks_like_polygon_clipper\": "+(p.clipwCount >= 3 && p.fcgetCount >= 1)+"}, ");
+            w.print("\"xgkick_pcs\": [");
+            f = true;
+            for(Long pc : p.xgkickPcs){ if(!f) w.print(", "); f=false; w.print("\"0x"+Long.toHexString(pc)+"\""); }
+            w.print("], \"bal_subroutines\": [");
+            f = true;
+            for(Long pc : p.balSubroutines){ if(!f) w.print(", "); f=false; w.print("\"0x"+Long.toHexString(pc)+"\""); }
+            w.print("], \"dispatcher_branch_pcs\": [");
+            f = true;
+            for(Long pc : p.dispatcherBranchPcs){ if(!f) w.print(", "); f=false; w.print("\"0x"+Long.toHexString(pc)+"\""); }
+            w.print("], \"branches\": "+p.branchTargetCount+", \"jr_indirect\": "+p.jrIndirectCount);
+            w.print(", \"coverage\": {\"reachable_pairs\": "+p.reachablePairs
+                +", \"total_pairs\": "+p.sizePairs+", \"unreached_spans\": [");
+            f = true;
+            for(long[] sp : p.unreachedSpans){
+                if(!f) w.print(", "); f=false;
+                w.print("{\"start\": \"0x"+Long.toHexString(sp[0])+"\", \"end\": \"0x"+Long.toHexString(sp[1])+"\"}");
+            }
+            w.print("]}}");
+            w.println(i<vuMicrocodePrograms.size()-1?",":"");
+        }
+        w.println("  ],");
+
+        // Rule 220: the authoritative lower-opcode map (PCSX2 _LOWER_OPCODE) +
+        // the best-effort runner conformance diff. MISMATCH? entries are leads,
+        // not verdicts (textual case-label pairing can cross switches).
+        w.println("  \"vu_lower_opcode_canon\": {");
+        {
+            boolean f = true;
+            for(Map.Entry<Integer,String> e : VU_LOWER_CANON_MAP.entrySet()){
+                if(!f) w.println(","); f = false;
+                w.print("    \""+String.format("0x%02x", e.getKey())+"\": "+jsonString(e.getValue()));
+            }
+        }
+        w.println("\n  },");
+        w.println("  \"vu_opcode_map_check\": [");
+        for(int i=0; i<vuOpcodeMapCheck.size(); i++){
+            String[] e = vuOpcodeMapCheck.get(i);
+            w.print("    {\"index\": \""+e[0]+"\", \"canonical\": "+jsonString(e[1])
+                +", \"runner_token\": "+jsonString(e[2])+", \"status\": "+jsonString(e[3])+"}");
+            w.println(i<vuOpcodeMapCheck.size()-1?",":"");
+        }
+        w.println("  ],");
+        w.println("  \"vu_opcode_coverage_gap\": "+jsonStrArray(vuOpcodeCoverageGap)+",");
+
+        // Rule 221: env-lever registry + the G138-G140 retired-band-aid roster.
+        w.println("  \"runtime_lever_registry\": [");
+        for(int i=0; i<runtimeLeverRegistry.size(); i++){
+            String[] e = runtimeLeverRegistry.get(i);
+            w.print("    {\"env\": "+jsonString(e[0])+", \"file\": "+jsonString(e[1])
+                +", \"line\": "+e[2]+", \"classification\": "+jsonString(e[3])
+                +", \"pc_literals\": "+jsonString(e[4])
+                +", \"stale_bandaid_suspect\": "+e[5]+"}");
+            w.println(i<runtimeLeverRegistry.size()-1?",":"");
+        }
+        w.println("  ],");
+        w.println("  \"runtime_bandaid_status\": [");
+        for(int i=0; i<DC2_RETIRED_BANDAIDS.length; i++){
+            String[] b = DC2_RETIRED_BANDAIDS[i];
+            w.print("    {\"env\": "+jsonString(b[0])+", \"phase\": "+jsonString(b[1])
+                +", \"default_state\": "+jsonString(b[2])+", \"note\": "+jsonString(b[3])+"}");
+            w.println(i<DC2_RETIRED_BANDAIDS.length-1?",":"");
+        }
+        w.println("  ],");
+
+        // Rule 224: GIFtag-shaped data records (nloop==0 = VIF-delivered template).
+        w.println("  \"giftag_templates\": [");
+        for(int i=0; i<giftagTemplates.size(); i++){
+            GiftagTemplate g = giftagTemplates.get(i);
+            w.print("    {\"w1_w0\": \""+String.format("%08x_%08x", g.w1, g.w0)
+                +"\", \"regs_w3_w2\": \""+String.format("%08x_%08x", g.w3, g.w2)
+                +"\", \"count\": "+g.count
+                +", \"nloop\": "+g.nloop+", \"eop\": "+g.eop+", \"pre\": "+g.pre
+                +", \"prim\": \"0x"+Long.toHexString(g.prim)+"\", \"prim_class\": \""+g.primClass
+                +"\", \"flg\": "+g.flg+", \"nreg\": "+g.nreg
+                +", \"is_template\": "+(g.nloop==0)+", \"example_addrs\": [");
+            boolean f = true;
+            for(Long a : g.exampleAddrs){ if(!f) w.print(", "); f=false; w.print("\""+hex(a)+"\""); }
+            w.print("]}");
+            w.println(i<giftagTemplates.size()-1?",":"");
         }
         w.println("  ],");
 
@@ -11831,6 +13542,31 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"mmi_families\": "+jsonStrArray(new ArrayList<>(t.mmiFamilies))+", ");
             w.print("\"uses_cop2_control_reg\": "+t.usesCop2ControlReg+", ");
             w.print("\"cop2_control_regs\": "+jsonStrArray(new ArrayList<>(t.cop2ControlRegs))+", ");
+            // ===== v16 fields (Rules 207-214, G116-G137) =====
+            w.print("\"is_adc_capable_packer\": "+t.isAdcCapablePacker+", ");
+            w.print("\"adc_capability\": "+jsonString(t.adcCapability==null?"":t.adcCapability)+", ");
+            w.print("\"is_near_plane_site\": "+t.isNearPlaneSite+", ");
+            w.print("\"near_plane_strategy\": "+jsonString(t.nearPlaneStrategy==null?"":t.nearPlaneStrategy)+", ");
+            w.print("\"is_spi_config_command\": "+t.isSpiConfigCommand+", ");
+            w.print("\"is_command_interpreter\": "+t.isCommandInterpreter+", ");
+            w.print("\"is_packer_family\": "+t.isPackerFamily+", ");
+            w.print("\"packer_family\": "+jsonString(t.packerFamily==null?"":t.packerFamily)+", ");
+            w.print("\"is_private_depth_scope\": "+t.isPrivateDepthScope+", ");
+            w.print("\"is_packed_field_alias\": "+t.isPackedFieldAlias+", ");
+            // v17 Rule 222 (G141 perf support)
+            w.print("\"perf_static_cost\": "+t.perfStaticCost+", ");
+            w.print("\"is_memcpy_shaped_loop\": "+t.isMemcpyShapedLoop+", ");
+            w.print("\"is_idle_spin_yield_site\": "+t.isIdleSpinYieldSite+", ");
+            // v17.1 Rules 226-232 (PCSX2 cross-check round 2)
+            w.print("\"is_dma_mfifo_user\": "+t.isDmaMfifoUser+", ");
+            w.print("\"is_dma_stall_control_sync\": "+t.isDmaStallControlSync+", ");
+            w.print("\"is_vif_path_arbiter\": "+t.isVifPathArbiter+", ");
+            w.print("\"is_gs_readback_site\": "+t.isGsReadbackSite+", ");
+            w.print("\"is_ee_time_source\": "+t.isEeTimeSource+", ");
+            if(!t.rcntRegsHit.isEmpty())
+                w.print("\"rcnt_regs_hit\": "+jsonStrArray(new ArrayList<>(t.rcntRegsHit))+", ");
+            if(!t.dmacGlobalRegsHit.isEmpty())
+                w.print("\"dmac_global_regs_hit\": "+jsonStrArray(new ArrayList<>(t.dmacGlobalRegsHit))+", ");
             w.print("\"computed_jump_sites\": [");
             {
                 Map<Long,List<Long>> byPc = new LinkedHashMap<>();
