@@ -1029,6 +1029,167 @@
 //
 // Rule 233 SCHEMA_VERSION: 16.1 (v17.1 adds Rules 226-233).
 //
+// ================================================================
+// v18 RULES (234-242) - DC2 G142-G172 PERFORMANCE-ARC retrospective + general PS2.
+// The whole prior rule set stops at G141 (Rule 222 marks it ACTIVE); everything the
+// recomp project learned across G142-G172 (the perf arc) is added here. Grounded in
+// plans/phase-G{142..172}-fix-log.md + ROADMAP.md + PS2_PROJECT_STATE.md.
+// ================================================================
+//
+// Rule 234 GS_PRIM_SPRITE_EMITTER + PRIMITIVE_CLASS_COST_PROFILE (per-func +
+//        top-level `prim_class_emitters`): THE G171 miss (cost ~16 phases, G144-G171).
+//        Inline SPRITE raster (GS_PRIM_SPRITE prim=6, abe=1, fbp=0x0, reached via the
+//        A+D packed-descriptor 0x0E write path to XYZF2/XYZ2) was ~76-79ms/frame - the
+//        DOMINANT title cost - yet INVISIBLE to G144's triangle-only tile-bin defer and
+//        every triangle-only perf probe, misattributed as GIF-parse cost for G155/G156.
+//        Detects sprite-draw name roster (drawSprite/DrawDivSprite4/PrimQuad/SetSpriteEnv/
+//        mgC3DSprite/DrawMesWin...) + a const-tracked PRIM-value census on real draw
+//        builders (PRIM class = bits[0:2]; require an attribute bit 0x78 = IIP/TME/ABE so
+//        bare A+D reg-ids 0x03..0x07 aren't mistaken for a PRIM value). Emits per-func
+//        prim_classes_emitted[] (triangle/tristrip/trifan/sprite). General PS2: sprite/HUD
+//        raster is the classic hidden cost; any deferred-raster lever must enumerate ALL
+//        prim classes, not just triangles. Advisory.
+//
+// Rule 235 SPRITE_GROUP_ORDER_DEPENDENCY (per-func + top-level `sprite_compound_widgets`):
+//        G172. Naively widening G144's defer to sprites regressed the costume prompt box to
+//        EMPTY - it is several sub-sprites (bg/border/text glyphs) that MUST draw as an
+//        unbroken GROUP (implicit ordering/atomicity; HW binds one TEX0 per strip). Flags a
+//        sprite emitter whose name is a compound-widget shape (Window/Box/Prompt/MesWin/
+//        Cursor/Menu/Dialog/...) that emits several sub-sprites in one body (backward loop or
+//        multiple XYZ2 kicks) -> reorder-unsafe for tile-bin defer / band-parallel replay.
+//        DC2_G172_SPRITE_DEFER must NOT be enabled. General PS2: layered 2D UI compositors.
+//        Advisory.
+//
+// Rule 236 RECOMPILE_TARGET_COVERAGE_GAP (per-func tag + top-level `recompile_coverage_gaps`):
+//        DC2 blocker #2 (some levels won't load: "Warning: Function at address 0xe3dc70 not
+//        found" stalls the load). Every direct-call (jal) / computed-jump (Rule 146) target
+//        that lands in the code range but has NO defined function makes the recompiler panic
+//        that way at runtime. Cross-checks the union of discovered target addresses against
+//        the defined-function set (funcManager) within the [minFn,maxFn] code-range proxy;
+//        emits in-range-but-undefined targets + their referencing site. Firewalled - never
+//        stub these away. General PS2: the #1 recompiler coverage failure (overlay/late-bound/
+//        jump-table code the exporter missed).
+//
+// Rule 237 TEXTURE_STREAM_CHURN (top-level `streamed_texture_pages`, advisory): G148/G149
+//        refutation. A de-swizzle/decode texture cache was BIT-EXACT but a MEASURED NET LOSS
+//        because streamed title textures are re-uploaded (BITBLT) frequently AND sparsely
+//        sampled per frame - whole-texture decode > the sparse sampler it replaces, and coarse
+//        VRAM-generation bumps (~82/frame) kill reuse. Distinct BITBLTBUF uploaders per
+//        labelled page (Rule 165 vramPageWriters) proxies churn: >=2 = STREAMED (poor cache
+//        candidate); ==1 = static (cacheable). General PS2.
+//
+// Rule 238 PRESENTATION_REGISTER_FIFO_BYPASS (per-func + top-level `presentation_fifo_bypass`,
+//        general PS2 - the most reusable MTGS lesson): the 6 presentation regs (PMODE/SMODE2/
+//        DISPFB1/DISPFB2/DISPLAY1/DISPLAY2) are written on the EE thread via the direct IO
+//        path (writeIORegister -> gs_regs), synchronously, no mutex, BYPASSING the GS draw
+//        FIFO. This broke MTGS v1 (worker latched present regs the EE had raced past ->
+//        alternating wrong-field frames); G157 fixed it by fencing the register WRITE. Any
+//        multithreaded/pipelined GS runtime must fence/latch these separately from the draw
+//        stream. Derived from DISPFB_WRITER / DISPFB_SDK_WRITER / PRESENTATION_FIELD_STATE.
+//
+// Rule 239 INTERLACED_FIELD_HEIGHT_VARIANCE (invariant): G157/G170. GS DISPLAY1/2's DH field
+//        legitimately alternates between two valid interlaced field heights (h=415/416) per
+//        NTSC field parity; under a pipeline's ~1-frame present lag a fixed-tick golden-height
+//        check flags a FALSE regression. Materialised as a DC2_RUNTIME_INVARIANT + noted on
+//        presentation writers: any golden-height check on an interlaced route must accept BOTH
+//        field heights, never a constant. General PS2: any interlaced NTSC/PAL route.
+//
+// Rule 240 GPU_RASTER_ELIGIBILITY_CENSUS (per-func + top-level `gpu_raster_eligibility`,
+//        general PS2): G161 closed the whole GPU-raster arc (G158-G167) with one census - the
+//        signed-off gate (abe==0 no-blend, PSM in {CT32,CT24,CT16,CT16S}, alpha-test off)
+//        matched 0/216000 real title triangles (every one has BOTH blend AND alpha-test, most
+//        paletted T8). Classifies each draw builder by whether it SETS blend (ALPHA 0x42) /
+//        alpha-test (TEST 0x47/0x48) / paletted PSM constants -> blend_atest_paletted_ineligible
+//        vs opaque_eligible, so "is any prim GPU-raster eligible?" is answerable BEFORE writing
+//        shader/thread code. Advisory.
+//
+// Rule 241 G142-G172 ROSTER/INVARIANT refresh (data): DC2_RUNTIME_INVARIANTS +=
+//        TITLE_INLINE_SPRITE_IS_DOMINANT_COST, SPRITE_DEFER_HAS_GROUP_ORDER_HAZARD,
+//        PRESENTATION_REGS_BYPASS_GS_FIFO, INTERLACED_DH_TWO_VALID_HEIGHTS,
+//        STREAMED_TEXTURE_CACHE_REFUTED, GPU_RASTER_GATE_ZERO_ELIGIBLE_ON_TITLE,
+//        PERF_PROMOTION_NEEDS_VISUAL_NOT_JUST_NONZERO (multi-frame visual review > nonzero
+//        count; windowed-avg fps not dump-count; verify the full distribution/tail; best stack
+//        = G150+G144+G157 ~9.2fps opt-in, safe default = MTGS+G144 tilebin ~5.5fps). Pure data.
+//
+// Rule 242 SCHEMA_VERSION: 17.0 (v18 adds Rules 234-242).
+//
+// ================================================================
+// v19 RULES (243-251) - PCSX2 source cross-check round 3 (D:\ps2r\pcsx2-master\pcsx2:
+// Hw.h, Dmac.h, Vif.h, Sif.h, Counters.cpp, Cache.cpp, COP0.cpp). These cover the EE
+// hardware CONTRACTS PCSX2 models that no prior rule flagged: the EE interrupt-dispatch
+// path (INTC/DMAC), DMAtag-IRQ completion, VIFcode i-bit, SIF RPC transport handshake,
+// CDVD read-completion gating, EE cache coherency, GS CSR signal handshake, TLB mapping.
+// Maps directly onto DC2's remaining blockers (audio/memcard/cd via SIF; the 2nd level-
+// load failure mode via CDVD; the half-rate title loop via the vblank interrupt).
+// ================================================================
+//
+// Rule 243 EE_INTERRUPT_HANDLER_REGISTRATION (per-func + top-level `interrupt_handlers`,
+//        general PS2): the biggest EE contract no rule flagged. PCSX2 Hw.h INTC_STAT
+//        (0x1000F000)/INTC_MASK(0x1000F010) + Counters.cpp vblank cause bits. The EE
+//        dispatches guest handlers registered via the libkernel SDK (AddIntcHandler/
+//        EnableIntc/AddDmacHandler/EnableDmac); each ACKs by writing 1 to its INTC/DMAC_STAT
+//        bit. A static recompiler that never RAISES these leaves the game's vblank + DMAC-
+//        completion callbacks DEAD - DC2's half-rate title loop (F52) + g_vsync_flag_mutex
+//        path (G7) depend on the vblank IRQ firing. Detects the handler SDK roster OR INTC/
+//        DMAC STAT/MASK/PCR/ENABLE MMIO; captures the INTC cause bit when the id is a const.
+//
+// Rule 244 DMA_TAG_IRQ_COMPLETION (per-func + top-level `dma_tag_irq_sites`, general PS2):
+//        PCSX2 Dmac.h DMAtag IRQ:1 (qword bit31) + CHCR TIE:1 (bit7). A source-chain tag
+//        with IRQ set + TIE raises the channel DMAC interrupt on tag completion. A runtime
+//        ignoring tag-IRQ/TIE never signals chain-done -> the DMA-complete semaphore/handler
+//        never fires (silent transfer-done deadlock). Detected: a chain-DMA builder (Rule
+//        115/116) whose const-tracked CHCR value has STR|TIE (0x180). Distinct from Rule
+//        21/115 (which see the kick, not the completion interrupt).
+//
+// Rule 245 VIF_INTERRUPT_IBIT (per-func + top-level `vif_interrupt_sites`, general PS2):
+//        PCSX2 Vif.h STAT.INT (bit11), the VIFcode i-bit (bit31), MARK/FBRST/MII. A VIFcode
+//        with the i-bit raises VIF1 STAT.INT and stalls until acked. A runtime that runs VIF
+//        streams but ignores the i-bit never fires VIF-INT -> a game syncing on it (progress
+//        callback / DBUF swap) hangs. Extends Rule 117 (saw the VIFcode, not the i-bit). DC2
+//        stages every VU1 model packet through VIF1 UNPACK. Detected: a VIF builder with a
+//        const-tracked value carrying bit31.
+//
+// Rule 246 SIF_RPC_TRANSPORT (per-func + top-level `sif_transport_sites`, general PS2):
+//        extends Rule 74 (MSCOM/SMCOM only) with the SBUS MSFLG/SMFLG (0x1000F220/F230)
+//        handshake flags + EE SIF DMA ch5(SIF0 0x1000C000 IOP->EE)/ch6(SIF1 0x1000C400
+//        EE->IOP) + the Sif.h sifData EE/IOP dual-tag junk-fill hazard. With no IOP the EE
+//        deadlocks polling SMFLG for a bit the IOP never sets - the DC2 audio(#3)/memcard(#4)/
+//        cd-RPC wait class. Flags the poll sites so an IOP-dead stall routes to the transport,
+//        not game logic (marks POLL_WAIT when also a sync-wait loop).
+//
+// Rule 247 CDVD_READ_COMPLETION_GATE (per-func + top-level `cdvd_completion_gates`, DC2
+//        blocker #2 + general): a backward-branch wait polling a sceCd* completion signal
+//        (sceCdSync/sceCdDiskReady/sceCdGetError/sceCdStatus/sceCdRead/sceCdSeek). DC2 level
+//        load streams DATA.DAT via sceCdRead + SearchFile@0x148850 (F55); a level that
+//        "cannot be loaded" can stall on a CD-completion wait that never signals if the
+//        runtime's CDVD model returns busy/never-ready. The 2nd static level-load failure
+//        mode beside the Rule 236 coverage gap. Analog to Rule 170 (audio gate).
+//
+// Rule 248 EE_CACHE_COHERENCY_OP (per-func + top-level `cache_ops`, general PS2): PCSX2
+//        Cache.cpp models the EE D-cache + cache/sync.l/sync.p. A flat coherent runtime can
+//        ignore most - EXCEPT when the game DMAs code/data into RAM then relies on a cache/
+//        sync before reading/executing it (stale read otherwise). Flags raw cache/sync ops,
+//        especially near a DMA kick / SPR / dynamic-code loader. Distinct from Rule 161
+//        (FlushCache + exec loader). DC2 G26 scratchpad staging touches this shape.
+//
+// Rule 249 GS_CSR_SIGNAL_HANDSHAKE (per-func + top-level `gs_csr_sites`, general PS2,
+//        extends Rule 79): GS CSR (priv 0x12001000) SIGNAL/FINISH/HSINT/VSINT latch + IMR
+//        mask. GIF A+D SIGNAL(0x60)/FINISH(0x61)/LABEL(0x62) writes latch CSR and raise GS
+//        INT unless IMR masks; the handler acks via CSR. DC2's IMR=0x7F00 masks all (so Rule
+//        79 stubs its handlers) - but a game leaving GS IRQs unmasked and syncing on FINISH
+//        needs the handshake. Flags SIGNAL/FINISH/LABEL writers + CSR access.
+//
+// Rule 250 EE_TLB_MAPPING (per-func + top-level `tlb_writers`, general PS2, "absence is a
+//        finding"): PCSX2 COP0.cpp TLB (tlbwi/tlbwr/tlbr/tlbp + EntryHi/Lo/PageMask). A game
+//        installing custom TLB entries (memory remap / scratchpad-as-RAM) breaks a flat-
+//        address recompiler. DC2 statistic 0 confirms it is flat (like Rule 150/226/229);
+//        non-zero is a red flag. Detected from the raw TLB instructions.
+//
+// Rule 251 ROSTER/INVARIANT refresh + SCHEMA_VERSION: 18.0 (v19 adds Rules 243-251).
+//        DC2_RUNTIME_INVARIANTS += EE_INTC_VBLANK_HANDLER_MUST_FIRE, DMA_TAG_IRQ_TIE_COMPLETION,
+//        VIF_IBIT_RAISES_STAT_INT, IOP_RPC_SMFLG_POLL_DEADLOCK_CLASS,
+//        CDVD_LEVEL_LOAD_IS_sceCdRead_STREAM, DC2_IS_FLAT_NO_TLB_UCAB. Pure data.
+//
 // PIPELINE (v11.3): the script now asks "FIRST run for this ELF?" up front:
 //   - YES -> full pipeline. Delegates the Step-1 export to ExportPS2Functions via runScript,
 //            then enriches; emits csv + assembly + decompiled + flowchart + unified TOML + triage_map.json.
@@ -1873,6 +2034,21 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         { "TITLE_TRANSFORM_GATE_FMAND_CASCADE","G138 (corrects TITLE_PACKER_DISPATCH_MAP's '0x1ff0 is 100% nodraw by correct microcode' and retires FORCED_0x1ff0_DRAW_IS_LOAD_BEARING): under the REAL opcode table the transform gates are takeable and bit-exact vs HW. Gate formula: draw when the FMAND mask cascade equals VI3 = 0xD0|qw30, where 0xD0 = MAC S-flags x,y,w ('guard SUB negative in all three tested lanes' = inside guard planes), 0x20 = OPMSUB winding cross S.z (backface), and qw30 = the winding-flip bit written by the setup determinant code at VU 0x01c0..0x0210 (FMAND VI9,0x80 on the view determinant's S.x). 5-vert tstrip loop 0x2070..0x2180 (IBEQ @0x2128), 3-vert loop 0x1ec8..0x1fd0 (IBEQ @0x1f68), tri packer 0x1d08..0x1da0 (IBEQ @0x1d48). G100 forced-draw RETIRED (re-enable DC2_G100_FORCE_DRAW=1); with faithful gates it OVER-draws." },
         { "STALE_PC_SCOPED_BANDAID_SWEEP","G140 DURABLE LESSON: a stale default-ON band-aid can BE the 'missing feature'. The June G64 'enable fix' (ps2_vu1.cpp IAND patch scoped to pc 0x30d8/0x30f8/0x3168) ORed the tested mask into VI1 - but VI1 there is the clipper's FCGET CLIP FLAGS (set = OUTSIDE), so every vertex read outside, all 6 Sutherland-Hodgman passes emptied, and the water pool never rendered. G64's credited effect was really the then-unfixed G138/G139 roots. When retiring a root fix's band-aids, sweep OLD pc-scoped interpreter patches too (G64 predated G138 by 70 phases). Retired default-OFF: G100 forced-draw, G89 guard cull, G104/G125 near-plane tri clip, G128 behind-drop, G64 enable-fix (DC2_*_FORCE_* re-enables); G125 title Z stays default-ON. Golden title smoke: frame_001500 PixelNonZero=211646. Statically: Rule 221 runtime_lever_registry." },
         { "GS_DUMP_RECORD_ALIGNMENT_TRICK","G139 reusable tooling lesson: runner GS dumps write one strip per record with order preserved, so a contiguous runner record window aligns to the HW dump by (prim,tbp,nverts) SIGNATURE matching - no camera-pose matching needed. This record-order alignment found the per-vertex slot-1 corruption (G139) that centroid-join missed. Harness: DC2_G138_GSDUMP (runner .gs container with per-XGKICK packer-PC NOP markers) + tools/g138_hw_slice.py (per-TBP/per-strip census: ALLDRAW/PRIMED/MIXED/ALLNODRAW) + tools/g138_join.py (geometry join + per-vertex outlier A/B). ALSO: split-IMAGE continuation records misparse as giant fake PACKED groups (the 'MIXED >=2048px:842' artifact) - dedupe/validate before trusting extent stats." },
+        // ===== v18: G142-G172 performance-arc invariants (Rules 234-241) =====
+        { "TITLE_INLINE_SPRITE_IS_DOMINANT_COST","G171 (ROOT of the whole G155/G156 '~28ms parserOther' mystery): the dominant title per-frame cost is INLINE SPRITE rasterization - ~76-79ms/frame at ~62,000ns/call for A+D descriptor 0x0E writes to XYZF2/XYZ2 (0x04/0x05) with prim=6 GS_PRIM_SPRITE, abe=1, fbp=0x0 (vs 25-90ns/call for every other register type, a 700-1000x gap). G144's tile-bin defer + parallel band-replay ONLY ever covered GS_PRIM_TRIANGLE/TRISTRIP, so sprites ALWAYS rasterized synchronously inline, invisible to every triangle-only perf probe for ~16 phases (G144-G171). It was never GIF parse time. LESSON: perf instrumentation and deferred-raster levers must enumerate ALL primitive classes, not just triangles. Statically: GS_PRIM_SPRITE_EMITTER / prim_class_emitters." },
+        { "SPRITE_DEFER_HAS_GROUP_ORDER_HAZARD","G172: naively widening G144's tile-bin defer to GS_PRIM_SPRITE regressed the costume 'Select Max's costume' prompt box to EMPTY (missing bg/border/text glyphs). The box is several sub-sprites that MUST draw as an unbroken GROUP (HW draws one TEX0 per strip; ordering/atomicity is implicit). A differential 'textured-only sprites' test made it WORSE, ruling out untextured-sprites as the cause. A reordering/band-parallel rasterizer must preserve compound-widget sprite groups. DC2_G172_SPRITE_DEFER must NOT be enabled. Statically: SPRITE_GROUP_ORDER_DEPENDENCY." },
+        { "PRESENTATION_REGS_BYPASS_GS_FIFO","G150/G157 (general PS2 MTGS lesson): the 6 presentation registers (PMODE/SMODE2/DISPFB1/DISPFB2/DISPLAY1/DISPLAY2) are mutated via PS2Memory::writeIORegister writing gs_regs DIRECTLY, synchronously, on the EE thread, with NO mutex and NO ordering vs the GS worker's draws - they BYPASS the GifArbiter/worker FIFO entirely. This is the exact mechanism that broke MTGS v1 (worker latched present regs the EE had already raced past -> alternating wrong-field frames). Fix = gate the register WRITE behind a fence (G157 g150_pipeline_wait_register_slot) so the worker's unmodified latchHostPresentationFrame is correct by construction. Any multithreaded/pipelined GS runtime MUST fence/latch these separately from the draw stream. Statically: PRESENTATION_REGISTER_FIFO_BYPASS." },
+        { "INTERLACED_DH_TWO_VALID_HEIGHTS","G157/G170: GS DISPLAY1/2's DH field genuinely alternates between two valid interlaced field heights (h=415 and h=416) every field (real NTSC field-parity behavior). A synchronous default samples a fixed field parity at a fixed tick; G157's inherent ~1-frame present lag shifts a fixed-tick sample onto the OTHER valid field most of the time. Verified BENIGN (identical legible content, zero corruption) - NOT a regression. LESSON: any automated golden-height check on an INTERLACED 2D route must ACCEPT BOTH field heights, never assume a constant like the (progressive) title route's 211646. Statically: presentation_fifo_bypass + this invariant." },
+        { "STREAMED_TEXTURE_CACHE_REFUTED","G148/G149: a shared de-swizzle/decode texture cache (decode a bound texture ONCE into linear CLUT-pre-applied RGBA, read lock-free by all tilebin lanes) was BIT-EXACT but a MEASURED NET LOSS (~226ms vs ~213ms baseline, -6% fps) despite a ~99% intra-frame hit. Root: the streamed title textures are SPARSELY sampled per frame (perspective/minified taps change nearly every pixel), so whole-texture decodes (many 512x512 T8 = ~1.6M swizzle+CLUT reads/f) EXCEED the ~1.18M-leaf sampler they replace; coarse global VRAM-generation bumps (~82x/frame) also kill cross-frame reuse. Do NOT invest in texture-decode caching for high-BITBLT-churn pages. Statically: TEXTURE_STREAM_CHURN / streamed_texture_pages (distinct uploaders >=2 = poor cache candidate)." },
+        { "GPU_RASTER_GATE_ZERO_ELIGIBLE_ON_TITLE","G158-G167 (the whole GPU-raster arc, closed by ONE census in G161): the signed-off eligibility gate (abe==0 no-blend, PSM in {CT32,CT24,CT16,CT16S}, alpha-test disabled, wrap in {REPEAT,CLAMP}) matched eligible=0/216000 (0.0%) real deferred title triangles - EVERY one has BOTH blend AND alpha-test enabled, and most are paletted T8 (badPsm=201484, the cavern is PSMT8). The abe==0 clause alone excludes the entire workload. Building the queue/shader/diff on this gate would have been dead code. A static census of which draw builders SET blend/alpha-test/paletted-PSM constants answers 'is any prim GPU-raster eligible?' before writing shader/thread code. Statically: GPU_RASTER_ELIGIBILITY_CENSUS. Also G167: cross-thread GPU contention (decoder thread vs main present thread on one physical GPU, glFinish/glReadPixels) confirmed as the real ceiling; user STOPPED the arc." },
+        { "PERF_PROMOTION_NEEDS_VISUAL_NOT_JUST_NONZERO","G168/G157/G150 durable perf-method lessons: (1) golden PixelNonZero count alone (211646+/-4) is INSUFFICIENT for a promotion - the G168 full stack passed the nonzero gate but visibly dropped bottom-left title geometry; use MULTI-FRAME VISUAL review / contact sheets. (2) raw captures/frame_*.ppm dump COUNT over a fixed wall-clock window is BOOT-TIME-CONFOUNDED (the same config dumped 15/19/21 frames across runs) - use the windowed average ([G154:perf]), not dump counts, as the fps proxy. (3) verify the full-frame DISTRIBUTION/tail, not a single median sample (the G150-v1 single-sample false 'golden'). (4) a new unverified lever must never ride in on an already-default-on mechanism. Best verified title stack today = G150(MTGS)+G144(tilebin)+G157(pipeline) ~9.2fps OPT-IN; safe default = MTGS+G144 tilebin ~5.5fps." },
+        // ===== v19: PCSX2 cross-check round 3 - EE interrupt/DMA/SIF/CDVD contracts (Rules 243-250) =====
+        { "EE_INTC_VBLANK_HANDLER_MUST_FIRE","PCSX2 Hw.h INTC_STAT(0x1000F000)/INTC_MASK(0x1000F010) + Counters.cpp vblank cause bits (2=VBLANK_ON,3=VBLANK_OFF). The EE dispatches guest interrupt handlers registered via libkernel (AddIntcHandler/EnableIntc/AddDmacHandler/EnableDmac); the handler ACKs by writing 1 to its INTC/DMAC_STAT bit. A static recompiler that never RAISES these interrupts leaves the game's vblank + DMAC-completion callbacks dead - the DC2 half-rate title loop (F52) and the g_vsync_flag_mutex path (G7) depend on the vblank IRQ firing at the right cadence. Verify the runtime raises INTC(2/3) each field and INTC(5)=VIF1/INTC(9-12)=timers on the modelled event. Statically: EE_INTERRUPT_HANDLER_REGISTRATION." },
+        { "DMA_TAG_IRQ_TIE_COMPLETION","PCSX2 Dmac.h: a source-chain DMAtag with the IRQ bit (qword bit31) set, combined with CHCR.TIE (bit7), raises that channel's DMAC interrupt on the tag's completion. A runtime that ignores tag-IRQ+TIE never signals chain completion -> the game's DMA-done handler/semaphore never fires (a silent transfer-complete deadlock, distinct from a missing kick). Statically: DMA_TAG_IRQ_COMPLETION (CHCR const with STR|TIE = 0x180 in a chain-DMA builder)." },
+        { "VIF_IBIT_RAISES_STAT_INT","PCSX2 Vif.h: a VIFcode with the i-bit (bit31) set raises VIF1 STAT.INT (bit11) and stalls until acked (STC clears it); MARK writes VIF_MARK, FBRST FBK/STP/STC control the stall, MII masks the STAT INT. A runtime that executes VIF streams but ignores the i-bit never fires the VIF interrupt -> a game syncing on VIF-INT (progress callback / double-buffer swap) hangs. DC2 stages every VU1 model packet through VIF1 UNPACK. Statically: VIF_INTERRUPT_IBIT." },
+        { "IOP_RPC_SMFLG_POLL_DEADLOCK_CLASS","PCSX2 Hw.h SBUS MSCOM(0x1000F200)/SMCOM(0x1000F210)/MSFLG(0x1000F220)/SMFLG(0x1000F230) + EE SIF DMA ch5(SIF0 0x1000C000 IOP->EE)/ch6(SIF1 0x1000C400 EE->IOP); Sif.h sifData EE/IOP dual-tag + sub-QW junk-fill (an IOP transfer <1QW reuses the prior QW / EE tag). MSFLG/SMFLG are the EE<->IOP handshake flags. With NO IOP CPU (DC2 blocker #1) the EE can deadlock polling SMFLG for a bit the IOP never sets - the audio(#3)/memcard(#4)/cd-RPC wait class (masked today by DC2_DISABLE_EVENT_SKIP). Statically: SIF_RPC_TRANSPORT (flags the poll sites so an IOP-dead stall routes to the transport, not game logic)." },
+        { "CDVD_LEVEL_LOAD_IS_sceCdRead_STREAM","DC2 blocker #2 (some levels won't load) has TWO static failure modes: (a) a missing recompiled function at an in-range call/jump target -> 'Warning: Function at address 0xN not found' (0xe3dc70; Rule 236 RECOMPILE_TARGET_COVERAGE_GAP); (b) a CDVD read-completion WAIT that never signals if the runtime's CDVD model returns busy/never-ready. DC2 streams DATA.DAT via sceCdRead + SearchFile@0x148850 (F55) and polls sceCdSync/sceCdDiskReady/sceCdGetError. Analog to the F63/F64 audio-gated stall (Rule 170). Statically: CDVD_READ_COMPLETION_GATE." },
+        { "DC2_IS_FLAT_NO_TLB_UCAB","PCSX2 models the EE TLB (tlbwi/tlbwr + COP0 EntryHi/Lo/PageMask) and the uncached-accelerated segment. DC2 is expected to be a FLAT single ELF that installs no custom TLB entries (tlb_writers statistic 0 confirms the flat-address recompiler assumption is safe - like overlay_loaders=0 for Rule 150). A non-zero tlb_writers count is a red flag that the runtime's flat memory model would break a remapped region. Statically: EE_TLB_MAPPING. Also: GS CSR SIGNAL/FINISH handshake is stubbable for DC2 (IMR=0x7F00 masks all GS IRQs, Rule 79/GS_CSR_SIGNAL_HANDSHAKE) but a game leaving GS IRQs unmasked needs it." },
     };
 
     // v9 Rule 134: pre-computed forward callgraphs to bullseye sinks. Each
@@ -3101,6 +3277,26 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         Set<String> rcntRegsHit = new LinkedHashSet<>();  // e.g. T0_COUNT, T2_MODE
         boolean readsCop0Count = false;
         boolean isEeTimeSource = false;
+        // ===== v18 (Rules 234-240): G142-G172 performance-arc retrospective =====
+        // Rule 234: draw-relevant GIF PRIM classes this builder emits (triangle/
+        // tristrip/trifan/sprite), from const-tracked PRIM values (attribute-bit gated).
+        Set<String> primClassesEmitted = new LinkedHashSet<>();
+        boolean isSpriteEmitter = false;             // Rule 234 (emits GS_PRIM_SPRITE)
+        boolean spriteGroupOrderDependency = false;  // Rule 235 (compound 2D widget)
+        boolean writesAlphaBlendReg = false;         // Rule 240 (A+D ALPHA 0x42)
+        boolean writesTestReg = false;               // Rule 240 (A+D TEST_1/2 0x47/0x48)
+        boolean presentationFifoBypass = false;      // Rule 238 (present regs bypass GS FIFO)
+        String  gpuRasterEligibility = null;         // Rule 240 (opaque_eligible / blend_atest_ineligible)
+        // ===== v19 (Rules 243-251): PCSX2 cross-check round 3 (EE interrupt/DMA/SIF/CDVD/cache) =====
+        boolean isInterruptHandlerReg = false;       // Rule 243 (INTC/DMAC handler install)
+        boolean dmaChcrTie = false;                  // Rule 244 (CHCR STR|TIE = completion IRQ enable)
+        boolean vifCodeIBit = false;                 // Rule 245 (VIFcode i-bit bit31)
+        boolean isSifTransport = false;              // Rule 246 (SBUS flags + SIF0/1 DMA)
+        boolean isCdvdCompletionGate = false;        // Rule 247 (sceCd* completion poll)
+        boolean hasCacheOp = false;                  // Rule 248 (cache instruction)
+        boolean hasSyncOp = false;                   // Rule 248 (sync.l/sync.p)
+        boolean writesTlb = false;                   // Rule 250 (tlbwi/tlbwr/tlbr/tlbp)
+        boolean isGsCsrSignalSite = false;           // Rule 249 (GS SIGNAL/FINISH/LABEL + CSR)
     }
 
     // =========================================================
@@ -3413,6 +3609,42 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private final List<String[]> prmodeAttrWriters    = new ArrayList<>(); // Rule 230
     private final List<String[]> texaClampWriters     = new ArrayList<>(); // Rule 231
     private final List<String[]> eeTimeSources        = new ArrayList<>(); // Rule 232
+    // ===== v18 counters + rosters (Rules 234-240, G142-G172 perf-arc retrospective) =====
+    private int spriteEmitterCount=0, spriteGroupOrderCount=0, presentationFifoBypassCount=0;
+    private int gpuRasterEligibleCount=0, gpuRasterIneligibleCount=0;
+    private final List<String[]> primClassEmitters      = new ArrayList<>(); // Rule 234
+    private final List<String[]> spriteCompoundWidgets   = new ArrayList<>(); // Rule 235
+    private final List<String[]> recompileCoverageGaps   = new ArrayList<>(); // Rule 236
+    private final List<String[]> streamedTexturePages    = new ArrayList<>(); // Rule 237
+    private final List<String[]> presentationFifoBypass  = new ArrayList<>(); // Rule 238
+    private final List<String[]> gpuRasterEligibility    = new ArrayList<>(); // Rule 240
+    // Rule 234/235 name rosters (sprite draw path + compound-widget shapes).
+    private static final String[] SPRITE_EMITTER_NAMES = {
+        "drawSprite","DrawSprite","DrawDivSprite","DrawDivSprite4","PrimQuad","SetSpriteEnv",
+        "PutSprite","mgC3DSprite","3DSprite","Sprite2D","DrawFont","PutFont","DrawMesWin","meswin" };
+    private static final String[] COMPOUND_WIDGET_NAMES = {
+        "Window","Wnd","Box","Prompt","MesWin","Message","Dialog","Panel","Cursor","Frame",
+        "Menu","Balloon","Caption","Icon","Gauge" };
+    // ===== v19 counters + rosters (Rules 243-250, PCSX2 cross-check round 3) =====
+    private int interruptHandlerCount=0, dmaTagIrqCount=0, vifInterruptCount=0;
+    private int sifTransportCount=0, cdvdGateCount=0, cacheOpCount=0, tlbWriterCount=0, gsCsrCount=0;
+    private final List<String[]> interruptHandlers   = new ArrayList<>(); // Rule 243
+    private final List<String[]> dmaTagIrqSites       = new ArrayList<>(); // Rule 244
+    private final List<String[]> vifInterruptSites    = new ArrayList<>(); // Rule 245
+    private final List<String[]> sifTransportSites    = new ArrayList<>(); // Rule 246
+    private final List<String[]> cdvdCompletionGates  = new ArrayList<>(); // Rule 247
+    private final List<String[]> cacheOps             = new ArrayList<>(); // Rule 248
+    private final List<String[]> tlbWriters           = new ArrayList<>(); // Rule 250
+    private final List<String[]> gsCsrSites           = new ArrayList<>(); // Rule 249
+    // Rule 243: EE interrupt-handler-registration SDK (libkernel INTC/DMAC handler install).
+    private static final String[] INTC_DMAC_HANDLER_NAMES = {
+        "AddIntcHandler","_AddIntcHandler","EnableIntc","DisableIntc","iEnableIntc","iDisableIntc",
+        "AddDmacHandler","_AddDmacHandler","EnableDmac","DisableDmac","iEnableDmac","iDisableDmac",
+        "RemoveIntcHandler","RemoveDmacHandler","_intc_","IntcHandler","DmacHandler" };
+    // Rule 247: sceCd* read/seek completion family (level-load stream gate, analog to Rule 170).
+    private static final String[] CDVD_COMPLETION_NAMES = {
+        "sceCdSync","sceCdDiskReady","sceCdGetError","sceCdStatus","sceCdRead","sceCdSeek",
+        "sceCdGetToc","sceCdReadClock","sceCdSearchFile","sceCdComplete" };
     // Rule 153/220/221: runtime checkout root actually used for the roster scrape.
     private File runtimeRootDir = null;
 
@@ -4903,6 +5135,15 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             // would have front-loaded G87/G138/G139/G140), GIFtag template scan,
             // runtime lever registry, canon-vs-runner VU opcode diff, perf ranking.
             applyV17Rules(results);
+            // v18 Rules 234-242 (G142-G172 perf-arc retrospective): sprite-emitter prim-class
+            // census, sprite-group order dependency, recompile target coverage gap (the
+            // level-load "function not found" class), streamed-texture cache suitability,
+            // presentation-register FIFO bypass, GPU-raster eligibility census.
+            applyV18Rules(results);
+            // v19 Rules 243-251 (PCSX2 cross-check round 3): EE interrupt-handler dispatch,
+            // DMAtag-IRQ+TIE completion, VIFcode i-bit, SIF RPC transport, CDVD read-completion
+            // gate (2nd level-load failure mode), EE cache-coherency ops, GS CSR handshake, TLB.
+            applyV19Rules(results);
             scanVuMicrocodePrograms(results);
             scanGiftagTemplates();
             scanRuntimeLeverRegistry();
@@ -7528,6 +7769,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         detectCodegenClasses(func, traits);
         // v16 Rules 207/208: FTOI4 + fog-clamp shape (ADC capability) + perspective-divide near-plane.
         detectV16Signals(func, fname, traits);
+        // v19 Rules 244/245/248/250: CHCR TIE bit, VIFcode i-bit, cache/sync/tlb instructions.
+        detectV19Signals(func, traits);
 
         cache.put(key,traits);
         return traits;
@@ -8496,6 +8739,65 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
     }
 
+    // v19 Rules 244/245/248/250 scan-time facts (PCSX2 cross-check round 3):
+    //  - Rule 244: a CHCR const with STR|TIE (bits 8|7 = 0x180) enables the
+    //    tag-completion DMAC interrupt (PCSX2 Dmac.h TIE:1 + DMAtag IRQ:1).
+    //  - Rule 245: a VIFcode with the i-bit (bit31) raises VIF STAT.INT (PCSX2
+    //    Vif.h INT:1) - detected as a tracked const whose top byte has bit7 set.
+    //  - Rule 248: EE cache-coherency ops (cache / sync.l / sync.p) - the DMA-to-
+    //    RAM-then-execute / SMC hazard PCSX2 models in Cache.cpp.
+    //  - Rule 250: TLB writers (tlbwi/tlbwr/tlbr/tlbp) - custom memory mapping a
+    //    flat-address recompiler would break (statistic 0 = flat, the finding).
+    private void detectV19Signals(Function func, FuncTraits traits) {
+        InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
+        Map<String,Long> regConsts = new HashMap<>();
+        while(it.hasNext()) {
+            Instruction inst = it.next();
+            String mn = inst.getMnemonicString(); if(mn == null) continue;
+            String mll = mn.toLowerCase();
+            if(mll.equals("cache")) traits.hasCacheOp = true;
+            else if(mll.equals("sync") || mll.equals("sync.l") || mll.equals("sync.p")) traits.hasSyncOp = true;
+            else if(mll.equals("tlbwi") || mll.equals("tlbwr") || mll.equals("tlbr") || mll.equals("tlbp"))
+                traits.writesTlb = true;
+            // composite const tracking (lui high half + ori/addiu low half), same as
+            // detectDmaSourceChainTagBuilder, so full 32-bit CHCR/VIFcode values recover.
+            if(mll.equals("lui")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                long imm = -1;
+                for(Object o : inst.getInputObjects())
+                    if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                if(dr != null && imm >= 0) regConsts.put(dr, (imm & 0xFFFFL) << 16);
+            } else if(mll.equals("ori") || mll.equals("addiu") || mll.equals("li") || mll.equals("daddiu")) {
+                Object[] dops = inst.getOpObjects(0);
+                String dr = (dops!=null && dops.length>0 && dops[0] instanceof ghidra.program.model.lang.Register)
+                    ? ((ghidra.program.model.lang.Register)dops[0]).getName() : null;
+                String src = null; long imm = 0;
+                for(Object o : inst.getInputObjects()) {
+                    if(o instanceof ghidra.program.model.lang.Register) {
+                        String rn = ((ghidra.program.model.lang.Register)o).getName();
+                        if(!rn.equalsIgnoreCase(dr)) src = rn;
+                    } else if(o instanceof ghidra.program.model.scalar.Scalar)
+                        imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
+                }
+                if(dr != null) {
+                    long base = (src != null && regConsts.containsKey(src)) ? regConsts.get(src)
+                              : (regConsts.containsKey(dr) ? regConsts.get(dr) : 0L);
+                    regConsts.put(dr, base | (imm & 0xFFFFL));
+                }
+            }
+        }
+        for(Long cb : regConsts.values()) {
+            long v = cb & 0xFFFFFFFFL;
+            // Rule 244: STR|TIE (0x180). Require both so a plain STR kick (0x100/0x101) is excluded.
+            if((v & 0x180L) == 0x180L) traits.dmaChcrTie = true;
+            // Rule 245: VIFcode i-bit = bit31 set with a plausible VIF cmd in the top byte.
+            if((v & 0x80000000L) != 0L) traits.vifCodeIBit = true;
+        }
+    }
+
     // v9 Rule 115: DMA_CHCR_START_KICK. Loads const 0x101 (STR | TIE) AND
     // touches a known DMA channel CHCR address.
     private void detectDmaChcrStartKick(Function func, FuncTraits traits) {
@@ -8994,6 +9296,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
         Map<String,Long> regConsts = new HashMap<>();
         Set<Long> adRegIdsStored = new LinkedHashSet<>(); // v11: distinct GS reg-id store evidence
+        Set<Long> allConsts = new LinkedHashSet<>();       // v18 Rule 234: every tracked immediate
         while(it.hasNext()) {
             Instruction inst = it.next();
             String mn = inst.getMnemonicString(); if(mn == null) continue;
@@ -9006,7 +9309,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 for(Object o : inst.getInputObjects())
                     if(o instanceof ghidra.program.model.scalar.Scalar)
                         imm = ((ghidra.program.model.scalar.Scalar)o).getUnsignedValue();
-                if(dr != null && imm >= 0) regConsts.put(dr, imm);
+                if(dr != null && imm >= 0) { regConsts.put(dr, imm); allConsts.add(imm); }
             } else if(mll.equals("sd") || mll.equals("sw") || mll.equals("sq")) {
                 Object[] dop = inst.getOpObjects(0);
                 String src = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
@@ -9052,9 +9355,30 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             // is not statically proven here; the readback post-pass requires an
             // additional BUSDIR / VIF-CTRL signal before flagging.
             if(adRegIdsStored.contains(0x53L)) traits.storesTrxdirLocalToHost = true;
+            // v18 Rule 240: ALPHA (0x42) blend + TEST_1/2 (0x47/0x48) alpha-test writers —
+            // the GPU-raster eligibility axes (G161: title tris all had blend AND atest).
+            if(adRegIdsStored.contains(0x42L)) traits.writesAlphaBlendReg = true;
+            if(adRegIdsStored.contains(0x47L) || adRegIdsStored.contains(0x48L)) traits.writesTestReg = true;
             for(Long v : adRegIdsStored) {
                 String nm = KNOWN_GS_REGS.get(v);
                 if(nm != null) traits.gsRegHits.add(nm);
+            }
+        }
+        // v18 Rule 234: per-emitter GIF PRIM-class census (the G171 miss — inline SPRITE
+        // raster was the dominant title cost, invisible to triangle-only instrumentation).
+        // Gate on being a real draw builder, then read PRIM-shaped constants. A PRIM value
+        // is 11 bits; prim class = bits[0:2]. Require an attribute bit (IIP/TME/ABE/FGE =
+        // bits 3/4/6, mask 0x78) set so bare A+D reg-ids (0x03..0x07) are NOT mistaken for
+        // a PRIM value (e.g. reg-id 0x06 TEX0 vs PRIM class 6 sprite).
+        if(traits.gifTagInlineBuilder || traits.writesGsPrimReg) {
+            for(Long cb : allConsts) {
+                long v = cb & 0xFFFFFFFFL;
+                if(v == 0 || v > 0x7FFL) continue;
+                if((v & 0x78L) == 0) continue;            // no attribute bit -> likely a reg-id
+                long cls = v & 7L;
+                if(cls < 3 || cls > 6) continue;          // triangle/tristrip/trifan/sprite only
+                traits.primClassesEmitted.add(GIF_PRIM_CLASS[(int)cls]);
+                if(cls == 6L) traits.isSpriteEmitter = true;
             }
         }
     }
@@ -10701,6 +11025,286 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             prmodeAttrWriterCount, texaClampWriterCount, eeTimeSourceCount));
     }
 
+    // =========================================================
+    // v18 Rules 234-242: G142-G172 performance-arc retrospective + general PS2.
+    // The whole prior rule set stops at G141 (Rule 222 = ACTIVE); everything learned
+    // across the G142-G172 perf arc (inline sprite raster, MTGS present-reg bypass,
+    // streamed-texture cache refutation, GPU-raster zero-eligibility, the level-load
+    // "function not found" coverage gap, interlaced field-height variance) is added here.
+    // Tags/counters/rosters; the scan-time facts (primClassesEmitted, isSpriteEmitter,
+    // writesAlphaBlendReg/writesTestReg) were set in detectAdRegImmediateStores.
+    // =========================================================
+    private void applyV18Rules(List<FuncResult> results) {
+        // --- collect the defined-function address set + a code-range proxy (Rule 236) ---
+        Set<Long> definedAddrs = new HashSet<>();
+        long minFn = Long.MAX_VALUE, maxFn = Long.MIN_VALUE;
+        FunctionIterator dfi = funcManager.getFunctions(true);
+        while(dfi.hasNext()) {
+            Function f = dfi.next();
+            long a = f.getEntryPoint().getOffset() & 0xFFFFFFFFL;
+            definedAddrs.add(a);
+            if(a < minFn) minFn = a;
+            if(a > maxFn) maxFn = a;
+        }
+
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // --- Rule 234 GS_PRIM_SPRITE_EMITTER + primitive-class cost profile ---
+            boolean spriteName = false;
+            for(String s : SPRITE_EMITTER_NAMES) if(nm.contains(s)) { spriteName = true; break; }
+            if(spriteName) { t.isSpriteEmitter = true; t.primClassesEmitted.add("sprite"); }
+            if(t.isSpriteEmitter || !t.primClassesEmitted.isEmpty()) {
+                if(t.isSpriteEmitter && !r.tags.contains("GS_PRIM_SPRITE_EMITTER")) {
+                    r.tags.add("GS_PRIM_SPRITE_EMITTER"); spriteEmitterCount++;
+                }
+                primClassEmitters.add(new String[]{ nm, hex(r.address),
+                    String.join("|", t.primClassesEmitted) });
+            }
+
+            // --- Rule 235 SPRITE_GROUP_ORDER_DEPENDENCY ---
+            // A compound 2D widget: a sprite emitter whose name is a widget shape and
+            // that emits several sub-sprites in one body (backward loop, or >=2 XYZ2
+            // kicks). Reorder-unsafe for tile-bin defer / band-parallel replay (G172).
+            if(t.isSpriteEmitter) {
+                boolean widgetName = false;
+                for(String s : COMPOUND_WIDGET_NAMES) if(nm.contains(s)) { widgetName = true; break; }
+                boolean multiKick = t.hasBackwardBranch || t.writesXyz2Reg;
+                if(widgetName && multiKick) {
+                    t.spriteGroupOrderDependency = true;
+                    if(!r.tags.contains("SPRITE_GROUP_ORDER_DEPENDENCY")) {
+                        r.tags.add("SPRITE_GROUP_ORDER_DEPENDENCY"); spriteGroupOrderCount++;
+                    }
+                    spriteCompoundWidgets.add(new String[]{ nm, hex(r.address),
+                        "compound_widget;" + (t.hasBackwardBranch ? "loop_of_subsprites"
+                                              : "multi_xyz2_kick") + ";defer_unsafe" });
+                }
+            }
+
+            // --- Rule 236 RECOMPILE_TARGET_COVERAGE_GAP ---
+            // Every direct-call / computed-jump target that lands in the code range but has
+            // no defined function makes the recompiler panic "Function at address 0xN not
+            // found" at runtime (DC2 blocker #2: 0xe3dc70 stalls level load).
+            Set<Long> tgts = new LinkedHashSet<>();
+            for(long[] s : t.jalSites)            if(s[1] != 0xFFFFFFFFL) tgts.add(s[1] & 0xFFFFFFFFL);
+            for(long[] e : t.computedJumpTargets) tgts.add(e[1] & 0xFFFFFFFFL);
+            for(Long tg : tgts) {
+                if(tg == 0 || tg == 0xFFFFFFFFL) continue;
+                if(tg < minFn || tg > maxFn) continue;          // outside code range = not this class
+                if(definedAddrs.contains(tg)) continue;         // resolves to a real function
+                if(!r.tags.contains("RECOMPILE_TARGET_COVERAGE_GAP")) {
+                    r.tags.add("RECOMPILE_TARGET_COVERAGE_GAP");
+                }
+                recompileCoverageGaps.add(new String[]{ hex(tg),
+                    "referenced_by=" + nm + "@" + hex(r.address),
+                    "in_code_range_no_function;recompiler_will_panic_not_found" });
+            }
+
+            // --- Rule 238 PRESENTATION_REGISTER_FIFO_BYPASS (general PS2, the MTGS lesson) ---
+            // The 6 presentation regs (PMODE/SMODE2/DISPFB1/DISPFB2/DISPLAY1/DISPLAY2) are
+            // written on the EE thread through the direct IO path, BYPASSING the GS draw FIFO.
+            // A multithreaded/pipelined GS must fence/latch them separately (G150/G157).
+            boolean present = r.tags.contains("DISPFB_WRITER") || r.tags.contains("DISPFB_SDK_WRITER")
+                || r.tags.contains("PRESENTATION_FIELD_STATE");
+            if(present) {
+                t.presentationFifoBypass = true;
+                if(!r.tags.contains("PRESENTATION_REGISTER_FIFO_BYPASS")) {
+                    r.tags.add("PRESENTATION_REGISTER_FIFO_BYPASS"); presentationFifoBypassCount++;
+                }
+                presentationFifoBypass.add(new String[]{ nm, hex(r.address),
+                    "present_regs_bypass_gs_fifo;fence_or_latch_under_MTGS" });
+            }
+
+            // --- Rule 240 GPU_RASTER_ELIGIBILITY_CENSUS (general PS2) ---
+            // G161 closed the whole GPU-raster arc: every deferred title triangle had BOTH
+            // blend AND alpha-test, most paletted T8 -> the opaque-only gate matched 0/216000.
+            // Classify each draw builder so "which prims are GPU-raster eligible" is static.
+            boolean drawBuilder = t.gifTagInlineBuilder || t.writesGsPrimReg || t.writesXyz2Reg
+                || t.isPackerFamily;
+            if(drawBuilder && (t.writesAlphaBlendReg || t.writesTestReg || t.loadsPsm4hhConstant)) {
+                boolean ineligible = t.writesAlphaBlendReg || t.writesTestReg || t.loadsPsm4hhConstant;
+                t.gpuRasterEligibility = ineligible ? "blend_atest_paletted_ineligible" : "opaque_eligible";
+                if(ineligible) gpuRasterIneligibleCount++; else gpuRasterEligibleCount++;
+                gpuRasterEligibility.add(new String[]{ nm, hex(r.address),
+                    t.gpuRasterEligibility
+                    + (t.writesAlphaBlendReg ? ";blend" : "")
+                    + (t.writesTestReg ? ";atest" : "")
+                    + (t.loadsPsm4hhConstant ? ";paletted_psm" : "") });
+            }
+        }
+
+        // --- Rule 237 TEXTURE_STREAM_CHURN (advisory) ---
+        // G148/G149 refutation: a de-swizzle/decode texture cache is a NET LOSS for STREAMED
+        // pages (re-uploaded every frame) that are sparsely sampled. Distinct BITBLTBUF
+        // uploaders per labelled page proxies upload churn: >=2 = streamed (poor cache
+        // candidate); ==1 = static (cacheable). Derived from the Rule 165 vramPageWriters map.
+        for(Map.Entry<Long,Map<String,List<String>>> e : vramPageWriters.entrySet()) {
+            Map<String,List<String>> byKind = e.getValue();
+            List<String> uploaders = byKind.get("BITBLTBUF");
+            if(uploaders == null || uploaders.isEmpty()) continue;
+            long page = e.getKey();
+            int distinct = new LinkedHashSet<>(uploaders).size();
+            String label = KNOWN_DC2_TBP_LABELS.getOrDefault(page, "");
+            streamedTexturePages.add(new String[]{ hex(page),
+                (label.isEmpty() ? "" : label + ";") + (distinct >= 2 ? "STREAMED" : "static"),
+                "distinct_uploaders=" + distinct
+                + (distinct >= 2 ? ";poor_cache_candidate(sparse+churn)" : ";cacheable") });
+        }
+
+        println(String.format(
+            "  v18 (G142-G172): SPRITE_EMIT=%d SPRITE_GROUP=%d COVERAGE_GAP=%d "
+          + "STREAMED_TEX=%d PRESENT_BYPASS=%d GPU_RASTER(elig=%d/inelig=%d)",
+            spriteEmitterCount, spriteGroupOrderCount, recompileCoverageGaps.size(),
+            streamedTexturePages.size(), presentationFifoBypassCount,
+            gpuRasterEligibleCount, gpuRasterIneligibleCount));
+    }
+
+    // =========================================================
+    // v19 Rules 243-251: PCSX2 cross-check round 3 (D:\ps2r\pcsx2-master).
+    // EE hardware CONTRACTS PCSX2 models that no prior rule flagged: interrupt-handler
+    // dispatch (INTC/DMAC STAT/MASK + libkernel SDK), DMAtag-IRQ+TIE completion, VIFcode
+    // i-bit, SIF RPC transport (SBUS flags + SIF0/1 DMA), CDVD read-completion gates, EE
+    // cache-coherency ops, GS CSR SIGNAL/FINISH handshake, TLB mapping. Grounded in
+    // Hw.h:304-330, Dmac.h:78/117, Vif.h:96, Sif.h. Scan-time facts (dmaChcrTie, vifCodeIBit,
+    // hasCacheOp/hasSyncOp, writesTlb) set in detectV19Signals; the rest derive from existing
+    // MMIO-recovery traits (writesIntcMask/readsIntcStat/dmacGlobalRegsHit/touchesSbusFlags/...).
+    // =========================================================
+    private void applyV19Rules(List<FuncResult> results) {
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // --- Rule 243 EE_INTERRUPT_HANDLER_REGISTRATION (general PS2) ---
+            // The EE dispatches guest handlers registered via the libkernel SDK; the handler
+            // ACKs by writing 1 to its INTC_STAT/DMAC_STAT bit. A recompiler that never fires
+            // these leaves vsync/DMAC-completion callbacks dead (DC2 half-rate title loop F52).
+            boolean handlerName = false;
+            for(String cn : t.calleeNames) { for(String s : INTC_DMAC_HANDLER_NAMES) if(cn.contains(s)) { handlerName = true; break; } if(handlerName) break; }
+            if(!handlerName) for(String s : INTC_DMAC_HANDLER_NAMES) if(nm.contains(s)) { handlerName = true; break; }
+            boolean intcDmacMmio = t.writesIntcMask || t.readsIntcStat || t.writesDmacEnable
+                || t.dmacGlobalRegsHit.contains("STAT") || t.dmacGlobalRegsHit.contains("PCR");
+            if(handlerName || intcDmacMmio) {
+                t.isInterruptHandlerReg = true;
+                if(!r.tags.contains("EE_INTERRUPT_HANDLER_REGISTRATION")) {
+                    r.tags.add("EE_INTERRUPT_HANDLER_REGISTRATION"); interruptHandlerCount++;
+                }
+                interruptHandlers.add(new String[]{ nm, hex(r.address),
+                    (handlerName ? "handler_sdk" : "")
+                    + (handlerName && intcDmacMmio ? "+" : "")
+                    + (t.writesIntcMask ? "INTC_MASK" : "") + (t.readsIntcStat ? ";INTC_STAT" : "")
+                    + (t.dmacGlobalRegsHit.contains("STAT") ? ";DMAC_STAT" : "")
+                    + (t.dmacGlobalRegsHit.contains("PCR") ? ";DMAC_PCR" : "")
+                    + (t.writesDmacEnable ? ";DMAC_ENABLE" : "") });
+            }
+
+            // --- Rule 244 DMA_TAG_IRQ_COMPLETION (general PS2) ---
+            // A source-chain DMAtag with IRQ (bit31) + CHCR.TIE raises the channel DMAC IRQ on
+            // tag completion (Dmac.h). Ignoring it -> the DMA-done handler/semaphore never fires.
+            boolean chainKick = t.dmaSourceChainTagBuilder || t.dmaChcrStartKick
+                || !t.dmaKickChannels.isEmpty() || !t.storedDmaTagIds.isEmpty();
+            if(t.dmaChcrTie && chainKick) {
+                if(!r.tags.contains("DMA_TAG_IRQ_COMPLETION")) {
+                    r.tags.add("DMA_TAG_IRQ_COMPLETION"); dmaTagIrqCount++;
+                }
+                dmaTagIrqSites.add(new String[]{ nm, hex(r.address),
+                    "CHCR_STR_TIE;chain_dma;verify_tag_IRQ_completion_interrupt_fires" });
+            }
+
+            // --- Rule 245 VIF_INTERRUPT_IBIT (general PS2, DC2 VU1 packets) ---
+            // A VIFcode i-bit (bit31) raises VIF1 STAT.INT (Vif.h). A runtime that ignores it
+            // never fires the VIF interrupt -> a game syncing on VIF-INT hangs.
+            boolean vifBuilder = !t.vifOpcodesBuilt.isEmpty() || !t.storedVifOpcodes.isEmpty()
+                || t.accessesVifCtrl || t.isMicrocodeUploader;
+            if(t.vifCodeIBit && vifBuilder) {
+                if(!r.tags.contains("VIF_INTERRUPT_IBIT")) {
+                    r.tags.add("VIF_INTERRUPT_IBIT"); vifInterruptCount++;
+                }
+                vifInterruptSites.add(new String[]{ nm, hex(r.address),
+                    "vifcode_i_bit;raises_VIF_STAT_INT;verify_interrupt_and_stall_handling" });
+            }
+
+            // --- Rule 246 SIF_RPC_TRANSPORT (general PS2, all DC2 IOP blockers) ---
+            // SBUS MSFLG/SMFLG handshake + SIF0(ch5)/SIF1(ch6) DMA. With no IOP the EE deadlocks
+            // polling SMFLG for a bit that never arrives (DC2 audio/memcard/cd RPC-wait class).
+            boolean sifDma = t.compositeMmioRangesHit.contains("DMA_CHAN_SIF0")
+                || t.compositeMmioRangesHit.contains("DMA_CHAN_SIF1");
+            if(t.touchesSbusFlags || t.touchesSbus || sifDma) {
+                t.isSifTransport = true;
+                if(!r.tags.contains("SIF_RPC_TRANSPORT")) {
+                    r.tags.add("SIF_RPC_TRANSPORT"); sifTransportCount++;
+                }
+                sifTransportSites.add(new String[]{ nm, hex(r.address),
+                    (t.touchesSbusFlags ? "SBUS_MSFLG/SMFLG" : "")
+                    + (t.touchesSbus ? ";SBUS_MSCOM/SMCOM" : "")
+                    + (sifDma ? ";SIF0/1_DMA" : "")
+                    + (t.isSyncWaitLoop ? ";POLL_WAIT(iop_dead_deadlock_risk)" : "") });
+            }
+
+            // --- Rule 247 CDVD_READ_COMPLETION_GATE (DC2 blocker #2, general) ---
+            // A backward-branch wait polling a sceCd* completion signal. DC2 level load streams
+            // DATA.DAT via sceCdRead (F55); a level that "cannot be loaded" can stall here.
+            boolean cdName = false;
+            for(String cn : t.calleeNames) { for(String s : CDVD_COMPLETION_NAMES) if(cn.contains(s)) { cdName = true; break; } if(cdName) break; }
+            if(!cdName) for(String s : CDVD_COMPLETION_NAMES) if(nm.contains(s)) { cdName = true; break; }
+            if(cdName && (t.isSyncWaitLoop || t.hasBackwardBranch)) {
+                t.isCdvdCompletionGate = true;
+                if(!r.tags.contains("CDVD_READ_COMPLETION_GATE")) {
+                    r.tags.add("CDVD_READ_COMPLETION_GATE"); cdvdGateCount++;
+                }
+                cdvdCompletionGates.add(new String[]{ nm, hex(r.address),
+                    "sceCd_completion_poll;level_load_stream_gate;mainloop_depth=" + t.mainLoopDepth });
+            }
+
+            // --- Rule 248 EE_CACHE_COHERENCY_OP (general PS2, DC2 scratchpad) ---
+            // cache/sync ops matter when the game DMAs code/data into RAM then reads/executes it
+            // before a coherency op (stale read otherwise). Flag them, esp. near a DMA kick.
+            if(t.hasCacheOp || t.hasSyncOp) {
+                boolean nearDma = chainKick || t.usesSPR || t.isDynamicCodeLoader;
+                if(!r.tags.contains("EE_CACHE_COHERENCY_OP")) {
+                    r.tags.add("EE_CACHE_COHERENCY_OP"); cacheOpCount++;
+                }
+                cacheOps.add(new String[]{ nm, hex(r.address),
+                    (t.hasCacheOp ? "cache" : "") + (t.hasCacheOp && t.hasSyncOp ? "+" : "")
+                    + (t.hasSyncOp ? "sync" : "") + (nearDma ? ";near_dma_or_loader" : "") });
+            }
+
+            // --- Rule 249 GS_CSR_SIGNAL_HANDSHAKE (general PS2, extends Rule 79) ---
+            // GIF A+D SIGNAL/FINISH/LABEL writes latch GS CSR + raise GS INT unless IMR masks;
+            // the handler acks via CSR. DC2 IMR=0x7F00 masks all (Rule 79 stubs its handlers).
+            boolean signalWrite = t.gsRegHits.contains("SIGNAL") || t.gsRegHits.contains("FINISH")
+                || t.gsRegHits.contains("LABEL");
+            boolean csrAccess = t.gsPrivRegHits.contains("CSR");
+            if(signalWrite || csrAccess) {
+                t.isGsCsrSignalSite = true;
+                if(!r.tags.contains("GS_CSR_SIGNAL_HANDSHAKE")) {
+                    r.tags.add("GS_CSR_SIGNAL_HANDSHAKE"); gsCsrCount++;
+                }
+                gsCsrSites.add(new String[]{ nm, hex(r.address),
+                    (t.gsRegHits.contains("SIGNAL") ? "SIGNAL" : "")
+                    + (t.gsRegHits.contains("FINISH") ? ";FINISH" : "")
+                    + (t.gsRegHits.contains("LABEL") ? ";LABEL" : "")
+                    + (csrAccess ? ";CSR_ack" : "")
+                    + ";DC2_IMR_masks_all(Rule79_stubbable)" });
+            }
+
+            // --- Rule 250 EE_TLB_MAPPING (general PS2, "absence is a finding") ---
+            if(t.writesTlb) {
+                if(!r.tags.contains("EE_TLB_MAPPING")) {
+                    r.tags.add("EE_TLB_MAPPING"); tlbWriterCount++;
+                }
+                tlbWriters.add(new String[]{ nm, hex(r.address),
+                    "tlb_write;custom_memory_mapping;flat_recompiler_hazard" });
+            }
+        }
+
+        println(String.format(
+            "  v19 (PCSX2 x3): INTC_DMAC_HANDLER=%d DMA_TAG_IRQ=%d VIF_IBIT=%d SIF_TRANSPORT=%d "
+          + "CDVD_GATE=%d CACHE_OP=%d TLB=%d GS_CSR=%d",
+            interruptHandlerCount, dmaTagIrqCount, vifInterruptCount, sifTransportCount,
+            cdvdGateCount, cacheOpCount, tlbWriterCount, gsCsrCount));
+    }
+
     // v15 Rule 194: fuzzy allocator-family membership for demangled/underscore variants
     // (operator new/delete, _r reentrant forms) not in the exact-name set.
     private static boolean isAllocFamilyName(String nm) {
@@ -11535,7 +12139,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(r.name != null && !r.name.isEmpty()) nameToAddr.putIfAbsent(r.name, r.address & 0xFFFFFFFFL);
         }
         String exportTs  = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date());
-        String exportVer = "DC2 enricher v17.1 (schema 16.1)";
+        String exportVer = "DC2 enricher v19 (schema 18.0)";
         int n = 0;
         for(FuncResult r : results) {
             if(monitor.isCancelled()) break;
@@ -11550,7 +12154,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     +"** · origin `"+r.origin+"`");
                 w.println();
                 // --- Export metadata (stale-export protection) ---
-                w.println("> schema_version `16.1` · elf_hash `"+elfHash+"` · global_pointer `"+hex(gpValue)
+                w.println("> schema_version `18.0` · elf_hash `"+elfHash+"` · global_pointer `"+hex(gpValue)
                     +"` · exported `"+exportTs+"` · enricher `"+exportVer+"`");
                 w.println(">");
                 w.println("> _If elf_hash / global_pointer differ from the current ELF, this doc is stale — re-run the enricher._");
@@ -11947,8 +12551,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
         PrintWriter w=utf8Writer(outFile);
         w.println("{");
-        w.println("  \"schema_version\": 16.1,");
-        w.println("  \"enricher_version\": \"DC2 enricher v17.1 (schema 16.1)\",");
+        w.println("  \"schema_version\": 18.0,");
+        w.println("  \"enricher_version\": \"DC2 enricher v19 (schema 18.0)\",");
         w.println("  \"export_timestamp\": \""
             +new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date())+"\",");
         w.println("  \"elf_hash\": \""+elfHash+"\",");
@@ -12084,6 +12688,26 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         w.println("    \"prmode_attr_writers\": "+prmodeAttrWriterCount+",");
         w.println("    \"texa_clamp_writers\": "+texaClampWriterCount+",");
         w.println("    \"ee_time_sources\": "+eeTimeSourceCount+",");
+        // v18 Rules 234-240 (G142-G172 perf-arc retrospective). recompile_coverage_gaps>0
+        // is the level-load "function not found" red flag; streamed_texture_pages flags
+        // poor texture-cache candidates.
+        w.println("    \"sprite_emitters\": "+spriteEmitterCount+",");
+        w.println("    \"sprite_group_order_deps\": "+spriteGroupOrderCount+",");
+        w.println("    \"recompile_coverage_gaps\": "+recompileCoverageGaps.size()+",");
+        w.println("    \"streamed_texture_pages\": "+streamedTexturePages.size()+",");
+        w.println("    \"presentation_fifo_bypass\": "+presentationFifoBypassCount+",");
+        w.println("    \"gpu_raster_eligible\": "+gpuRasterEligibleCount+",");
+        w.println("    \"gpu_raster_ineligible\": "+gpuRasterIneligibleCount+",");
+        // v19 Rules 243-250 (PCSX2 cross-check round 3). tlb_writers==0 confirms DC2 is flat;
+        // interrupt_handlers/sif_transport/cdvd_gates are the EE contracts a runtime must model.
+        w.println("    \"interrupt_handlers\": "+interruptHandlerCount+",");
+        w.println("    \"dma_tag_irq_sites\": "+dmaTagIrqCount+",");
+        w.println("    \"vif_interrupt_sites\": "+vifInterruptCount+",");
+        w.println("    \"sif_transport_sites\": "+sifTransportCount+",");
+        w.println("    \"cdvd_completion_gates\": "+cdvdGateCount+",");
+        w.println("    \"cache_ops\": "+cacheOpCount+",");
+        w.println("    \"tlb_writers\": "+tlbWriterCount+",");
+        w.println("    \"gs_csr_sites\": "+gsCsrCount+",");
         w.println("    \"ctor_field_writer\": "+ctorFieldWriterCount+",");
         w.println("    \"vtable_setter\": "+vtableSetterCount+",");
         w.println("    \"a0_passthrough_returner\": "+a0PassthroughCount+",");
@@ -12532,6 +13156,39 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         // Rule 232 EE_TIME_SOURCE_ROSTER (timer COUNT/MODE + COP0 Count readers - the
         // G141 pacing checklist: verify the runtime's clock model at these functions first).
         emitV13Roster(w, "ee_time_sources", eeTimeSources, "detail");
+        // ===== v18 rosters (Rules 234-240, G142-G172 perf-arc retrospective) =====
+        // Rule 234 GS_PRIM_SPRITE_EMITTER + prim-class census (G171: inline sprite raster was
+        // the dominant title cost, invisible to triangle-only defer/instrumentation).
+        emitV13Roster(w, "prim_class_emitters", primClassEmitters, "prim_classes");
+        // Rule 235 SPRITE_GROUP_ORDER_DEPENDENCY (compound 2D widgets, reorder-unsafe, G172).
+        emitV13Roster(w, "sprite_compound_widgets", spriteCompoundWidgets, "detail");
+        // Rule 236 RECOMPILE_TARGET_COVERAGE_GAP (in-code-range call/jump target with no
+        // function -> "Function at address 0xN not found"; DC2 blocker #2 = 0xe3dc70).
+        emitV13Roster(w, "recompile_coverage_gaps", recompileCoverageGaps, "note");
+        // Rule 237 TEXTURE_STREAM_CHURN (streamed vs static pages; poor cache candidates, G148/G149).
+        emitV13Roster(w, "streamed_texture_pages", streamedTexturePages, "detail");
+        // Rule 238 PRESENTATION_REGISTER_FIFO_BYPASS (present regs bypass the GS FIFO; MTGS/pipeline
+        // must fence/latch them, G150/G157 - general PS2).
+        emitV13Roster(w, "presentation_fifo_bypass", presentationFifoBypass, "detail");
+        // Rule 240 GPU_RASTER_ELIGIBILITY_CENSUS (blend/atest/paletted vs opaque; G161 - general PS2).
+        emitV13Roster(w, "gpu_raster_eligibility", gpuRasterEligibility, "eligibility");
+        // ===== v19 rosters (Rules 243-250, PCSX2 cross-check round 3) =====
+        // Rule 243 EE_INTERRUPT_HANDLER_REGISTRATION (INTC/DMAC handler dispatch - vsync/DMA callbacks).
+        emitV13Roster(w, "interrupt_handlers", interruptHandlers, "detail");
+        // Rule 244 DMA_TAG_IRQ_COMPLETION (DMAtag IRQ + CHCR.TIE tag-completion interrupt).
+        emitV13Roster(w, "dma_tag_irq_sites", dmaTagIrqSites, "detail");
+        // Rule 245 VIF_INTERRUPT_IBIT (VIFcode i-bit -> VIF STAT.INT).
+        emitV13Roster(w, "vif_interrupt_sites", vifInterruptSites, "detail");
+        // Rule 246 SIF_RPC_TRANSPORT (SBUS MSFLG/SMFLG + SIF0/1 DMA; IOP-dead poll deadlock class).
+        emitV13Roster(w, "sif_transport_sites", sifTransportSites, "detail");
+        // Rule 247 CDVD_READ_COMPLETION_GATE (sceCd* completion poll; DC2 level-load stream gate).
+        emitV13Roster(w, "cdvd_completion_gates", cdvdCompletionGates, "detail");
+        // Rule 248 EE_CACHE_COHERENCY_OP (cache/sync near DMA-to-RAM-then-execute).
+        emitV13Roster(w, "cache_ops", cacheOps, "detail");
+        // Rule 249 GS_CSR_SIGNAL_HANDSHAKE (SIGNAL/FINISH/LABEL + CSR ack; DC2 IMR masks all).
+        emitV13Roster(w, "gs_csr_sites", gsCsrSites, "detail");
+        // Rule 250 EE_TLB_MAPPING (custom TLB mapping; 0 = flat, the finding for DC2).
+        emitV13Roster(w, "tlb_writers", tlbWriters, "detail");
         w.println("  \"perf_cost_ranking\": [");
         {
             List<FuncResult> pr = new ArrayList<>();
@@ -13557,6 +14214,24 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             w.print("\"perf_static_cost\": "+t.perfStaticCost+", ");
             w.print("\"is_memcpy_shaped_loop\": "+t.isMemcpyShapedLoop+", ");
             w.print("\"is_idle_spin_yield_site\": "+t.isIdleSpinYieldSite+", ");
+            // v18 Rules 234-240 (G142-G172 perf-arc retrospective)
+            w.print("\"is_sprite_emitter\": "+t.isSpriteEmitter+", ");
+            if(!t.primClassesEmitted.isEmpty())
+                w.print("\"prim_classes_emitted\": "+jsonStrArray(new ArrayList<>(t.primClassesEmitted))+", ");
+            w.print("\"sprite_group_order_dependency\": "+t.spriteGroupOrderDependency+", ");
+            w.print("\"presentation_fifo_bypass\": "+t.presentationFifoBypass+", ");
+            if(t.gpuRasterEligibility != null)
+                w.print("\"gpu_raster_eligibility\": "+jsonString(t.gpuRasterEligibility)+", ");
+            // v19 Rules 243-250 (PCSX2 cross-check round 3)
+            w.print("\"is_interrupt_handler_reg\": "+t.isInterruptHandlerReg+", ");
+            w.print("\"dma_chcr_tie\": "+t.dmaChcrTie+", ");
+            w.print("\"vif_code_ibit\": "+t.vifCodeIBit+", ");
+            w.print("\"is_sif_transport\": "+t.isSifTransport+", ");
+            w.print("\"is_cdvd_completion_gate\": "+t.isCdvdCompletionGate+", ");
+            if(t.hasCacheOp || t.hasSyncOp)
+                w.print("\"cache_coherency_op\": true, ");
+            if(t.writesTlb) w.print("\"writes_tlb\": true, ");
+            w.print("\"is_gs_csr_signal_site\": "+t.isGsCsrSignalSite+", ");
             // v17.1 Rules 226-232 (PCSX2 cross-check round 2)
             w.print("\"is_dma_mfifo_user\": "+t.isDmaMfifoUser+", ");
             w.print("\"is_dma_stall_control_sync\": "+t.isDmaStallControlSync+", ");
