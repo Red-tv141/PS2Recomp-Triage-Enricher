@@ -1190,6 +1190,182 @@
 //        VIF_IBIT_RAISES_STAT_INT, IOP_RPC_SMFLG_POLL_DEADLOCK_CLASS,
 //        CDVD_LEVEL_LOAD_IS_sceCdRead_STREAM, DC2_IS_FLAT_NO_TLB_UCAB. Pure data.
 //
+// ================================================================
+// v20 RULES (252-260) - DC2 G173-G199 retrospective (the town/edit-map render arc:
+//                       scene-vtable headless repair, dbuff ZBUF Z-format seeding,
+//                       the still-open town-ADC/qw30 per-object VU1-data divergence,
+//                       DOF pyramid composite, TexAnime L->L scroll rects, the
+//                       direct-jal-bypasses-registerFunction probe gotcha) + general PS2.
+// Grounded in plans/phase-G{173..199}-fix-log.md + ROADMAP.MD + PS2_PROJECT_STATE.md.
+// The prior rule set stops at the G172 arc (v18) + PCSX2 cross-check round 3 (v19);
+// nothing G173-G199 taught was encodable until now.
+// ================================================================
+//
+// Rule 252 EABI_TRAILING_ARG_STUB / GS_STATE_COMPOSER (per-func + top-level
+//        `gs_value_composers`, general PS2): G194 ROOT (shipped). A runtime STUB that
+//        reads args 5+ from the o32 STACK is silently wrong on DC2 (MIPS-EABI: args 5-7 in
+//        $t0/$t1/$t2). `sceGsSetDefDBuff` read readStackU32(16/20/24) junk and seeded ZBUF
+//        Z32-instead-of-Z24 (+junk ztest) into the dbuff struct the game re-reads for ALL
+//        its own ZBUF composition -> every town/dungeon pass ran the wrong Z format for
+//        months with no crash. Generalises Rule 144 (EABI_ARG_T0) to args 6/7 ($t1/$t2) and
+//        pairs it with GS-value composition: a function that reads a trailing EABI reg arg
+//        AND composes a GS register value (writes ZBUF/FRAME/DISPFB/SCISSOR, or is a GS-setup
+//        SDK helper by name: sceGsSetDefDBuff/sceGsSetDefDrawEnv/sceGsSetDefDispEnv/
+//        SetDefDBuff/...) is a value-composing boundary the recompiler/runtime must decode
+//        REGS-FIRST. Emits per-func reads_eabi_trailing_arg + a `gs_value_composers` roster.
+//        ZBUF PSM legend: Z32=0x00 / Z24=0x01 / Z16=0x02 / Z16S=0x0A. Bug signature to grep in
+//        the runtime: readStackU32(16 (args 9+ at sp+0 ARE legitimately stack; only the
+//        16/20/24 o32 slots for args 5-8 are the defect). General PS2: any recompiled SDK stub
+//        that returns a HW-register value composed from >4 args.
+//
+// Rule 253 VU1_DATA_MEM_UPLOAD (per-func + top-level `vu_data_uploaders`, general PS2):
+//        G198/G199 (ACTIVE root, still open). The town/edit-map ADC divergence (runner draws
+//        ~55% of a batch real HW draws 0% of) roots in VU1 DATA MEMORY quadword 30 - PER-OBJECT
+//        UPLOADED data (splits 0x0/0x20 across map kicks; 0x0 on every title kick) that widens
+//        the FMAND cull mask - NOT microcode. Rules 217-220 disassemble VU MICROCODE (MPG cmd
+//        0x4A); nothing tracked the per-object VU1 DATA uploads that carry per-primitive
+//        cull/winding/ADC flags. Flags EE functions that write the VU data-memory range
+//        (ACCESSES_VU_DATAMEM) with UNPACK/VIF-delivery evidence but are NOT primarily a
+//        microcode (MPG) uploader -> the per-object geometry/flag sub-packet. THE active G200
+//        target: the qw30 producer is the dynamic per-object geometry sub-packet (self+0x1c
+//        vtable slot 0x40 off a CMapPiece), not a fixed render-info field (info+0x270 refuted
+//        G199). General PS2: any VU1 engine whose per-object draw control lives in uploaded
+//        DATA, not the shared microcode.
+//
+// Rule 254 DIRECT_JAL_ONLY_TARGET + probe_strategy (per-func, general PS2): G199 (cost ~1
+//        session). registerFunction overrides/probes are consulted ONLY for indirect jr $t9/
+//        jalr; a direct `jal <addr>` is a direct C++ call that BYPASSES dispatch. The
+//        g16_createpacket_probe (registerFunction) got 0/310 hits on the map route while a
+//        trace at the raw recompiled body's own entry got 310/310 - every map-piece call
+//        arrived via a direct-jal bypass. The traits already exist (calledViaDirectJal /
+//        calledViaJrT9); this promotes them to explicit GUIDANCE so a future instrumentation/
+//        override attempt is not silently inert. Emits per-func probe_strategy =
+//        registerFunction_ok (only indirect callers) / wrap_body_only (direct-jal-only ->
+//        registerFunction is INERT, wrap the jal TARGET or codegen) / dual (mixed - some sites
+//        bypass) / no_caller_evidence. Top-level `direct_jal_only_targets` rosters the
+//        wrap_body_only set. General PS2: THE recompiler instrumentation gotcha.
+//
+// Rule 255 LOCAL_TO_LOCAL_TRANSFER (per-func + top-level `local_to_local_transfers`, general
+//        PS2): G194 root #3 (documented, unfixed). TexAnime texture-scroll issues local->local
+//        (TRXDIR=2) BITBLT copies as `1xk` TRXREG rects where real HW does `64xk` + `64x(64-k)`
+//        wrap pairs - same "runtime-seeded field width" family as the G194 dbuff bug. Rules
+//        cover host->local upload (Rule 114) and local->host download (Rule 229 TRXDIR=1) but
+//        NOT local<->local (TRXDIR=2 = scroll/feedback copy). Detected as a BITBLTBUF macro
+//        sequence whose const-tracked TRXDIR value is 2 (local-to-local). Advisory - the wrap
+//        bug lives in the rect-WIDTH producer, so this names the copy site to audit the width
+//        source. General PS2: scrolling water / heat-haze / feedback textures.
+//
+// Rule 256 SCREEN_SPACE_FEEDBACK_PASS (per-func + top-level `screen_space_effect_passes`,
+//        general PS2): G194. The dark triangular wedges were the DepthOfField@0x17E320
+//        composite pass - a multi-level RTT pyramid that SAMPLES the just-rendered frame buffer
+//        as a texture (render-target-as-texture feedback), not phantom geometry. Detected as:
+//        a post-process name (DepthOfField/DOF/Bloom/Glare/Blur/Radial/MotionBlur/Composite/
+//        Effect) that also draws (writes TEX0 + a draw kick), OR a function that both writes
+//        FRAME and samples TEX0 in one body (feedback shape). Advisory. General PS2: bloom/
+//        glare/DOF/motion-blur - the classic "phantom geometry that is actually a post pass"
+//        misdiagnosis (bisect it with a skip lever before chasing the raster).
+//
+// Rule 257 SHARED_DEPTH_TEST_REQUIRED (per-func + top-level `shared_depth_test_sites`,
+//        general PS2, extends Rule 212): G195 durable fact. The runner rasterizer only
+//        real-Z-tests the costume-RTT + title-private-Z paths; every other target (normal
+//        town/dungeon fbp writes) is PAINTER'S-ORDER only -> back-over-front overdraw when the
+//        guest relies on ZTEST. Flags a draw that writes TEST (0x47/0x48, ZTST enabled) AND
+//        ZBUF into a display-buffer FRAME (not an RTT private-Z page) AND emits many overlapping
+//        batches (gif-tag inline builder / path3 / indirect dispatch) -> needs a real depth
+//        test, cannot be flattened to painter's order. General PS2: any depth-sorted opaque
+//        scene on a painter's-order fast path.
+//
+// Rule 258 PREEMPTIBLE_OVERRIDE_TARGET (per-func + top-level `preemptible_override_targets`,
+//        general PS2, extends Rule 188): G186. An override that calls a recompiled body DIRECTLY
+//        and relies on a register sentinel / post-call fixup ($ra=0 completion trick) is broken
+//        by back-edge preemption - the yield unwinds the override's C++ frame mid-call, the
+//        sentinel leaks into the resumed guest chain, pc-zero recovery restores PC but not $sp
+//        -> stack corruption -> "Function at address <garbage> not found" at a DATA address
+//        (one was &MainScene). Flags a function that is BOTH back-edge-preemptible (large body,
+//        terminal indirect flow / frame-resume risk) AND a direct-jal override target. Fix
+//        pattern: wrap the direct call in g_dc2PreemptSuppressDepth ++/-- (G57/G186) or make it
+//        resume-aware; never assume one-shot completion. General PS2: any cooperative-preemption
+//        recompiler with C++ override shims around recompiled bodies.
+//
+// Rule 259 HEADLESS_INIT_VTABLE_CONSUMER (per-func tag + top-level `headless_vtable_hazards`,
+//        general PS2, refines Rules 141/186): G193 (ROOT-CAUSED + FIXED - first-ever town 3D
+//        render). __sinit_mainloop never runs headless -> MainScene+0x10548 CScene-vtable ptr =
+//        0 -> EditInit's scene->Initialize() VIRTUAL DISPATCH silently no-ops -> camera count 0
+//        -> all AssignCamera fail -> zero view matrix -> every map part frustum-culled (the G127
+//        mechanism) -> flat blue. Rule 186 catches globals BRANCHED-ON whose only writer is a
+//        __sinit; this is the vtable-SLOT variant: a vtable installed into a global object only
+//        by an uncalled __sinit (STATIC_INIT_VTABLE_INSTALLER + UNCALLED_STATIC_INIT), whose
+//        slot is later consumed by a virtual dispatch on a non-__sinit init path. Fix = write
+//        the vtable ptr the __sinit should have set (idempotent) at the consumer's init entry
+//        (F50.4 dungeon / G193 town EditInit@0x1A9F40). Emits the uncalled-static-init vtable
+//        installers cross-referenced with the class-registry virtual-draw consumers. General
+//        PS2: every C++ engine with global polymorphic scene objects + incomplete headless
+//        static-init coverage.
+//
+// Rule 260 G173-G199 ROSTER/INVARIANT refresh + SCHEMA_VERSION: 19.0 (v20 adds Rules 252-260).
+//        DC2_RUNTIME_INVARIANTS += SCENE_VTABLE_NEEDS_HEADLESS_REPAIR (G193),
+//        DBUFF_ZBUF_IS_Z24_NOT_Z32_EABI (G194), TOWN_ADC_DIVERGENCE_IS_DATA_NOT_CODE (G196-G199
+//        qw30), MAP_SHARES_SKINNED_VU1_PROGRAM (G197 startPC=0x10), RASTERIZER_ZTESTS_ONLY_RTT
+//        (G195), DIRECT_JAL_BYPASSES_REGISTERFUNCTION (G199), DOF_PYRAMID_IS_A_POST_PASS (G194).
+//        DC2_KNOWN_FUNCTION_ADDRESSES += EditInit@0x1A9F40, DepthOfField@0x17E320,
+//        DrawSub__9CMapPiece / __8CEditMap@0x1B4130, CreateRenderInfoPacket motion-MDT caller
+//        @0x28a660. Pure data.
+//
+// ================================================================
+// v21 RULES (261-266) - PCSX2 GS pixel-pipeline cross-check round 4
+// (D:\ps2r\pcsx2-master\pcsx2\GS\GSRegs.h GIF_A_D_REG enum + GS blend/pixel pipeline).
+// The prior GS A+D detectors cover PRIM/RGBAQ/XYZ/TEX0/TEX1/CLAMP/ZBUF/FRAME/DISPFB/
+// ALPHA/TEST/PRMODE/TEXA/XYOFFSET/BITBLTBUF - but the REMAINING pixel-pipeline attribute
+// regs had NO detector (they fell through to gsRegHits only). G178's own census
+// (plans/phase-G178-fix-log.md) names PABE/DATE/FBA/fbmsk as the GPU-raster eligibility +
+// blend-correctness axes; G174 found a CLUT/TEX0 state write racing the pipeline FIFO the
+// same way the presentation regs did (Rule 238). A software rasterizer must honor each.
+// ================================================================
+//
+// Rule 261 GS_BLEND_COLCLAMP_CONTRACT (per-func + top-level `blend_colclamp_writers`,
+//        general PS2): GS COLCLAMP (A+D 0x46). The PS2 blend unit computes
+//        (A-B)*C>>7+D per channel; COLCLAMP=1 CLAMPS the result to [0,255], COLCLAMP=0 lets
+//        it WRAP mod 256 (deliberate for some additive/subtractive passes). A software
+//        rasterizer that always clamps (or always wraps) is wrong on the other mode - a
+//        silent per-pixel colour divergence. Flags COLCLAMP setters (paired with the ALPHA
+//        0x42/0x43 blend-formula writer already caught by Rule 240). General PS2.
+//
+// Rule 262 GS_PER_PIXEL_ALPHA_CONTRACT (per-func + top-level `per_pixel_alpha_writers`,
+//        general PS2): PABE (A+D 0x49) = blend ONLY where the source alpha MSB is set
+//        (per-pixel alpha blend enable); FBA_1/2 (0x4a/0x4b) = force the framebuffer alpha
+//        MSB (alpha correction, so dest-alpha tests behave); DATE/DATM = a TEST-reg (0x47/
+//        0x48) bit that draws only where DEST alpha matches (a masking primitive). All three
+//        silently drop (over-draw / wrong mask) if the rasterizer ignores them. G178's title
+//        census had PABE=0/DATE=0/FBA=0 but town/dungeon/menu are untested. Flags PABE/FBA
+//        writers and notes when TEST is co-written (verify DATE/DATM). General PS2.
+//
+// Rule 263 GS_DITHER_SCANMSK_CONTRACT (per-func + top-level `dither_scanmsk_writers`,
+//        general PS2): DIMX (A+D 0x44, the 4x4 dither matrix) + DTHE (0x45, dither enable) =
+//        ordered dither on CT16 output; SCANMSK (0x22) = even/odd scanline draw mask (an
+//        interlace tool - DC2 blocker #4 interlace/field jitter); FOGCOL (0x3d) = the colour
+//        FOG blends toward. Cosmetic but visible; a mis-handled SCANMSK shifts interlaced
+//        fields. Flags the setters so an interlace/banding bug routes to these regs. General PS2.
+//
+// Rule 264 GS_SCISSOR_WRITER (per-func + top-level `gs_scissor_writers`, general PS2, pairs
+//        Rule 213): SCISSOR_1/2 (A+D 0x40/0x41). The PS2 GS does NO triangle/near-plane/
+//        guard-band CLIPPING (Rule 213 GS_NO_HW_CLIP_MANIFEST) - it only SCISSORS. SCISSOR is
+//        the sole hardware clip rectangle; a stale scissor left from a prior RTT scope leaks
+//        into the next scene (G79 render-target/scissor leak class). Flags every scissor
+//        setter so a "geometry clipped/unclipped wrong" bug routes to the scissor state, not
+//        the (absent) triangle clipper. General PS2.
+//
+// Rule 265 GS_STATE_FIFO_BYPASS_RISK (per-func + top-level `gs_state_fifo_bypass_sites`,
+//        general PS2, extends Rule 238): G174. A CLUT/TEX0-adjacent GS-state write raced the
+//        G157 pipeline the SAME way the 6 presentation registers did before G157 fenced them
+//        (Rule 238 PRESENTATION_REGISTER_FIFO_BYPASS): the title rock's TEX0/CLUT state
+//        rendered wrong-colour for a few frames under DC2_G157_PIPELINE=1 because the write
+//        bypassed the GifArbiter FIFO. Any multithreaded/pipelined GS runtime must fence/latch
+//        TEX0 + CLUT writes in EE program order, not just the presentation regs. Flags TEX0/
+//        CLUT-cache writers that also emit draws (gif-tag / path3 / BITBLTBUF). General PS2:
+//        the most reusable MTGS/pipeline lesson after Rule 238.
+//
+// Rule 266 SCHEMA_VERSION: 19.1 (v21 adds Rules 261-266; GS pixel-pipeline attribute census).
+//
 // PIPELINE (v11.3): the script now asks "FIRST run for this ELF?" up front:
 //   - YES -> full pipeline. Delegates the Step-1 export to ExportPS2Functions via runScript,
 //            then enriches; emits csv + assembly + decompiled + flowchart + unified TOML + triage_map.json.
@@ -2049,6 +2225,16 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         { "IOP_RPC_SMFLG_POLL_DEADLOCK_CLASS","PCSX2 Hw.h SBUS MSCOM(0x1000F200)/SMCOM(0x1000F210)/MSFLG(0x1000F220)/SMFLG(0x1000F230) + EE SIF DMA ch5(SIF0 0x1000C000 IOP->EE)/ch6(SIF1 0x1000C400 EE->IOP); Sif.h sifData EE/IOP dual-tag + sub-QW junk-fill (an IOP transfer <1QW reuses the prior QW / EE tag). MSFLG/SMFLG are the EE<->IOP handshake flags. With NO IOP CPU (DC2 blocker #1) the EE can deadlock polling SMFLG for a bit the IOP never sets - the audio(#3)/memcard(#4)/cd-RPC wait class (masked today by DC2_DISABLE_EVENT_SKIP). Statically: SIF_RPC_TRANSPORT (flags the poll sites so an IOP-dead stall routes to the transport, not game logic)." },
         { "CDVD_LEVEL_LOAD_IS_sceCdRead_STREAM","DC2 blocker #2 (some levels won't load) has TWO static failure modes: (a) a missing recompiled function at an in-range call/jump target -> 'Warning: Function at address 0xN not found' (0xe3dc70; Rule 236 RECOMPILE_TARGET_COVERAGE_GAP); (b) a CDVD read-completion WAIT that never signals if the runtime's CDVD model returns busy/never-ready. DC2 streams DATA.DAT via sceCdRead + SearchFile@0x148850 (F55) and polls sceCdSync/sceCdDiskReady/sceCdGetError. Analog to the F63/F64 audio-gated stall (Rule 170). Statically: CDVD_READ_COMPLETION_GATE." },
         { "DC2_IS_FLAT_NO_TLB_UCAB","PCSX2 models the EE TLB (tlbwi/tlbwr + COP0 EntryHi/Lo/PageMask) and the uncached-accelerated segment. DC2 is expected to be a FLAT single ELF that installs no custom TLB entries (tlb_writers statistic 0 confirms the flat-address recompiler assumption is safe - like overlay_loaders=0 for Rule 150). A non-zero tlb_writers count is a red flag that the runtime's flat memory model would break a remapped region. Statically: EE_TLB_MAPPING. Also: GS CSR SIGNAL/FINISH handshake is stubbable for DC2 (IMR=0x7F00 masks all GS IRQs, Rule 79/GS_CSR_SIGNAL_HANDSHAKE) but a game leaving GS IRQs unmasked needs it." },
+        // ===== v20: G173-G199 town/edit-map render-arc invariants (Rules 252-260) =====
+        { "SCENE_VTABLE_NEEDS_HEADLESS_REPAIR","G193 (ROOT-CAUSED + FIXED, first-ever town 3D render): __sinit_mainloop never runs headless -> MainScene+0x10548 CScene-vtable ptr = 0 -> EditInit@0x1A9F40's scene->Initialize() virtual dispatch (asm 0x1AA938) silently no-ops -> camera count 0 -> all 5 AssignCamera fail -> zero view matrix -> every map part frustum-culled (the G127 mechanism) -> flat blue. F50.4 repaired the vtable on the DUNGEON route only; G193 applies the same idempotent repair at EditInit entry (default-ON, DC2_G193_NO_SCENEVT_FIX=1 kills). Both town routes now render the full textured forest scene. Statically: HEADLESS_INIT_VTABLE_CONSUMER (Rule 259) - a global object's vtable installed only by an uncalled __sinit and consumed by a virtual dispatch on a non-__sinit init path." },
+        { "DBUFF_ZBUF_IS_Z24_NOT_Z32_EABI","G194 (ROOT-CAUSED + FIXED): sceGsSetDefDBuff read its args 5-7 from the o32 STACK (readStackU32 16/20/24) instead of the MIPS-EABI regs $t0/$t1/$t2 -> seeded ZBUF Z32 (psm 0x30) instead of Z24 (psm 0x01) + junk ztest into the dbuff struct the game re-reads for every per-material ZBUF write -> every town/dungeon pass ran the wrong Z format vs real HW for months with no crash. Fixed via a regs-first trailing-args decoder (decodeGsTrailingArgs2/3). DURABLE: when a runtime-composed GS value diverges from a real-HW dump but the guest code is identical, audit the composing STUB's arg reads against EABI first; grep runtime stubs for readStackU32(16 as the bug signature (args 9+ at sp+0 ARE legitimately stack). Statically: EABI_TRAILING_ARG_STUB / GS_STATE_COMPOSER (Rule 252)." },
+        { "TOWN_ADC_DIVERGENCE_IS_DATA_NOT_CODE","G196-G199 (ACTIVE, still open): the town/edit-map DrawSub__9CMapPiece->CObjectFrame->mgDraw->mgCFrame->mgCVisualMDT batch draws ~55% (284/512) of geometry real HW draws 0% of (map_0.gs freeze is 100% ADC=1). NOT a GS front-end bug - the runner's vertexKick correctly honors whatever ADC bit it is given (G196 read PCSX2's GSState::VertexKick end-to-end). The guest's own visibility/cull decision computes a wrong ADC. Localized (G197) to the SHARED VU1 model program's FMAND/OPMSUB/IBEQ gate at pc 0x20a0-0x2128 (same startPC=0x10 program the title/costume use); MAC-pipe depth ruled out as the fix (depth=4 is architecturally correct per PCSX2 VUops.cpp; depth=3 recreates the pre-G138 blue-void). ROOT is DATA: VU1 data-memory quadword 30 (feeds VI8 via ILW.x VI8,30(VI0) at 0x2058, widens the FMAND mask) is 0x0 on all sampled TITLE kicks but splits 0x0/0x20 on sampled MAP kicks -> per-object UPLOADED data (not a resident constant, not info+0x270 which was refuted G199). G200 target: the qw30 producer is the dynamic per-object geometry sub-packet (self+0x1c vtable slot 0x40 off a CMapPiece), instrument its OWN recomp/*.cpp body directly. Statically: VU1_DATA_MEM_UPLOAD (Rule 253)." },
+        { "MAP_SHARES_SKINNED_VU1_PROGRAM","G197/G199: town CMapPiece draws use the EXACT SAME startPC=0x10 model VU1 microcode as the title/costume/skinned-character draws (DC2_G197_VUDUMP confirmed), not a separate map program - the divergence is a data-dependent outcome of shared, load-bearing code. Map and skinned geometry reach CreateRenderInfoPacket@0x1404d0 via the same C++ entry (the motion-MDT wrapper @0x28a660) but by a DIRECT jal that bypasses the g16_createpacket_probe registerFunction wrapper (0/310 there vs 310/310 at the raw body entry). Do NOT retune the shared VU1 program to fix a map-only symptom - it will regress the title (G197)." },
+        { "RASTERIZER_ZTESTS_ONLY_RTT","G195: the runner rasterizer only real-Z-tests the costume-RTT + title-private-Z paths; every other target (normal town/dungeon fbp writes) is PAINTER'S-ORDER only, even when the guest's GS state has ZTST=GEQUAL + a live ZBUF. A depth-sorted opaque scene relying on the real HW Z test overdraws back-over-front on this fast path. Statically: SHARED_DEPTH_TEST_REQUIRED (Rule 257)." },
+        { "DIRECT_JAL_BYPASSES_REGISTERFUNCTION","G199 (durable recompiler gotcha, cost ~1 session): registerFunction overrides/probes are consulted ONLY for indirect jr $t9/jalr dispatch; a direct `jal <addr>` is a direct C++ call that bypasses the override table entirely. Any instrumentation/override on a direct-jal-only target is silently INERT (0 hits) - wrap the jal TARGET's recompiled body or fix in codegen, not registerFunction. Statically: DIRECT_JAL_ONLY_TARGET + probe_strategy (Rule 254)." },
+        { "DOF_PYRAMID_IS_A_POST_PASS","G194: the dark triangular wedges over the town were the DepthOfField@0x17E320 composite pass - a multi-level RTT pyramid that samples the just-rendered frame as a texture (bisect-proven: DC2_G194_SKIP_DOF=1 removes them; all DOF inputs/geometry/textures verified identical to real HW -> the residual root is raster-semantics/pyramid-content level, G195 #1). DURABLE: a screen-space post pass (bloom/glare/DOF) reads the render target as a texture and can look like phantom geometry; bisect it with a skip lever before chasing the rasterizer. Statically: SCREEN_SPACE_FEEDBACK_PASS (Rule 256)." },
+        // ===== v21: PCSX2 GS pixel-pipeline attribute contracts (Rules 261-266) =====
+        { "GS_PIXEL_PIPELINE_CONTRACTS","PCSX2 GSRegs.h GIF_A_D_REG: the GS pixel pipeline has attribute regs beyond FRAME/ZBUF/TEX0/ALPHA/TEST that a software rasterizer must honor and no prior rule flagged: COLCLAMP(0x46) clamps the blend result to [0,255] when 1 else WRAPS mod 256; PABE(0x49) blends only where source-alpha MSB set (per-pixel); FBA_1/2(0x4a/0x4b) force the fb-alpha MSB (alpha correction); DATE/DATM (a TEST-reg bit) draws only where dest alpha matches (masking); DIMX(0x44)+DTHE(0x45) ordered dither on CT16; SCANMSK(0x22) even/odd scanline draw mask (interlace, DC2 blocker #4); FOGCOL(0x3d) fog colour; SCISSOR_1/2(0x40/0x41) the ONLY GS clip (Rule 213 - no triangle/near-plane clip). G178's title census had PABE=0/DATE=0/FBA=0/fbmsk=0 but town/dungeon/menu are untested. Statically: Rules 261-264 roster each writer. Also G174: TEX0/CLUT state writes must be fenced in EE program order under a pipelined/MTGS runtime the same way the presentation regs were (Rule 238/265 GS_STATE_FIFO_BYPASS_RISK)." },
     };
 
     // v9 Rule 134: pre-computed forward callgraphs to bullseye sinks. Each
@@ -3297,6 +3483,25 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         boolean hasSyncOp = false;                   // Rule 248 (sync.l/sync.p)
         boolean writesTlb = false;                   // Rule 250 (tlbwi/tlbwr/tlbr/tlbp)
         boolean isGsCsrSignalSite = false;           // Rule 249 (GS SIGNAL/FINISH/LABEL + CSR)
+        // ===== v20 (Rules 252-259): G173-G199 town/edit-map render-arc retrospective =====
+        boolean readsEabiTrailingArg = false;        // Rule 252 (reads $t1/$t2 = EABI arg 6/7 before def)
+        boolean isGsValueComposer = false;           // Rule 252 (trailing EABI arg + composes a GS reg value)
+        boolean isVuDataUploader = false;            // Rule 253 (per-object VU1 DATA-mem upload, not microcode)
+        boolean trxdirLocalToLocal = false;          // Rule 255 (BITBLT TRXDIR const value == 2 = L<->L copy)
+        boolean isScreenSpaceFeedback = false;       // Rule 256 (samples the rendered frame as a texture)
+        boolean isSharedDepthTestSite = false;       // Rule 257 (overlapping opaque batches needing a real Z test)
+        boolean isPreemptibleOverrideTarget = false; // Rule 258 (preemptible body + direct-jal override target)
+        String  probeStrategy = null;                // Rule 254 (registerFunction_ok / wrap_body_only / dual / no_caller_evidence)
+        boolean isHeadlessVtableHazard = false;      // Rule 259 (vtable installed only by an uncalled __sinit)
+        // ===== v21 (Rules 261-265): PCSX2 GS pixel-pipeline attribute census (round 4) =====
+        boolean writesColclampReg = false;           // Rule 261 (COLCLAMP 0x46 - blend clamp vs 8-bit wrap)
+        boolean writesPabeReg = false;               // Rule 262 (PABE 0x49 - per-pixel alpha blend)
+        boolean writesFbaReg = false;                // Rule 262 (FBA_1/2 0x4a/0x4b - fb alpha correction bit)
+        boolean writesDitherReg = false;             // Rule 263 (DIMX 0x44 / DTHE 0x45 - dither)
+        boolean writesScanmskReg = false;            // Rule 263 (SCANMSK 0x22 - interlace scan mask)
+        boolean writesFogcolReg = false;             // Rule 263 (FOGCOL 0x3d + FOG - fog)
+        boolean writesScissorReg = false;            // Rule 264 (SCISSOR_1/2 0x40/0x41 - the only GS clip)
+        boolean isGsStateFifoBypassRisk = false;     // Rule 265 (TEX0/CLUT write a pipelined GS must fence)
     }
 
     // =========================================================
@@ -3645,6 +3850,36 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     private static final String[] CDVD_COMPLETION_NAMES = {
         "sceCdSync","sceCdDiskReady","sceCdGetError","sceCdStatus","sceCdRead","sceCdSeek",
         "sceCdGetToc","sceCdReadClock","sceCdSearchFile","sceCdComplete" };
+    // ===== v20 counters + rosters (Rules 252-259, G173-G199 town/edit-map arc) =====
+    private int gsValueComposerCount=0, vuDataUploaderCount=0, localToLocalCount=0;
+    private int screenSpaceFeedbackCount=0, sharedDepthTestCount=0, preemptibleOverrideCount=0;
+    private int directJalOnlyCount=0, headlessVtableHazardCount=0;
+    private final List<String[]> gsValueComposers       = new ArrayList<>(); // Rule 252
+    private final List<String[]> vuDataUploaders        = new ArrayList<>(); // Rule 253
+    private final List<String[]> directJalOnlyTargets   = new ArrayList<>(); // Rule 254
+    private final List<String[]> localToLocalTransfers  = new ArrayList<>(); // Rule 255
+    private final List<String[]> screenSpaceEffectPasses= new ArrayList<>(); // Rule 256
+    private final List<String[]> sharedDepthTestSites   = new ArrayList<>(); // Rule 257
+    private final List<String[]> preemptibleOverrideTargets = new ArrayList<>(); // Rule 258
+    private final List<String[]> headlessVtableHazards  = new ArrayList<>(); // Rule 259
+    // ===== v21 counters + rosters (Rules 261-265, PCSX2 GS pixel-pipeline census) =====
+    private int blendColclampCount=0, perPixelAlphaCount=0, ditherScanmskCount=0;
+    private int gsScissorWriterCount=0, gsStateFifoBypassCount=0;
+    private final List<String[]> blendColclampWriters   = new ArrayList<>(); // Rule 261
+    private final List<String[]> perPixelAlphaWriters   = new ArrayList<>(); // Rule 262
+    private final List<String[]> ditherScanmskWriters   = new ArrayList<>(); // Rule 263
+    private final List<String[]> gsScissorWriters       = new ArrayList<>(); // Rule 264
+    private final List<String[]> gsStateFifoBypassSites = new ArrayList<>(); // Rule 265
+    // Rule 252: GS-value-composing SDK setup helpers (compose FRAME/ZBUF/DISPFB from >4 args;
+    // args 5-7 come EABI regs $t0/$t1/$t2, not the o32 stack - the G194 dbuff Z24/Z32 bug).
+    private static final String[] GS_SETUP_HELPER_NAMES = {
+        "sceGsSetDefDBuff","sceGsSetDefDrawEnv","sceGsSetDefDispEnv","sceGsSetDefLoadImage",
+        "SetDefDBuff","SetDefDrawEnv","SetDefDispEnv","sceGsSetDefClear","mgSetDrawEnv",
+        "mgSetDispEnv","sceGsPutDrawEnv","sceGsSetDrawEnv2" };
+    // Rule 256: screen-space post-process names (RTT pyramid / feedback; G194 DepthOfField).
+    private static final String[] SCREEN_SPACE_EFFECT_NAMES = {
+        "DepthOfField","DepthField","DOF","Bloom","Glare","Blur","RadialBlur","MotionBlur",
+        "Composite","PostEffect","ScreenEffect","Distortion","HeatHaze","Corona","LensFlare" };
     // Rule 153/220/221: runtime checkout root actually used for the roster scrape.
     private File runtimeRootDir = null;
 
@@ -5144,6 +5379,17 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             // DMAtag-IRQ+TIE completion, VIFcode i-bit, SIF RPC transport, CDVD read-completion
             // gate (2nd level-load failure mode), EE cache-coherency ops, GS CSR handshake, TLB.
             applyV19Rules(results);
+            // v20 Rules 252-260 (G173-G199 town/edit-map arc): EABI-trailing-arg GS-value
+            // composer (the G194 dbuff Z24/Z32 root), per-object VU1 DATA-mem upload (the active
+            // G198/G199 qw30 ADC divergence), direct-jal-only probe strategy (the G199 gotcha),
+            // local<->local scroll transfers, screen-space feedback passes, shared-depth-test
+            // sites, preemptible override targets, headless vtable hazards.
+            applyV20Rules(results);
+            // v21 Rules 261-266 (PCSX2 GS pixel-pipeline cross-check round 4): the remaining
+            // pixel-pipe attribute regs no rule flagged (COLCLAMP blend clamp/wrap, PABE/FBA
+            // per-pixel alpha, DIMX/DTHE dither, SCANMSK interlace, FOGCOL, SCISSOR) + the
+            // CLUT/TEX0 FIFO-bypass risk generalised from G174.
+            applyV21Rules(results);
             scanVuMicrocodePrograms(results);
             scanGiftagTemplates();
             scanRuntimeLeverRegistry();
@@ -8655,20 +8901,26 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
     // signal that any runtime/CRT override must read $t0, not a stack slot.
     private void detectEabiArgT0(Function func, FuncTraits traits) {
         InstructionIterator it = currentProgram.getListing().getInstructions(func.getBody(), true);
-        int scanned = 0; boolean t0Defined = false;
+        int scanned = 0;
+        boolean t0Defined = false, t1Defined = false, t2Defined = false;
+        // v20 Rule 252: also track $t1/$t2 (EABI args 6/7). A stub that reads a
+        // trailing EABI reg arg before defining it but is DECODED from the o32 stack
+        // in the runtime is the G194 sceGsSetDefDBuff Z24/Z32 bug class.
         while(it.hasNext() && scanned < 24) {
             Instruction inst = it.next(); scanned++;
             for(Object o : inst.getInputObjects()) {
-                if(o instanceof ghidra.program.model.lang.Register &&
-                   ((ghidra.program.model.lang.Register)o).getName().equalsIgnoreCase("t0")) {
-                    if(!t0Defined) traits.readsEabiArgT0 = true;
-                }
+                if(!(o instanceof ghidra.program.model.lang.Register)) continue;
+                String rn = ((ghidra.program.model.lang.Register)o).getName();
+                if("t0".equalsIgnoreCase(rn) && !t0Defined) traits.readsEabiArgT0 = true;
+                if("t1".equalsIgnoreCase(rn) && !t1Defined) traits.readsEabiTrailingArg = true;
+                if("t2".equalsIgnoreCase(rn) && !t2Defined) traits.readsEabiTrailingArg = true;
             }
-            if(traits.readsEabiArgT0) break;
             Object[] dop = inst.getOpObjects(0);
             String dr = (dop!=null && dop.length>0 && dop[0] instanceof ghidra.program.model.lang.Register)
                 ? ((ghidra.program.model.lang.Register)dop[0]).getName() : null;
             if("t0".equalsIgnoreCase(dr)) t0Defined = true;
+            if("t1".equalsIgnoreCase(dr)) t1Defined = true;
+            if("t2".equalsIgnoreCase(dr)) t2Defined = true;
         }
     }
 
@@ -9355,6 +9607,25 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             // is not statically proven here; the readback post-pass requires an
             // additional BUSDIR / VIF-CTRL signal before flagging.
             if(adRegIdsStored.contains(0x53L)) traits.storesTrxdirLocalToHost = true;
+            // v20 Rule 255: TRXDIR (0x53) stored AND a const value 2 tracked = local<->local
+            // (TRXDIR=2) copy (texture scroll/feedback; G194 TexAnime L->L). Raw signal only;
+            // gated on an independent BITBLTBUF-macro shape in applyV20Rules to cut false hits.
+            if(adRegIdsStored.contains(0x53L) && allConsts.contains(2L))
+                traits.trxdirLocalToLocal = true;
+            // v21 Rules 261-264: the remaining GS PIXEL-PIPELINE attribute regs a software
+            // rasterizer must honor, verified against PCSX2 GSRegs.h GIF_A_D_REG enum. None had
+            // a detector - they fell through to gsRegHits only. (G178 census named PABE/DATE/FBA/
+            // fbmsk as the GPU-raster eligibility + blend-correctness axes.)
+            if(adRegIdsStored.contains(0x46L)) traits.writesColclampReg = true;   // Rule 261 COLCLAMP
+            if(adRegIdsStored.contains(0x49L)) traits.writesPabeReg = true;       // Rule 262 PABE
+            if(adRegIdsStored.contains(0x4AL) || adRegIdsStored.contains(0x4BL))
+                traits.writesFbaReg = true;                                       // Rule 262 FBA_1/2
+            if(adRegIdsStored.contains(0x44L) || adRegIdsStored.contains(0x45L))
+                traits.writesDitherReg = true;                                    // Rule 263 DIMX/DTHE
+            if(adRegIdsStored.contains(0x22L)) traits.writesScanmskReg = true;    // Rule 263 SCANMSK
+            if(adRegIdsStored.contains(0x3DL)) traits.writesFogcolReg = true;     // Rule 263 FOGCOL
+            if(adRegIdsStored.contains(0x40L) || adRegIdsStored.contains(0x41L))
+                traits.writesScissorReg = true;                                   // Rule 264 SCISSOR_1/2
             // v18 Rule 240: ALPHA (0x42) blend + TEST_1/2 (0x47/0x48) alpha-test writers —
             // the GPU-raster eligibility axes (G161: title tris all had blend AND atest).
             if(adRegIdsStored.contains(0x42L)) traits.writesAlphaBlendReg = true;
@@ -11305,6 +11576,242 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             cdvdGateCount, cacheOpCount, tlbWriterCount, gsCsrCount));
     }
 
+    // =========================================================
+    // v20 Rules 252-259: DC2 G173-G199 town/edit-map render-arc retrospective + general PS2.
+    // Everything the recomp project learned after the ref/ was generated (G173-G199 fix logs).
+    // Tags/counters/rosters derived from already-computed traits (no new instruction scan
+    // beyond the Rule 252 t1/t2 extension + the Rule 255 TRXDIR value signal set at scan time).
+    // =========================================================
+    private void applyV20Rules(List<FuncResult> results) {
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // --- Rule 252 EABI_TRAILING_ARG_STUB / GS_STATE_COMPOSER (G194 root, general PS2) ---
+            // A GS-setup SDK helper (by name) OR any function that reads a trailing EABI reg arg
+            // ($t0/$t1/$t2) AND composes a GS register value (ZBUF/FRAME/DISPFB/SCISSOR). The
+            // recompiler/runtime MUST decode args 5-7 REGS-FIRST, not from o32 stack slots.
+            boolean gsSetupName = false;
+            for(String s : GS_SETUP_HELPER_NAMES) if(nm.contains(s)) { gsSetupName = true; break; }
+            boolean composesGsValue = t.writesZbufReg || t.writesFrameReg || t.writesDispfbReg;
+            boolean trailingArg = t.readsEabiArgT0 || t.readsEabiTrailingArg;
+            if(gsSetupName || (trailingArg && composesGsValue)) {
+                t.isGsValueComposer = true;
+                if(!r.tags.contains("GS_STATE_COMPOSER")) {
+                    r.tags.add("GS_STATE_COMPOSER"); gsValueComposerCount++;
+                }
+                StringBuilder d = new StringBuilder();
+                if(gsSetupName) d.append("gs_setup_sdk_helper");
+                if(t.readsEabiArgT0) d.append(d.length()>0?";":"").append("reads_t0_arg5");
+                if(t.readsEabiTrailingArg) d.append(d.length()>0?";":"").append("reads_t1_t2_arg6_7");
+                if(t.writesZbufReg) d.append(";composes_ZBUF(verify_Z24=psm0x01_not_Z32=psm0x30)");
+                if(t.writesFrameReg) d.append(";composes_FRAME");
+                if(t.writesDispfbReg) d.append(";composes_DISPFB");
+                d.append(";decode_args5-7_EABI_regs_first_not_o32_stack");
+                gsValueComposers.add(new String[]{ nm, hex(r.address), d.toString() });
+            }
+
+            // --- Rule 253 VU1_DATA_MEM_UPLOAD (G198/G199 active root, general PS2) ---
+            // Writes the VU DATA-memory range with VIF-UNPACK/DMA delivery evidence but is NOT a
+            // microcode (MPG) uploader = the per-object geometry/flag sub-packet (the qw30 cull/
+            // ADC carrier). Distinct from Rule 217-220 (which disassemble microcode).
+            boolean unpackDelivery = t.vifOpcodesBuilt.contains("UNPACK")
+                || t.storedVifOpcodes.contains("UNPACK") || t.programsSprDma
+                || t.isVu1DoubleBufferFramer || t.accessesVifCtrl;
+            if(t.accessesVuDatamem && !t.isMicrocodeUploader && unpackDelivery) {
+                t.isVuDataUploader = true;
+                if(!r.tags.contains("VU1_DATA_MEM_UPLOAD")) {
+                    r.tags.add("VU1_DATA_MEM_UPLOAD"); vuDataUploaderCount++;
+                }
+                vuDataUploaders.add(new String[]{ nm, hex(r.address),
+                    "vu_data_mem_write;"
+                    + (t.vifOpcodesBuilt.contains("UNPACK")||t.storedVifOpcodes.contains("UNPACK") ? "UNPACK;" : "")
+                    + (t.programsSprDma ? "spr_dma;" : "")
+                    + "per_object_flag_carrier(qw30_ADC/cull_class);not_microcode" });
+            }
+
+            // --- Rule 254 DIRECT_JAL_ONLY_TARGET + probe_strategy (G199, general PS2) ---
+            // registerFunction overrides/probes only see INDIRECT jr $t9/jalr. Derive the safe
+            // instrumentation/override placement so a probe is never silently inert.
+            if(t.calledViaJrT9 && !t.calledViaDirectJal)      t.probeStrategy = "registerFunction_ok";
+            else if(t.calledViaDirectJal && !t.calledViaJrT9) t.probeStrategy = "wrap_body_only";
+            else if(t.calledViaDirectJal && t.calledViaJrT9)  t.probeStrategy = "dual";
+            else                                              t.probeStrategy = "no_caller_evidence";
+            if("wrap_body_only".equals(t.probeStrategy)) {
+                if(!r.tags.contains("DIRECT_JAL_ONLY_TARGET")) {
+                    r.tags.add("DIRECT_JAL_ONLY_TARGET"); directJalOnlyCount++;
+                }
+                directJalOnlyTargets.add(new String[]{ nm, hex(r.address),
+                    "registerFunction_INERT;wrap_jal_target_body_or_codegen(G199_gotcha)" });
+            }
+
+            // --- Rule 255 LOCAL_TO_LOCAL_TRANSFER (G194 TexAnime, general PS2) ---
+            // A BITBLTBUF macro whose const-tracked TRXDIR value is 2 (local<->local copy).
+            if(t.trxdirLocalToLocal && (t.bitbltbufMacroSequence || t.writesBitbltbufReg)) {
+                if(!r.tags.contains("LOCAL_TO_LOCAL_TRANSFER")) {
+                    r.tags.add("LOCAL_TO_LOCAL_TRANSFER"); localToLocalCount++;
+                }
+                localToLocalTransfers.add(new String[]{ nm, hex(r.address),
+                    "TRXDIR=2(local_to_local);texture_scroll/feedback;audit_TRXREG_width_producer" });
+            }
+
+            // --- Rule 256 SCREEN_SPACE_FEEDBACK_PASS (G194 DepthOfField, general PS2) ---
+            boolean effectName = false;
+            for(String s : SCREEN_SPACE_EFFECT_NAMES) if(nm.contains(s)) { effectName = true; break; }
+            boolean draws = t.writesTex0Reg || t.gifTagInlineBuilder || t.path3Initiator;
+            boolean feedbackShape = t.writesFrameReg && t.writesTex0Reg;
+            if((effectName && draws) || (effectName && feedbackShape) || (feedbackShape && t.isRenderFrameEntry)) {
+                t.isScreenSpaceFeedback = true;
+                if(!r.tags.contains("SCREEN_SPACE_FEEDBACK_PASS")) {
+                    r.tags.add("SCREEN_SPACE_FEEDBACK_PASS"); screenSpaceFeedbackCount++;
+                }
+                screenSpaceEffectPasses.add(new String[]{ nm, hex(r.address),
+                    (effectName ? "post_process_name;" : "")
+                    + (feedbackShape ? "samples_rendered_frame_as_texture;" : "")
+                    + "bisect_with_skip_lever_before_chasing_raster(not_phantom_geometry)" });
+            }
+
+            // --- Rule 257 SHARED_DEPTH_TEST_REQUIRED (G195, general PS2, extends Rule 212) ---
+            // Overlapping opaque batches with ZTEST + ZBUF into a display FRAME (not an RTT
+            // private-Z page) need a real depth test; a painter's-order fast path mis-orders them.
+            boolean manyBatches = t.gifTagInlineBuilder || t.path3Initiator || t.indirectCallT9Count > 0;
+            if(t.writesTestReg && t.writesZbufReg && manyBatches && !t.isRttTarget) {
+                t.isSharedDepthTestSite = true;
+                if(!r.tags.contains("SHARED_DEPTH_TEST_REQUIRED")) {
+                    r.tags.add("SHARED_DEPTH_TEST_REQUIRED"); sharedDepthTestCount++;
+                }
+                sharedDepthTestSites.add(new String[]{ nm, hex(r.address),
+                    "ZTEST+ZBUF_on_display_FRAME;overlapping_batches;painters_order_fast_path_hazard" });
+            }
+
+            // --- Rule 258 PREEMPTIBLE_OVERRIDE_TARGET (G186, general PS2, extends Rule 188) ---
+            // A large, back-edge-preemptible body reached as a DIRECT-jal override target: a
+            // register-sentinel/post-call-fixup override breaks under preemption (stack corrupt).
+            boolean preemptible = t.byteSize > 400
+                && (t.isRenderFrameEntry || t.tailCallIndirect
+                    || (t.drawingChainDepth >= 0 && t.drawingChainDepth <= 6));
+            if(preemptible && t.calledViaDirectJal) {
+                t.isPreemptibleOverrideTarget = true;
+                if(!r.tags.contains("PREEMPTIBLE_OVERRIDE_TARGET")) {
+                    r.tags.add("PREEMPTIBLE_OVERRIDE_TARGET"); preemptibleOverrideCount++;
+                }
+                preemptibleOverrideTargets.add(new String[]{ nm, hex(r.address),
+                    "direct_jal_target+preemptible_body;wrap_in_g_dc2PreemptSuppressDepth_or_resume_aware(G186)" });
+            }
+
+            // --- Rule 259 HEADLESS_INIT_VTABLE_CONSUMER (G193, general PS2, refines Rule 141/186) ---
+            // A vtable installed into a global only by an uncalled __sinit -> headless the global's
+            // vtable ptr stays null -> its virtual init dispatch silently no-ops (town flat blue).
+            if(t.staticInitInstallsVtable && t.isUncalledStaticInit) {
+                t.isHeadlessVtableHazard = true;
+                if(!r.tags.contains("HEADLESS_INIT_VTABLE_CONSUMER")) {
+                    r.tags.add("HEADLESS_INIT_VTABLE_CONSUMER"); headlessVtableHazardCount++;
+                }
+                headlessVtableHazards.add(new String[]{ nm, hex(r.address),
+                    "uncalled_sinit_installs_global_vtable;idempotent_repair_at_consumer_init_entry(G193/F50.4)" });
+            }
+        }
+
+        println(String.format(
+            "  v20 (G173-G199): GS_COMPOSER=%d VU_DATA_UPLOAD=%d DIRECT_JAL_ONLY=%d L2L=%d "
+          + "SCREEN_FX=%d SHARED_ZTEST=%d PREEMPT_OVERRIDE=%d HEADLESS_VTABLE=%d",
+            gsValueComposerCount, vuDataUploaderCount, directJalOnlyCount, localToLocalCount,
+            screenSpaceFeedbackCount, sharedDepthTestCount, preemptibleOverrideCount,
+            headlessVtableHazardCount));
+    }
+
+    // =========================================================
+    // v21 Rules 261-266: PCSX2 GS pixel-pipeline cross-check round 4. The prior GS A+D
+    // detectors cover PRIM/RGBAQ/XYZ/TEX0/TEX1/CLAMP/ZBUF/FRAME/DISPFB/ALPHA/TEST/PRMODE/
+    // TEXA/XYOFFSET/BITBLTBUF - but the REMAINING pixel-pipeline attribute regs (COLCLAMP,
+    // PABE, FBA, DIMX/DTHE, SCANMSK, FOGCOL, SCISSOR) had NO detector; a software rasterizer
+    // must honor each. Reg ids verified against PCSX2 GSRegs.h GIF_A_D_REG. G178's census named
+    // PABE/DATE/FBA/fbmsk as the GPU-raster eligibility + blend-correctness axes; G174 found a
+    // CLUT/TEX0 GS-state write that bypasses the pipeline FIFO the same way the presentation
+    // registers did (Rule 238). Flags/rosters set from the scan-time A+D reg-id evidence.
+    // =========================================================
+    private void applyV21Rules(List<FuncResult> results) {
+        for(FuncResult r : results) {
+            FuncTraits t = r.traits; if(t == null) continue;
+            String nm = r.name == null ? "" : r.name;
+
+            // --- Rule 261 GS_BLEND_COLCLAMP_CONTRACT (COLCLAMP 0x46 + ALPHA, general PS2) ---
+            // PS2 blends (A-B)*C>>7+D; COLCLAMP=1 clamps the result to [0,255], COLCLAMP=0 WRAPS
+            // it mod 256 (deliberate for some additive/subtractive effects). A rasterizer that
+            // always clamps (or always wraps) is wrong on the other mode.
+            if(t.writesColclampReg) {
+                if(!r.tags.contains("GS_BLEND_COLCLAMP_CONTRACT")) {
+                    r.tags.add("GS_BLEND_COLCLAMP_CONTRACT"); blendColclampCount++;
+                }
+                blendColclampWriters.add(new String[]{ nm, hex(r.address),
+                    "COLCLAMP" + (t.writesAlphaBlendReg ? "+ALPHA_blend" : "")
+                    + ";verify_result_clamp[0,255]_when_1_else_wrap_mod256" });
+            }
+
+            // --- Rule 262 GS_PER_PIXEL_ALPHA_CONTRACT (PABE 0x49 / FBA 0x4a/0x4b / DATE, general PS2) ---
+            // PABE = blend only where source alpha MSB set (per-pixel). FBA = force the fb-alpha
+            // MSB (alpha correction). DATE/DATM (a TEST-reg bit) = draw only where dest alpha
+            // matches - a masking primitive. All silently drop if the rasterizer ignores them.
+            if(t.writesPabeReg || t.writesFbaReg) {
+                if(!r.tags.contains("GS_PER_PIXEL_ALPHA_CONTRACT")) {
+                    r.tags.add("GS_PER_PIXEL_ALPHA_CONTRACT"); perPixelAlphaCount++;
+                }
+                perPixelAlphaWriters.add(new String[]{ nm, hex(r.address),
+                    (t.writesPabeReg ? "PABE(per_pixel_alpha_blend)" : "")
+                    + (t.writesPabeReg && t.writesFbaReg ? "+" : "")
+                    + (t.writesFbaReg ? "FBA(fb_alpha_correction_bit)" : "")
+                    + (t.writesTestReg ? ";TEST_present(verify_DATE/DATM_dest_alpha_test)" : "") });
+            }
+
+            // --- Rule 263 GS_DITHER_SCANMSK_CONTRACT (DIMX/DTHE/SCANMSK/FOGCOL, general PS2) ---
+            // DIMX+DTHE = 4x4 ordered dither on CT16 output; SCANMSK = even/odd scanline draw mask
+            // (an interlace tool - DC2 blocker #4 interlace jitter); FOGCOL = the fog colour FOG
+            // blends toward. Cosmetic but visible; SCANMSK mis-handling shifts interlaced fields.
+            if(t.writesDitherReg || t.writesScanmskReg || t.writesFogcolReg) {
+                if(!r.tags.contains("GS_DITHER_SCANMSK_CONTRACT")) {
+                    r.tags.add("GS_DITHER_SCANMSK_CONTRACT"); ditherScanmskCount++;
+                }
+                ditherScanmskWriters.add(new String[]{ nm, hex(r.address),
+                    (t.writesDitherReg ? "DIMX/DTHE_dither;" : "")
+                    + (t.writesScanmskReg ? "SCANMSK_interlace_scan_mask(blocker4);" : "")
+                    + (t.writesFogcolReg ? "FOGCOL;" : "") });
+            }
+
+            // --- Rule 264 GS_SCISSOR_WRITER (SCISSOR_1/2 0x40/0x41, general PS2, pairs Rule 213) ---
+            // The PS2 GS does NO triangle/near-plane/guard-band clipping (Rule 213) - it only
+            // SCISSORS. SCISSOR is the sole HW clip; a stale scissor from a prior RTT scope leaks
+            // (G79 render-target/scissor leak). Flag every scissor setter.
+            if(t.writesScissorReg) {
+                if(!r.tags.contains("GS_SCISSOR_WRITER")) {
+                    r.tags.add("GS_SCISSOR_WRITER"); gsScissorWriterCount++;
+                }
+                gsScissorWriters.add(new String[]{ nm, hex(r.address),
+                    "SCISSOR(only_GS_clip;verify_restore_across_RTT_scope_G79)" });
+            }
+
+            // --- Rule 265 GS_STATE_FIFO_BYPASS_RISK (G174, general PS2, extends Rule 238) ---
+            // G174: a CLUT/TEX0-adjacent GS-state write raced the pipeline the SAME way the 6
+            // presentation regs did before G157 fenced them (Rule 238) - a multithreaded/
+            // pipelined GS runtime must fence/latch TEX0+CLUT writes in EE program order too.
+            if((t.writesTex0Reg || t.isClutCacheInvalidator)
+               && (t.gifTagInlineBuilder || t.path3Initiator || t.writesBitbltbufReg)) {
+                t.isGsStateFifoBypassRisk = true;
+                if(!r.tags.contains("GS_STATE_FIFO_BYPASS_RISK")) {
+                    r.tags.add("GS_STATE_FIFO_BYPASS_RISK"); gsStateFifoBypassCount++;
+                }
+                gsStateFifoBypassSites.add(new String[]{ nm, hex(r.address),
+                    (t.writesTex0Reg ? "TEX0;" : "") + (t.isClutCacheInvalidator ? "CLUT/TEXFLUSH;" : "")
+                    + "fence_in_EE_program_order_like_presentation_regs(G174/G157)" });
+            }
+        }
+
+        println(String.format(
+            "  v21 (PCSX2 GS pixel-pipe): COLCLAMP=%d PER_PIXEL_ALPHA=%d DITHER_SCANMSK=%d "
+          + "SCISSOR=%d GS_STATE_FIFO_BYPASS=%d",
+            blendColclampCount, perPixelAlphaCount, ditherScanmskCount,
+            gsScissorWriterCount, gsStateFifoBypassCount));
+    }
+
     // v15 Rule 194: fuzzy allocator-family membership for demangled/underscore variants
     // (operator new/delete, _r reentrant forms) not in the exact-name set.
     private static boolean isAllocFamilyName(String nm) {
@@ -12139,7 +12646,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
             if(r.name != null && !r.name.isEmpty()) nameToAddr.putIfAbsent(r.name, r.address & 0xFFFFFFFFL);
         }
         String exportTs  = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date());
-        String exportVer = "DC2 enricher v19 (schema 18.0)";
+        String exportVer = "DC2 enricher v21 (schema 19.1)";
         int n = 0;
         for(FuncResult r : results) {
             if(monitor.isCancelled()) break;
@@ -12154,7 +12661,7 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                     +"** · origin `"+r.origin+"`");
                 w.println();
                 // --- Export metadata (stale-export protection) ---
-                w.println("> schema_version `18.0` · elf_hash `"+elfHash+"` · global_pointer `"+hex(gpValue)
+                w.println("> schema_version `19.1` · elf_hash `"+elfHash+"` · global_pointer `"+hex(gpValue)
                     +"` · exported `"+exportTs+"` · enricher `"+exportVer+"`");
                 w.println(">");
                 w.println("> _If elf_hash / global_pointer differ from the current ELF, this doc is stale — re-run the enricher._");
@@ -12551,8 +13058,8 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         }
         PrintWriter w=utf8Writer(outFile);
         w.println("{");
-        w.println("  \"schema_version\": 18.0,");
-        w.println("  \"enricher_version\": \"DC2 enricher v19 (schema 18.0)\",");
+        w.println("  \"schema_version\": 19.1,");
+        w.println("  \"enricher_version\": \"DC2 enricher v21 (schema 19.1)\",");
         w.println("  \"export_timestamp\": \""
             +new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date())+"\",");
         w.println("  \"elf_hash\": \""+elfHash+"\",");
@@ -13189,6 +13696,34 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
         emitV13Roster(w, "gs_csr_sites", gsCsrSites, "detail");
         // Rule 250 EE_TLB_MAPPING (custom TLB mapping; 0 = flat, the finding for DC2).
         emitV13Roster(w, "tlb_writers", tlbWriters, "detail");
+        // ===== v20 rosters (Rules 252-259, G173-G199 town/edit-map render arc) =====
+        // Rule 252 GS_STATE_COMPOSER (EABI-trailing-arg GS-value stubs; the G194 dbuff Z24/Z32 root).
+        emitV13Roster(w, "gs_value_composers", gsValueComposers, "detail");
+        // Rule 253 VU1_DATA_MEM_UPLOAD (per-object VU1 data-mem flag carrier; the active G198/G199 qw30 ADC root).
+        emitV13Roster(w, "vu_data_uploaders", vuDataUploaders, "detail");
+        // Rule 254 DIRECT_JAL_ONLY_TARGET (registerFunction-inert; wrap the jal target body - G199 gotcha).
+        emitV13Roster(w, "direct_jal_only_targets", directJalOnlyTargets, "detail");
+        // Rule 255 LOCAL_TO_LOCAL_TRANSFER (TRXDIR=2 scroll/feedback copy; G194 TexAnime width bug).
+        emitV13Roster(w, "local_to_local_transfers", localToLocalTransfers, "detail");
+        // Rule 256 SCREEN_SPACE_FEEDBACK_PASS (RTT pyramid / frame-as-texture; G194 DepthOfField).
+        emitV13Roster(w, "screen_space_effect_passes", screenSpaceEffectPasses, "detail");
+        // Rule 257 SHARED_DEPTH_TEST_REQUIRED (overlapping opaque batches on a painter's-order path; G195).
+        emitV13Roster(w, "shared_depth_test_sites", sharedDepthTestSites, "detail");
+        // Rule 258 PREEMPTIBLE_OVERRIDE_TARGET (direct-jal target + preemptible body; G186 sentinel hazard).
+        emitV13Roster(w, "preemptible_override_targets", preemptibleOverrideTargets, "detail");
+        // Rule 259 HEADLESS_INIT_VTABLE_CONSUMER (uncalled-__sinit vtable installer; G193 town flat-blue root).
+        emitV13Roster(w, "headless_vtable_hazards", headlessVtableHazards, "detail");
+        // ===== v21 rosters (Rules 261-265, PCSX2 GS pixel-pipeline census round 4) =====
+        // Rule 261 GS_BLEND_COLCLAMP_CONTRACT (blend result clamp[0,255] vs 8-bit wrap).
+        emitV13Roster(w, "blend_colclamp_writers", blendColclampWriters, "detail");
+        // Rule 262 GS_PER_PIXEL_ALPHA_CONTRACT (PABE per-pixel alpha blend / FBA fb-alpha bit / DATE).
+        emitV13Roster(w, "per_pixel_alpha_writers", perPixelAlphaWriters, "detail");
+        // Rule 263 GS_DITHER_SCANMSK_CONTRACT (DIMX/DTHE dither / SCANMSK interlace / FOGCOL).
+        emitV13Roster(w, "dither_scanmsk_writers", ditherScanmskWriters, "detail");
+        // Rule 264 GS_SCISSOR_WRITER (the only GS clip; scope-leak across RTT, G79).
+        emitV13Roster(w, "gs_scissor_writers", gsScissorWriters, "detail");
+        // Rule 265 GS_STATE_FIFO_BYPASS_RISK (TEX0/CLUT writes a pipelined GS must fence, G174).
+        emitV13Roster(w, "gs_state_fifo_bypass_sites", gsStateFifoBypassSites, "detail");
         w.println("  \"perf_cost_ranking\": [");
         {
             List<FuncResult> pr = new ArrayList<>();
@@ -14242,6 +14777,26 @@ public class PS2Recomp_TriageEnricher extends GhidraScript {
                 w.print("\"rcnt_regs_hit\": "+jsonStrArray(new ArrayList<>(t.rcntRegsHit))+", ");
             if(!t.dmacGlobalRegsHit.isEmpty())
                 w.print("\"dmac_global_regs_hit\": "+jsonStrArray(new ArrayList<>(t.dmacGlobalRegsHit))+", ");
+            // v20 Rules 252-259 (G173-G199 town/edit-map render arc)
+            w.print("\"reads_eabi_trailing_arg\": "+t.readsEabiTrailingArg+", ");
+            w.print("\"is_gs_value_composer\": "+t.isGsValueComposer+", ");
+            w.print("\"is_vu_data_uploader\": "+t.isVuDataUploader+", ");
+            if(t.probeStrategy != null)
+                w.print("\"probe_strategy\": "+jsonString(t.probeStrategy)+", ");
+            w.print("\"trxdir_local_to_local\": "+t.trxdirLocalToLocal+", ");
+            w.print("\"is_screen_space_feedback\": "+t.isScreenSpaceFeedback+", ");
+            w.print("\"is_shared_depth_test_site\": "+t.isSharedDepthTestSite+", ");
+            w.print("\"is_preemptible_override_target\": "+t.isPreemptibleOverrideTarget+", ");
+            w.print("\"is_headless_vtable_hazard\": "+t.isHeadlessVtableHazard+", ");
+            // v21 Rules 261-265 (PCSX2 GS pixel-pipeline census round 4)
+            w.print("\"writes_colclamp_reg\": "+t.writesColclampReg+", ");
+            w.print("\"writes_pabe_reg\": "+t.writesPabeReg+", ");
+            w.print("\"writes_fba_reg\": "+t.writesFbaReg+", ");
+            w.print("\"writes_dither_reg\": "+t.writesDitherReg+", ");
+            w.print("\"writes_scanmsk_reg\": "+t.writesScanmskReg+", ");
+            w.print("\"writes_fogcol_reg\": "+t.writesFogcolReg+", ");
+            w.print("\"writes_scissor_reg\": "+t.writesScissorReg+", ");
+            w.print("\"is_gs_state_fifo_bypass_risk\": "+t.isGsStateFifoBypassRisk+", ");
             w.print("\"computed_jump_sites\": [");
             {
                 Map<Long,List<Long>> byPc = new LinkedHashMap<>();
